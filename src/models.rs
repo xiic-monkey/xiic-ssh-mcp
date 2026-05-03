@@ -1,0 +1,203 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthKind {
+    Password,
+    PrivateKey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredInstance {
+    pub instance_id: String,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth_kind: AuthKind,
+    pub host_key_check: bool,
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstanceSummary {
+    pub instance_id: String,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth_kind: AuthKind,
+    pub host_key_check: bool,
+    pub notes: Option<String>,
+    pub has_secret: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl InstanceSummary {
+    pub fn from_stored(instance: StoredInstance, has_secret: bool) -> Self {
+        Self {
+            instance_id: instance.instance_id,
+            name: instance.name,
+            host: instance.host,
+            port: instance.port,
+            username: instance.username,
+            auth_kind: instance.auth_kind,
+            host_key_check: instance.host_key_check,
+            notes: instance.notes,
+            has_secret,
+            created_at: instance.created_at,
+            updated_at: instance.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstanceDraft {
+    pub instance_id: String,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth_kind: AuthKind,
+    pub host_key_check: bool,
+    pub notes: Option<String>,
+    pub password: Option<String>,
+    pub private_key: Option<String>,
+    pub passphrase: Option<String>,
+    #[serde(default)]
+    pub keep_existing_secret: bool,
+}
+
+impl InstanceDraft {
+    pub fn normalize(mut self) -> Self {
+        self.instance_id = self.instance_id.trim().to_string();
+        self.name = self.name.trim().to_string();
+        self.host = self.host.trim().to_string();
+        self.username = self.username.trim().to_string();
+        self.notes = trim_to_none(self.notes);
+        self.password = trim_to_none(self.password);
+        self.private_key = trim_to_none(self.private_key);
+        self.passphrase = trim_to_none(self.passphrase);
+        if self.port == 0 {
+            self.port = 22;
+        }
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretPayload {
+    pub password: Option<String>,
+    pub private_key: Option<String>,
+    pub passphrase: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestConnectionResult {
+    pub success: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpConfigBundle {
+    pub command: String,
+    pub args: Vec<String>,
+    pub stdio_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSessionResult {
+    pub session_id: String,
+    pub instance_id: String,
+    pub connected_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecuteCommandResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadFileResult {
+    pub bytes_written: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadFileResult {
+    pub content: String,
+    pub size: usize,
+    pub encoding: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UploadEncoding {
+    Utf8,
+    Base64,
+}
+
+impl Default for UploadEncoding {
+    fn default() -> Self {
+        Self::Utf8
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadEncoding {
+    Utf8,
+    Base64,
+}
+
+impl Default for DownloadEncoding {
+    fn default() -> Self {
+        Self::Base64
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecuteCommandArgs {
+    pub session_id: String,
+    pub command: String,
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadFileArgs {
+    pub session_id: String,
+    pub remote_path: String,
+    pub content: String,
+    #[serde(default)]
+    pub encoding: UploadEncoding,
+    #[serde(default = "default_overwrite")]
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadFileArgs {
+    pub session_id: String,
+    pub remote_path: String,
+    #[serde(default)]
+    pub encoding: DownloadEncoding,
+}
+
+fn default_overwrite() -> bool {
+    true
+}
+
+fn trim_to_none(value: Option<String>) -> Option<String> {
+    value.and_then(|text| {
+        let trimmed = text.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}

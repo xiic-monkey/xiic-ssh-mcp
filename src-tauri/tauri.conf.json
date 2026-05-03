@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Xiic SSH Manager",
+  "version": "0.1.0",
+  "identifier": "com.xiic.sshmanager",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1430",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Xiic SSH Manager",
+        "width": 1040,
+        "height": 690,
+        "minWidth": 1040,
+        "minHeight": 690,
+        "maxWidth": 1040,
+        "maxHeight": 690,
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 18,
+          "y": 18
+        },
+        "resizable": false,
+        "maximizable": false
+      }
+    ]
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/icon.png"]
+  }
+}
