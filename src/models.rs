@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -110,6 +111,21 @@ pub struct McpConfigBundle {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListServersResult {
+    pub servers: Vec<InstanceSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationLogEntry {
+    pub id: i64,
+    pub session_id: String,
+    pub instance_id: String,
+    pub operation: String,
+    pub details: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSessionResult {
     pub session_id: String,
     pub instance_id: String,
@@ -189,6 +205,105 @@ pub struct DownloadFileArgs {
 
 fn default_overwrite() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleType {
+    Tool,
+    Command,
+    Path,
+    Instance,
+}
+
+impl RuleType {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "tool" => Some(Self::Tool),
+            "command" => Some(Self::Command),
+            "path" => Some(Self::Path),
+            "instance" => Some(Self::Instance),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tool => "tool",
+            Self::Command => "command",
+            Self::Path => "path",
+            Self::Instance => "instance",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleAction {
+    Allow,
+    Deny,
+}
+
+impl RuleAction {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "allow" => Some(Self::Allow),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhitelistRule {
+    pub id: i64,
+    pub rule_type: RuleType,
+    pub pattern: String,
+    pub action: RuleAction,
+    pub enabled: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct OperationContext {
+    pub tool_name: String,
+    pub command: Option<String>,
+    pub remote_path: Option<String>,
+    pub instance_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RuleDecision {
+    Allow,
+    Deny(String),
+    NeedsElicitation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub name: String,
+    #[serde(default)]
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingToolCall {
+    pub id: Value,
+    pub tool_call: ToolCall,
+    pub operation: OperationContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhitelistMode {
+    Strict,
+    Off,
 }
 
 fn trim_to_none(value: Option<String>) -> Option<String> {

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,12 +16,13 @@ use uuid::Uuid;
 
 use crate::credentials::SecretStore;
 use crate::models::{
-    AuthKind, CreateSessionResult, DownloadFileArgs, DownloadFileResult, DownloadEncoding,
-    ExecuteCommandArgs, ExecuteCommandResult, InstanceDraft, InstanceSummary, McpConfigBundle,
-    SecretPayload, StoredInstance, TestConnectionResult, UploadEncoding, UploadFileArgs,
-    UploadFileResult,
+    AuthKind, CreateSessionResult, DownloadEncoding, DownloadFileArgs, DownloadFileResult,
+    ExecuteCommandArgs, ExecuteCommandResult, InstanceDraft, InstanceSummary, ListServersResult,
+    McpConfigBundle, OperationLogEntry, RuleAction, RuleType, SecretPayload, StoredInstance,
+    TestConnectionResult, UploadEncoding, UploadFileArgs, UploadFileResult, WhitelistRule,
 };
 use crate::storage::InstanceStore;
+use crate::whitelist::WhitelistChecker;
 
 pub const DEFAULT_KEYRING_SERVICE: &str = "com.xiic.ssh-manager";
 
@@ -29,6 +31,7 @@ pub struct DesktopCore {
     store: InstanceStore,
     secrets: SecretStore,
     sessions: Arc<Mutex<HashMap<String, ManagedSession>>>,
+    notify_socket: Option<PathBuf>,
 }
 
 struct ManagedSession {
@@ -43,11 +46,25 @@ struct ResolvedInstance {
 
 impl DesktopCore {
     pub fn new(db_path: PathBuf, keyring_service: impl Into<String>) -> Result<Self> {
+        Self::new_with_socket(db_path, keyring_service, None)
+    }
+
+    pub fn new_with_socket(
+        db_path: PathBuf,
+        keyring_service: impl Into<String>,
+        notify_socket: Option<PathBuf>,
+    ) -> Result<Self> {
         Ok(Self {
             store: InstanceStore::new(db_path)?,
             secrets: SecretStore::new(keyring_service),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            notify_socket,
         })
+    }
+
+    pub fn list_servers(&self) -> Result<ListServersResult> {
+        let servers = self.list_instances()?;
+        Ok(ListServersResult { servers })
     }
 
     pub fn list_instances(&self) -> Result<Vec<InstanceSummary>> {
@@ -61,6 +78,26 @@ impl DesktopCore {
             .collect()
     }
 
+    pub fn get_operation_logs(&self, limit: Option<u64>) -> Result<Vec<OperationLogEntry>> {
+        self.store.get_operation_logs(limit)
+    }
+
+    pub fn get_operation_logs_since(
+        &self,
+        since_id: i64,
+        limit: u64,
+    ) -> Result<Vec<OperationLogEntry>> {
+        self.store.get_operation_logs_since(since_id, limit)
+    }
+
+    fn notify_ui(&self) {
+        if let Some(socket_path) = &self.notify_socket {
+            if let Ok(mut stream) = UnixStream::connect(socket_path) {
+                let _ = stream.write_all(b"1");
+            }
+        }
+    }
+
     pub fn save_instance(&self, draft: InstanceDraft) -> Result<InstanceSummary> {
         let draft = draft.normalize();
         self.validate_metadata(&draft)?;
@@ -70,7 +107,10 @@ impl DesktopCore {
         let stored = self.store.save_instance(&draft)?;
         self.store.save_secret(&draft.instance_id, &secret)?;
         if let Err(err) = self.secrets.save_secret(&draft.instance_id, &secret) {
-            eprintln!("warning: failed to store keychain secret for '{}': {err:#}", draft.instance_id);
+            eprintln!(
+                "warning: failed to store keychain secret for '{}': {err:#}",
+                draft.instance_id
+            );
         }
 
         Ok(InstanceSummary::from_stored(stored, true))
@@ -92,11 +132,10 @@ impl DesktopCore {
     pub fn test_connection(&self, draft: InstanceDraft) -> Result<TestConnectionResult> {
         let draft = draft.normalize();
         self.validate_metadata(&draft)?;
-        let has_inline_secret = draft.password.is_some()
-            || draft.private_key.is_some()
-            || draft.passphrase.is_some();
-        let has_saved_instance = !draft.instance_id.is_empty()
-            && self.store.get_instance(&draft.instance_id)?.is_some();
+        let has_inline_secret =
+            draft.password.is_some() || draft.private_key.is_some() || draft.passphrase.is_some();
+        let has_saved_instance =
+            !draft.instance_id.is_empty() && self.store.get_instance(&draft.instance_id)?.is_some();
         let should_try_saved_secret =
             has_saved_instance && (draft.keep_existing_secret || !has_inline_secret);
 
@@ -139,19 +178,28 @@ impl DesktopCore {
         command_path: &str,
         db_path: &str,
         keyring_service: &str,
+        notify_socket: Option<&str>,
     ) -> Result<McpConfigBundle> {
-        let args = vec![
+        let mut args = vec![
             "--db-path".to_string(),
             db_path.to_string(),
             "--keyring-service".to_string(),
             keyring_service.to_string(),
         ];
+        if let Some(socket) = notify_socket {
+            args.push("--notify-socket".to_string());
+            args.push(socket.to_string());
+        }
 
         let stdio_json = serde_json::to_string_pretty(&serde_json::json!({
             "mcpServers": {
                 "xiic-ssh": {
                     "command": command_path,
-                    "args": args
+                    "args": args,
+                    "env": {
+                        "HOME": env::var("HOME").unwrap_or_else(|_| "/home".to_string()),
+                        "SSH_ASKPASS_REQUIRE": "never"
+                    }
                 }
             }
         }))?;
@@ -181,6 +229,21 @@ impl DesktopCore {
                 session,
             },
         );
+        drop(sessions);
+
+        let details = serde_json::json!({
+            "instance_id": instance_id,
+            "name": resolved.metadata.name,
+            "host": resolved.metadata.host,
+            "port": resolved.metadata.port,
+        });
+        self.store.insert_log(
+            &session_id,
+            instance_id,
+            "create_session",
+            &serde_json::to_string(&details).unwrap_or_default(),
+        )?;
+        self.notify_ui();
 
         Ok(CreateSessionResult {
             session_id,
@@ -194,54 +257,82 @@ impl DesktopCore {
             bail!("command cannot be empty");
         }
 
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| anyhow!("session manager lock poisoned"))?;
-        let managed = sessions
-            .get_mut(&args.session_id)
-            .with_context(|| format!("unknown session_id '{}'", args.session_id))?;
+        let timeout_ms = args
+            .timeout_secs
+            .and_then(|s| s.checked_mul(1_000))
+            .map(|ms| u32::try_from(ms).unwrap_or(u32::MAX))
+            .unwrap_or(30_000);
 
-        if let Some(timeout_secs) = args.timeout_secs {
-            let timeout_ms = timeout_secs
-                .checked_mul(1_000)
-                .ok_or_else(|| anyhow!("timeout_secs is too large"))?;
-            managed
+        let (instance_id, session_id, command, result) = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| anyhow!("session manager lock poisoned"))?;
+            let managed = sessions
+                .get_mut(&args.session_id)
+                .with_context(|| format!("unknown session_id '{}'", args.session_id))?;
+            let instance_id = managed.instance_id.clone();
+
+            managed.session.set_timeout(timeout_ms);
+
+            let mut channel = managed
                 .session
-                .set_timeout(u32::try_from(timeout_ms).map_err(|_| anyhow!("timeout_secs exceeds ssh timeout limits"))?);
-        } else {
-            managed.session.set_timeout(0);
-        }
+                .channel_session()
+                .context("failed to open SSH channel")?;
+            channel
+                .exec(&args.command)
+                .with_context(|| format!("failed to execute command '{}'", args.command))?;
 
-        let mut channel = managed
-            .session
-            .channel_session()
-            .context("failed to open SSH channel")?;
-        channel
-            .exec(&args.command)
-            .with_context(|| format!("failed to execute command '{}'", args.command))?;
+            let mut stdout = String::new();
+            channel
+                .read_to_string(&mut stdout)
+                .context("failed to read command stdout")?;
 
-        let mut stdout = String::new();
-        channel
-            .read_to_string(&mut stdout)
-            .context("failed to read command stdout")?;
+            let mut stderr = String::new();
+            channel
+                .stderr()
+                .read_to_string(&mut stderr)
+                .context("failed to read command stderr")?;
 
-        let mut stderr = String::new();
-        channel
-            .stderr()
-            .read_to_string(&mut stderr)
-            .context("failed to read command stderr")?;
+            channel
+                .wait_close()
+                .context("failed waiting for command exit")?;
+            let exit_code = channel.exit_status().context("failed to read exit code")?;
 
-        channel
-            .wait_close()
-            .context("failed waiting for command exit")?;
-        let exit_code = channel.exit_status().context("failed to read exit code")?;
+            (
+                instance_id,
+                args.session_id.clone(),
+                args.command.clone(),
+                ExecuteCommandResult {
+                    stdout,
+                    stderr,
+                    exit_code,
+                },
+            )
+        };
 
-        Ok(ExecuteCommandResult {
-            stdout,
-            stderr,
-            exit_code,
-        })
+        let instance_name = self
+            .store
+            .get_instance(&instance_id)?
+            .map(|i| i.name)
+            .unwrap_or_else(|| instance_id.clone());
+
+        let details = serde_json::json!({
+            "instance_name": instance_name,
+            "command": command,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "exit_code": result.exit_code,
+        });
+        self.store.insert_log(
+            &session_id,
+            &instance_id,
+            "execute_command",
+            &serde_json::to_string(&details).unwrap_or_default(),
+        )?;
+        self.notify_ui();
+
+        Ok(result)
     }
 
     pub fn upload_file(&self, args: UploadFileArgs) -> Result<UploadFileResult> {
@@ -252,71 +343,166 @@ impl DesktopCore {
                 .context("failed to decode upload content as base64")?,
         };
 
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| anyhow!("session manager lock poisoned"))?;
-        let managed = sessions
-            .get_mut(&args.session_id)
-            .with_context(|| format!("unknown session_id '{}'", args.session_id))?;
+        let (instance_id, session_id, remote_path, bytes_written) = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| anyhow!("session manager lock poisoned"))?;
+            let managed = sessions
+                .get_mut(&args.session_id)
+                .with_context(|| format!("unknown session_id '{}'", args.session_id))?;
+            let instance_id = managed.instance_id.clone();
 
-        let sftp = managed
-            .session
-            .sftp()
-            .context("failed to open SFTP session")?;
-        let remote = PathBuf::from(&args.remote_path);
-        if !args.overwrite && sftp.stat(&remote).is_ok() {
-            bail!("remote path '{}' already exists", args.remote_path);
-        }
+            managed.session.set_timeout(30_000);
 
-        let mut file = sftp
-            .create(&remote)
-            .with_context(|| format!("failed to open remote path '{}'", args.remote_path))?;
-        file.write_all(&bytes)
-            .with_context(|| format!("failed to write remote path '{}'", args.remote_path))?;
-        file.flush()
-            .with_context(|| format!("failed to flush remote path '{}'", args.remote_path))?;
+            let sftp = managed
+                .session
+                .sftp()
+                .context("failed to open SFTP session")?;
+            let remote = PathBuf::from(&args.remote_path);
+            if !args.overwrite && sftp.stat(&remote).is_ok() {
+                bail!("remote path '{}' already exists", args.remote_path);
+            }
+
+            let mut file = sftp
+                .create(&remote)
+                .with_context(|| format!("failed to open remote path '{}'", args.remote_path))?;
+            file.write_all(&bytes)
+                .with_context(|| format!("failed to write remote path '{}'", args.remote_path))?;
+            file.flush()
+                .with_context(|| format!("failed to flush remote path '{}'", args.remote_path))?;
+
+            (
+                instance_id,
+                args.session_id.clone(),
+                args.remote_path.clone(),
+                bytes.len(),
+            )
+        };
+
+        let instance_name = self
+            .store
+            .get_instance(&instance_id)?
+            .map(|i| i.name)
+            .unwrap_or_else(|| instance_id.clone());
+
+        let details = serde_json::json!({
+            "instance_name": instance_name,
+            "remote_path": remote_path,
+            "bytes_written": bytes_written,
+        });
+        self.store.insert_log(
+            &session_id,
+            &instance_id,
+            "upload_file",
+            &serde_json::to_string(&details).unwrap_or_default(),
+        )?;
+        self.notify_ui();
 
         Ok(UploadFileResult {
-            bytes_written: bytes.len(),
+            bytes_written,
         })
     }
 
     pub fn download_file(&self, args: DownloadFileArgs) -> Result<DownloadFileResult> {
-        let mut sessions = self
+        let (instance_id, session_id, remote_path, result) = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| anyhow!("session manager lock poisoned"))?;
+            let managed = sessions
+                .get_mut(&args.session_id)
+                .with_context(|| format!("unknown session_id '{}'", args.session_id))?;
+            let instance_id = managed.instance_id.clone();
+
+            managed.session.set_timeout(30_000);
+
+            let sftp = managed
+                .session
+                .sftp()
+                .context("failed to open SFTP session")?;
+            let mut file = sftp
+                .open(PathBuf::from(&args.remote_path).as_path())
+                .with_context(|| format!("failed to open remote path '{}'", args.remote_path))?;
+
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .with_context(|| format!("failed to read remote path '{}'", args.remote_path))?;
+
+            let (content, encoding) = match args.encoding {
+                DownloadEncoding::Utf8 => (
+                    String::from_utf8(bytes.clone())
+                        .context("remote file is not valid UTF-8; use base64 encoding instead")?,
+                    "utf8".to_string(),
+                ),
+                DownloadEncoding::Base64 => (BASE64.encode(bytes.clone()), "base64".to_string()),
+            };
+
+            (
+                instance_id,
+                args.session_id.clone(),
+                args.remote_path.clone(),
+                DownloadFileResult {
+                    content,
+                    size: bytes.len(),
+                    encoding,
+                },
+            )
+        };
+
+        let instance_name = self
+            .store
+            .get_instance(&instance_id)?
+            .map(|i| i.name)
+            .unwrap_or_else(|| instance_id.clone());
+
+        let details = serde_json::json!({
+            "instance_name": instance_name,
+            "remote_path": remote_path,
+            "size": result.size,
+            "encoding": result.encoding,
+        });
+        self.store.insert_log(
+            &session_id,
+            &instance_id,
+            "download_file",
+            &serde_json::to_string(&details).unwrap_or_default(),
+        )?;
+        self.notify_ui();
+
+        Ok(result)
+    }
+
+    pub fn create_whitelist_checker(&self) -> WhitelistChecker {
+        WhitelistChecker::new(self.store.clone())
+    }
+
+    pub fn list_whitelist_rules(&self) -> Result<Vec<WhitelistRule>> {
+        self.store.list_whitelist_rules()
+    }
+
+    pub fn add_whitelist_rule(
+        &self,
+        rule_type: &RuleType,
+        pattern: &str,
+        action: &RuleAction,
+    ) -> Result<i64> {
+        self.store.add_whitelist_rule(rule_type, pattern, action)
+    }
+
+    pub fn remove_whitelist_rule(&self, id: i64) -> Result<()> {
+        self.store.remove_whitelist_rule(id)
+    }
+
+    pub fn get_session_instance_id(&self, session_id: &str) -> Result<String> {
+        let sessions = self
             .sessions
             .lock()
             .map_err(|_| anyhow!("session manager lock poisoned"))?;
-        let managed = sessions
-            .get_mut(&args.session_id)
-            .with_context(|| format!("unknown session_id '{}'", args.session_id))?;
-
-        let sftp = managed
-            .session
-            .sftp()
-            .context("failed to open SFTP session")?;
-        let mut file = sftp
-            .open(PathBuf::from(&args.remote_path).as_path())
-            .with_context(|| format!("failed to open remote path '{}'", args.remote_path))?;
-
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .with_context(|| format!("failed to read remote path '{}'", args.remote_path))?;
-
-        let (content, encoding) = match args.encoding {
-            DownloadEncoding::Utf8 => (
-                String::from_utf8(bytes.clone())
-                    .context("remote file is not valid UTF-8; use base64 encoding instead")?,
-                "utf8".to_string(),
-            ),
-            DownloadEncoding::Base64 => (BASE64.encode(bytes.clone()), "base64".to_string()),
-        };
-
-        Ok(DownloadFileResult {
-            content,
-            size: bytes.len(),
-            encoding,
-        })
+        sessions
+            .get(session_id)
+            .map(|s| s.instance_id.clone())
+            .with_context(|| format!("unknown session_id '{}'", session_id))
     }
 
     fn validate_metadata(&self, draft: &InstanceDraft) -> Result<()> {
@@ -416,13 +602,38 @@ impl DesktopCore {
 }
 
 fn connect(instance: &ResolvedInstance) -> Result<Session> {
-    let tcp = TcpStream::connect((instance.metadata.host.as_str(), instance.metadata.port))
-        .with_context(|| {
-            format!(
-                "failed to open TCP connection to {}:{}",
-                instance.metadata.host, instance.metadata.port
-            )
-        })?;
+    // 解析主机地址并连接（最多等待 10 秒）
+    let addr = format!("{}:{}", instance.metadata.host, instance.metadata.port);
+    let socket_addrs: Vec<_> = std::net::ToSocketAddrs::to_socket_addrs(&addr)
+        .with_context(|| format!("failed to resolve host '{}'", instance.metadata.host))?
+        .collect();
+
+    if socket_addrs.is_empty() {
+        bail!("no addresses found for host '{}'", instance.metadata.host);
+    }
+
+    let connect_timeout = Duration::from_secs(10);
+    let mut last_err = None;
+    let mut tried_idx = 0;
+
+    let tcp = loop {
+        if tried_idx >= socket_addrs.len() {
+            break Err(anyhow::anyhow!(
+                "failed to connect to {} within 10s: {:?}",
+                addr,
+                last_err
+            ));
+        }
+
+        match TcpStream::connect_timeout(&socket_addrs[tried_idx], connect_timeout) {
+            Ok(stream) => break Ok(stream),
+            Err(e) => {
+                last_err = Some(e);
+                tried_idx += 1;
+            }
+        }
+    }?;
+
     tcp.set_read_timeout(Some(Duration::from_secs(30)))
         .context("failed to set TCP read timeout")?;
     tcp.set_write_timeout(Some(Duration::from_secs(30)))
@@ -430,6 +641,10 @@ fn connect(instance: &ResolvedInstance) -> Result<Session> {
 
     let mut session = Session::new().context("failed to create SSH session")?;
     session.set_tcp_stream(tcp);
+
+    // 为 SSH 会话设置总超时（包括握手和认证）
+    session.set_timeout(30_000);
+
     session.handshake().context("SSH handshake failed")?;
 
     if instance.metadata.host_key_check {

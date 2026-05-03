@@ -4,27 +4,54 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::app_core::DesktopCore;
 use crate::models::{
     CreateSessionResult, DownloadFileArgs, DownloadFileResult, ExecuteCommandArgs,
-    ExecuteCommandResult, UploadFileArgs, UploadFileResult,
+    ExecuteCommandResult, OperationContext, PendingToolCall, RuleDecision, ToolCall,
+    UploadFileArgs, UploadFileResult, WhitelistMode,
 };
+use crate::whitelist::WhitelistChecker;
 
-const DEFAULT_PROTOCOL_VERSION: &str = "2025-03-26";
+const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "xiic-ssh-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MessageFraming {
+    Newline,
+    ContentLength,
+}
+
+#[derive(Debug)]
+struct IncomingMessage {
+    payload: Value,
+    framing: MessageFraming,
+}
+
+enum DispatchResult {
+    Respond(Value),
+    NoResponse,
+    NeedsElicitation {
+        elicitation: Value,
+        pending: PendingToolCall,
+    },
+}
+
 pub struct McpServer {
     core: Arc<DesktopCore>,
-    protocol_version: String,
+    whitelist_mode: WhitelistMode,
+    checker: WhitelistChecker,
 }
 
 impl McpServer {
-    pub fn new(core: Arc<DesktopCore>) -> Self {
+    pub fn new(core: Arc<DesktopCore>, whitelist_mode: WhitelistMode) -> Self {
+        let checker = core.create_whitelist_checker();
         Self {
             core,
-            protocol_version: DEFAULT_PROTOCOL_VERSION.to_string(),
+            whitelist_mode,
+            checker,
         }
     }
 
@@ -33,17 +60,96 @@ impl McpServer {
         let stdout = io::stdout();
         let mut reader = BufReader::new(stdin.lock());
         let mut writer = stdout.lock();
+        let mut response_framing = None;
 
-        while let Some(message) = read_message(&mut reader)? {
-            if let Some(response) = self.handle_message(message)? {
-                write_message(&mut writer, &response)?;
+        eprintln!("[xiic-ssh-mcp] MCP server starting, waiting for messages...");
+
+        loop {
+            let message = match read_message(&mut reader)? {
+                Some(msg) => msg,
+                None => break,
+            };
+
+            let framing = *response_framing.get_or_insert(message.framing);
+            let method = message
+                .payload
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let id_str = message
+                .payload
+                .get("id")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "notification".to_string());
+            eprintln!("[xiic-ssh-mcp] Received: method={}, id={}", method, id_str);
+
+            match self.dispatch(message.payload)? {
+                DispatchResult::Respond(response) => {
+                    write_message(&mut writer, &response, framing)?;
+                    eprintln!(
+                        "[xiic-ssh-mcp] Sent response for method={}, id={}",
+                        method, id_str
+                    );
+                }
+                DispatchResult::NoResponse => {
+                    eprintln!(
+                        "[xiic-ssh-mcp] No response needed for method={}",
+                        method
+                    );
+                }
+                DispatchResult::NeedsElicitation {
+                    elicitation,
+                    pending,
+                } => {
+                    eprintln!(
+                        "[xiic-ssh-mcp] Sending elicitation for tool='{}'",
+                        pending.tool_call.name
+                    );
+                    write_message(&mut writer, &elicitation, framing)?;
+
+                    let elicitation_response = read_message(&mut reader)?
+                        .ok_or_else(|| anyhow!("stdin closed while waiting for elicitation response"))?;
+
+                    let result = elicitation_response
+                        .payload
+                        .get("result")
+                        .and_then(|r| r.get("action"))
+                        .and_then(|a| a.as_str());
+
+                    match result {
+                        Some("accept") => {
+                            eprintln!(
+                                "[xiic-ssh-mcp] Elicitation accepted for tool='{}'",
+                                pending.tool_call.name
+                            );
+                            self.checker.cache_approval(&pending.operation);
+                            let exec_result = self.execute_tool(&pending.tool_call)?;
+                            let response = success_response(pending.id, exec_result);
+                            write_message(&mut writer, &response, framing)?;
+                        }
+                        Some("decline") | _ => {
+                            eprintln!(
+                                "[xiic-ssh-mcp] Elicitation declined for tool='{}'",
+                                pending.tool_call.name
+                            );
+                            let response = error_response(
+                                pending.id,
+                                -32000,
+                                "operation declined by user".to_string(),
+                            );
+                            write_message(&mut writer, &response, framing)?;
+                        }
+                    }
+                }
             }
         }
 
+        eprintln!("[xiic-ssh-mcp] MCP server shutting down (stdin closed)");
         Ok(())
     }
 
-    fn handle_message(&mut self, message: Value) -> Result<Option<Value>> {
+    fn dispatch(&self, message: Value) -> Result<DispatchResult> {
         let method = message
             .get("method")
             .and_then(Value::as_str)
@@ -54,7 +160,7 @@ impl McpServer {
 
         if id.is_none() {
             self.handle_notification(method, params)?;
-            return Ok(None);
+            return Ok(DispatchResult::NoResponse);
         }
 
         let id = id.expect("checked is_some");
@@ -65,17 +171,19 @@ impl McpServer {
             },
             "ping" => success_response(id, json!({})),
             "tools/list" => success_response(id, self.handle_tools_list()),
-            "tools/call" => match self.handle_tool_call(params) {
-                Ok(result) => success_response(id, result),
+            "tools/call" => match self.handle_tool_call(params, id.clone()) {
+                Ok(result) => {
+                    return Ok(result);
+                }
                 Err(err) => success_response(id, tool_error(err.to_string())),
             },
             _ => error_response(id, -32601, format!("method '{}' not found", method)),
         };
 
-        Ok(Some(response))
+        Ok(DispatchResult::Respond(response))
     }
 
-    fn handle_notification(&mut self, method: &str, _params: Value) -> Result<()> {
+    fn handle_notification(&self, method: &str, _params: Value) -> Result<()> {
         match method {
             "notifications/initialized" => Ok(()),
             "notifications/cancelled" => Ok(()),
@@ -83,7 +191,7 @@ impl McpServer {
         }
     }
 
-    fn handle_initialize(&mut self, params: Value) -> Result<Value> {
+    fn handle_initialize(&self, params: Value) -> Result<Value> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct InitializeParams {
@@ -92,12 +200,9 @@ impl McpServer {
 
         let params: InitializeParams =
             serde_json::from_value(params).context("invalid initialize params")?;
-        if let Some(protocol_version) = params.protocol_version {
-            self.protocol_version = protocol_version;
-        }
 
         Ok(json!({
-            "protocolVersion": self.protocol_version,
+            "protocolVersion": params.protocol_version.unwrap_or_else(|| DEFAULT_PROTOCOL_VERSION.to_string()),
             "capabilities": {
                 "tools": {
                     "listChanged": false
@@ -107,13 +212,22 @@ impl McpServer {
                 "name": SERVER_NAME,
                 "version": SERVER_VERSION
             },
-            "instructions": "Manage SSH sessions stored by the local Xiic SSH Manager desktop app."
+            "instructions": "Manage SSH sessions stored by the local Xiic SSH Manager desktop app. Operations not in the whitelist require elicitation approval."
         }))
     }
 
     fn handle_tools_list(&self) -> Value {
         json!({
             "tools": [
+                {
+                    "name": "list_servers",
+                    "description": "List all configured SSH server instances.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                },
                 {
                     "name": "create_session",
                     "description": "Create an SSH session for a configured instance_id.",
@@ -176,42 +290,162 @@ impl McpServer {
         })
     }
 
-    fn handle_tool_call(&mut self, params: Value) -> Result<Value> {
-        #[derive(Deserialize)]
-        struct ToolCall {
-            name: String,
-            #[serde(default)]
-            arguments: Value,
-        }
-
+    fn handle_tool_call(&self, params: Value, id: Value) -> Result<DispatchResult> {
         let tool_call: ToolCall =
             serde_json::from_value(params).context("invalid tools/call params")?;
 
+        if self.whitelist_mode == WhitelistMode::Off {
+            let result = self.execute_tool(&tool_call)?;
+            return Ok(DispatchResult::Respond(success_response(id, result)));
+        }
+
+        let ctx = self.build_context(&tool_call)?;
+
+        match self.checker.check(&ctx)? {
+            RuleDecision::Allow => {
+                eprintln!(
+                    "[xiic-ssh-mcp] Whitelist ALLOW for tool='{}' cmd='{}'",
+                    ctx.tool_name,
+                    ctx.command.as_deref().unwrap_or("-"),
+                );
+                let result = self.execute_tool(&tool_call)?;
+                Ok(DispatchResult::Respond(success_response(id, result)))
+            }
+            RuleDecision::Deny(reason) => {
+                eprintln!(
+                    "[xiic-ssh-mcp] Whitelist DENY for tool='{}': {}",
+                    ctx.tool_name, reason
+                );
+                Ok(DispatchResult::Respond(error_response(
+                    id,
+                    -32001,
+                    reason,
+                )))
+            }
+            RuleDecision::NeedsElicitation => {
+                let elicitation_id = Uuid::new_v4().to_string();
+                let details = json!({
+                    "tool_name": ctx.tool_name,
+                    "command": ctx.command,
+                    "remote_path": ctx.remote_path,
+                    "instance_id": ctx.instance_id,
+                });
+                let elicitation = json!({
+                    "jsonrpc": "2.0",
+                    "id": elicitation_id,
+                    "method": "elicitation/create",
+                    "params": {
+                        "message": format!(
+                            "SSH operation '{}' requires approval.",
+                            ctx.tool_name
+                        ),
+                        "requestId": Uuid::new_v4().to_string(),
+                        "details": details,
+                    }
+                });
+
+                let pending = PendingToolCall {
+                    id,
+                    tool_call,
+                    operation: ctx,
+                };
+
+                Ok(DispatchResult::NeedsElicitation {
+                    elicitation,
+                    pending,
+                })
+            }
+        }
+    }
+
+    fn build_context(&self, tool_call: &ToolCall) -> Result<OperationContext> {
         match tool_call.name.as_str() {
+            "list_servers" => Ok(OperationContext {
+                tool_name: "list_servers".into(),
+                command: None,
+                remote_path: None,
+                instance_id: None,
+            }),
             "create_session" => {
                 #[derive(Deserialize)]
                 struct Args {
                     instance_id: String,
                 }
-
-                let args: Args = deserialize_args(tool_call.arguments)?;
-                let result = self.core.create_session(&args.instance_id)?;
-                Ok(tool_success(result)?)
+                let args: Args = deserialize_args(tool_call.arguments.clone())?;
+                Ok(OperationContext {
+                    tool_name: "create_session".into(),
+                    command: None,
+                    remote_path: None,
+                    instance_id: Some(args.instance_id),
+                })
             }
             "execute_command" => {
-                let args: ExecuteCommandArgs = deserialize_args(tool_call.arguments)?;
-                let result = self.core.execute_command(args)?;
-                Ok(tool_success(result)?)
+                let args: ExecuteCommandArgs = deserialize_args(tool_call.arguments.clone())?;
+                let instance_id = self.lookup_session_instance(&args.session_id)?;
+                Ok(OperationContext {
+                    tool_name: "execute_command".into(),
+                    command: Some(args.command),
+                    remote_path: None,
+                    instance_id: Some(instance_id),
+                })
             }
             "upload_file" => {
-                let args: UploadFileArgs = deserialize_args(tool_call.arguments)?;
-                let result = self.core.upload_file(args)?;
-                Ok(tool_success(result)?)
+                let args: UploadFileArgs = deserialize_args(tool_call.arguments.clone())?;
+                let instance_id = self.lookup_session_instance(&args.session_id)?;
+                Ok(OperationContext {
+                    tool_name: "upload_file".into(),
+                    command: None,
+                    remote_path: Some(args.remote_path),
+                    instance_id: Some(instance_id),
+                })
             }
             "download_file" => {
-                let args: DownloadFileArgs = deserialize_args(tool_call.arguments)?;
+                let args: DownloadFileArgs = deserialize_args(tool_call.arguments.clone())?;
+                let instance_id = self.lookup_session_instance(&args.session_id)?;
+                Ok(OperationContext {
+                    tool_name: "download_file".into(),
+                    command: None,
+                    remote_path: Some(args.remote_path),
+                    instance_id: Some(instance_id),
+                })
+            }
+            _ => bail!("unknown tool '{}'", tool_call.name),
+        }
+    }
+
+    fn lookup_session_instance(&self, session_id: &str) -> Result<String> {
+        self.core.get_session_instance_id(session_id)
+    }
+
+    fn execute_tool(&self, tool_call: &ToolCall) -> Result<Value> {
+        match tool_call.name.as_str() {
+            "list_servers" => {
+                let result = self.core.list_servers()?;
+                tool_success(result)
+            }
+            "create_session" => {
+                #[derive(Deserialize)]
+                struct Args {
+                    instance_id: String,
+                }
+                let args: Args = deserialize_args(tool_call.arguments.clone())?;
+                let result = self.core.create_session(&args.instance_id)?;
+                tool_success(result)
+            }
+            "execute_command" => {
+                let args: ExecuteCommandArgs = deserialize_args(tool_call.arguments.clone())?;
+                let result = self.core.execute_command(args)?;
+                tool_success(result)
+            }
+            "upload_file" => {
+                let args: UploadFileArgs = deserialize_args(tool_call.arguments.clone())?;
+                let result = self.core.upload_file(args)?;
+                tool_success(result)
+            }
+            "download_file" => {
+                let args: DownloadFileArgs = deserialize_args(tool_call.arguments.clone())?;
                 let result = self.core.download_file(args)?;
-                Ok(tool_success(result)?)
+                tool_success(result)
             }
             _ => bail!("unknown tool '{}'", tool_call.name),
         }
@@ -225,7 +459,7 @@ where
     serde_json::from_value(value).context("invalid tool arguments")
 }
 
-fn read_message<R>(reader: &mut BufReader<R>) -> Result<Option<Value>>
+fn read_message<R>(reader: &mut BufReader<R>) -> Result<Option<IncomingMessage>>
 where
     R: Read,
 {
@@ -236,9 +470,50 @@ where
         line.clear();
         let bytes_read = reader
             .read_line(&mut line)
-            .context("failed to read MCP header")?;
+            .context("failed to read MCP message")?;
         if bytes_read == 0 {
             return Ok(None);
+        }
+
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            let value = serde_json::from_str(trimmed)
+                .context("failed to parse newline-delimited MCP JSON-RPC message")?;
+            return Ok(Some(IncomingMessage {
+                payload: value,
+                framing: MessageFraming::Newline,
+            }));
+        }
+
+        if let Some((name, value)) = trimmed.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            let parsed = value
+                .trim()
+                .parse::<usize>()
+                .context("invalid Content-Length header")?;
+            content_length = Some(parsed);
+            break;
+        }
+
+        if trimmed.split_once(':').is_some() {
+            break;
+        }
+
+        bail!("invalid MCP message start");
+    }
+
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .context("failed to read MCP header")?;
+        if bytes_read == 0 {
+            bail!("unexpected EOF while reading MCP headers");
         }
 
         let trimmed = line.trim_end_matches(['\r', '\n']);
@@ -265,19 +540,34 @@ where
 
     let value =
         serde_json::from_slice(&body).context("failed to parse MCP JSON-RPC message body")?;
-    Ok(Some(value))
+    Ok(Some(IncomingMessage {
+        payload: value,
+        framing: MessageFraming::ContentLength,
+    }))
 }
 
-fn write_message<W>(writer: &mut W, payload: &Value) -> Result<()>
+fn write_message<W>(writer: &mut W, payload: &Value, framing: MessageFraming) -> Result<()>
 where
     W: Write,
 {
     let body = serde_json::to_vec(payload).context("failed to serialize MCP response")?;
-    write!(writer, "Content-Length: {}\r\n\r\n", body.len())
-        .context("failed to write MCP response header")?;
-    writer
-        .write_all(&body)
-        .context("failed to write MCP response body")?;
+    match framing {
+        MessageFraming::Newline => {
+            writer
+                .write_all(&body)
+                .context("failed to write MCP response body")?;
+            writer
+                .write_all(b"\n")
+                .context("failed to write MCP response newline")?;
+        }
+        MessageFraming::ContentLength => {
+            write!(writer, "Content-Length: {}\r\n\r\n", body.len())
+                .context("failed to write MCP response header")?;
+            writer
+                .write_all(&body)
+                .context("failed to write MCP response body")?;
+        }
+    }
     writer.flush().context("failed to flush MCP response")?;
     Ok(())
 }
@@ -341,4 +631,95 @@ fn _type_assertions(
     download: DownloadFileResult,
 ) {
     let _ = (create, exec, upload, download);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufReader, Cursor};
+
+    use serde_json::json;
+
+    use super::{MessageFraming, read_message, write_message};
+
+    fn initialize_payload() -> serde_json::Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "test",
+                    "version": "0.0.0"
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn reads_newline_delimited_message() {
+        let input = format!("{}\n", initialize_payload());
+        let mut reader = BufReader::new(Cursor::new(input.into_bytes()));
+
+        let message = read_message(&mut reader).unwrap().unwrap();
+
+        assert_eq!(message.framing, MessageFraming::Newline);
+        assert_eq!(message.payload["method"], "initialize");
+    }
+
+    #[test]
+    fn reads_content_length_message() {
+        let body = initialize_payload().to_string();
+        let input = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        let mut reader = BufReader::new(Cursor::new(input.into_bytes()));
+
+        let message = read_message(&mut reader).unwrap().unwrap();
+
+        assert_eq!(message.framing, MessageFraming::ContentLength);
+        assert_eq!(message.payload["method"], "initialize");
+    }
+
+    #[test]
+    fn writes_newline_delimited_response() {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {}
+        });
+        let mut output = Vec::new();
+
+        write_message(&mut output, &payload, MessageFraming::Newline).unwrap();
+
+        assert!(output.ends_with(b"\n"));
+        assert!(!output.starts_with(b"Content-Length:"));
+        let parsed: serde_json::Value =
+            serde_json::from_slice(output.strip_suffix(b"\n").unwrap()).unwrap();
+        assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn writes_content_length_response() {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {}
+        });
+        let mut output = Vec::new();
+
+        write_message(&mut output, &payload, MessageFraming::ContentLength).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        let (header, body) = output.split_once("\r\n\r\n").unwrap();
+        let length = header
+            .strip_prefix("Content-Length: ")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert_eq!(length, body.len());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            payload
+        );
+    }
 }

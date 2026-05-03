@@ -5,20 +5,24 @@ use std::sync::Arc;
 use anyhow::Result;
 use xiic_ssh_mcp::app_core::{DEFAULT_KEYRING_SERVICE, DesktopCore};
 use xiic_ssh_mcp::mcp::McpServer;
+use xiic_ssh_mcp::models::WhitelistMode;
 
 fn main() -> Result<()> {
     let options = CliOptions::parse(env::args().skip(1))?;
-    let core = Arc::new(DesktopCore::new(
+    let core = Arc::new(DesktopCore::new_with_socket(
         options.db_path,
         options.keyring_service,
+        options.notify_socket,
     )?);
-    let mut server = McpServer::new(core);
+    let mut server = McpServer::new(core, options.whitelist_mode);
     server.run()
 }
 
 struct CliOptions {
     db_path: PathBuf,
     keyring_service: String,
+    notify_socket: Option<PathBuf>,
+    whitelist_mode: WhitelistMode,
 }
 
 impl CliOptions {
@@ -28,6 +32,8 @@ impl CliOptions {
     {
         let mut db_path = None;
         let mut keyring_service = DEFAULT_KEYRING_SERVICE.to_string();
+        let mut notify_socket = None;
+        let mut whitelist_mode = WhitelistMode::Strict;
         let mut iter = args.into_iter();
 
         while let Some(arg) = iter.next() {
@@ -42,6 +48,27 @@ impl CliOptions {
                     keyring_service = iter
                         .next()
                         .ok_or_else(|| anyhow::anyhow!("--keyring-service requires a value"))?;
+                }
+                "--notify-socket" => {
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--notify-socket requires a value"))?;
+                    notify_socket = Some(PathBuf::from(value));
+                }
+                "--whitelist" => {
+                    let value = iter.next().ok_or_else(|| {
+                        anyhow::anyhow!("--whitelist requires 'strict' or 'off'")
+                    })?;
+                    whitelist_mode = match value.as_str() {
+                        "strict" => WhitelistMode::Strict,
+                        "off" => WhitelistMode::Off,
+                        _ => {
+                            return Err(anyhow::anyhow!(
+                                "--whitelist must be 'strict' or 'off', got '{}'",
+                                value
+                            ));
+                        }
+                    };
                 }
                 "-h" | "--help" => {
                     print_help();
@@ -60,12 +87,22 @@ impl CliOptions {
         Ok(Self {
             db_path,
             keyring_service,
+            notify_socket,
+            whitelist_mode,
         })
     }
 }
 
 fn print_help() {
     println!(
-        "xiic-ssh-mcp\n\nUsage:\n  xiic-ssh-mcp --db-path <path> [--keyring-service <service>]\n"
+        "xiic-ssh-mcp\n\n\
+         Usage:\n  \
+         xiic-ssh-mcp --db-path <path> [--keyring-service <service>] [--notify-socket <path>] [--whitelist strict|off]\n\n\
+         Options:\n  \
+         --db-path <path>          Path to SQLite database\n  \
+         --keyring-service <srv>   Keyring service name (default: {})\n  \
+         --notify-socket <path>    Unix socket path for UI notifications\n  \
+         --whitelist <mode>        Whitelist mode: 'strict' (default) or 'off'\n",
+        DEFAULT_KEYRING_SERVICE,
     );
 }

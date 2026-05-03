@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
 type AuthKind = "password" | "private_key";
@@ -43,6 +44,15 @@ type McpConfigBundle = {
   command: string;
   args: string[];
   stdio_json: string;
+};
+
+type OperationLogEntry = {
+  id: number;
+  session_id: string;
+  instance_id: string;
+  operation: string;
+  details: string;
+  created_at: string;
 };
 
 type ParsedTarget = {
@@ -99,6 +109,15 @@ export default function App() {
   );
   const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [activeTab, setActiveTab] = useState<"config" | "logs">("config");
+  const [logs, setLogs] = useState<OperationLogEntry[]>([]);
+  const [loadingLogs, setLoadingLogs] = useState(false);
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [expandedStdout, setExpandedStdout] = useState<0 | 10 | 20>(0);
+  const [lastLogId, setLastLogId] = useState(0);
+  const logListRef = useRef<HTMLDivElement>(null);
+  const activeTabRef = useRef(activeTab);
+  const autoRefreshRef = useRef(autoRefresh);
 
   useEffect(() => {
     void loadData();
@@ -137,6 +156,78 @@ export default function App() {
       setStatusTone("danger");
     }
   }
+
+  useEffect(() => {
+    if (activeTab === "logs") {
+      void loadLogs();
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
+    activeTabRef.current = activeTab;
+  }, [activeTab]);
+
+  useEffect(() => {
+    autoRefreshRef.current = autoRefresh;
+  }, [autoRefresh]);
+
+  useEffect(() => {
+    const setup = async () => {
+      const unlisten = await listen("log-updated", () => {
+        if (activeTabRef.current === "logs" && autoRefreshRef.current) {
+          setTimeout(() => void loadNewLogs(), 150);
+        }
+      });
+      return unlisten;
+    };
+    let unlisten: (() => void) | undefined;
+    setup().then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, []);
+
+  async function loadLogs() {
+    setLoadingLogs(true);
+    try {
+      const entries = await invoke<OperationLogEntry[]>("get_operation_logs", { limit: 200 });
+      const sorted = [...entries].reverse();
+      setLogs(sorted);
+      setLastLogId(sorted.length > 0 ? sorted[sorted.length - 1].id : 0);
+    } catch (error) {
+      setStatus(asMessage(error));
+      setStatusTone("danger");
+    } finally {
+      setLoadingLogs(false);
+    }
+  }
+
+  async function loadNewLogs() {
+    if (lastLogId === 0) {
+      void loadLogs();
+      return;
+    }
+    try {
+      const entries = await invoke<OperationLogEntry[]>("get_operation_logs_since", {
+        sinceId: lastLogId,
+        limit: 200,
+      });
+      if (entries.length === 0) return;
+      setLogs((prev) => {
+        const existingIds = new Set(prev.map((e) => e.id));
+        const newEntries = entries.filter((e) => !existingIds.has(e.id));
+        return [...prev, ...newEntries];
+      });
+      const maxId = entries.reduce((max, e) => Math.max(max, e.id), lastLogId);
+      setLastLogId(maxId);
+    } catch {
+      // silently fail on background refresh
+    }
+  }
+
+  useEffect(() => {
+    if (logListRef.current) {
+      logListRef.current.scrollTop = logListRef.current.scrollHeight;
+    }
+  }, [logs]);
 
 function startCreateMode() {
   setSelectedId(null);
@@ -329,176 +420,294 @@ function startCreateMode() {
             </div>
           </div>
 
-          <div className="form-grid">
-            <label className="field-span-2">
-              <span>SSH 目标</span>
-              <div className="target-row">
-                <input
-                  onChange={(event) => setTargetInput(event.target.value)}
-                  placeholder="例如：ssh://root@10.0.0.10:22 或 root@10.0.0.10"
-                  value={targetInput}
-                />
-                <button className="ghost-button" onClick={applyTargetInput} type="button">
-                  解析
-                </button>
-              </div>
-            </label>
-            <label>
-              <span>连接 ID</span>
-              <input
-                disabled={!isCreating}
-                onChange={(event) => setDraft({ ...draft, instance_id: event.target.value })}
-                placeholder="例如：prod-server"
-                value={draft.instance_id}
-              />
-            </label>
-            <label>
-              <span>显示名称</span>
-              <input
-                onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-                placeholder="例如：生产服务器"
-                value={draft.name}
-              />
-            </label>
-            <label>
-              <span>主机</span>
-              <input
-                onChange={(event) => setDraft({ ...draft, host: event.target.value })}
-                placeholder="10.0.0.10"
-                value={draft.host}
-              />
-            </label>
-            <label>
-              <span>端口</span>
-              <input
-                min={1}
-                onChange={(event) =>
-                  setDraft({
-                    ...draft,
-                    port: Number.parseInt(event.target.value, 10) || 22,
-                  })
-                }
-                type="number"
-                value={draft.port}
-              />
-            </label>
-            <label>
-              <span>用户名</span>
-              <input
-                onChange={(event) => setDraft({ ...draft, username: event.target.value })}
-                placeholder="root"
-                value={draft.username}
-              />
-            </label>
-            <label>
-              <span>认证方式</span>
-              <select
-                onChange={(event) =>
-                  setDraft({
-                    ...draft,
-                    auth_kind: event.target.value as AuthKind,
-                  })
-                }
-                value={draft.auth_kind}
-              >
-                <option value="password">密码</option>
-                <option value="private_key">私钥</option>
-              </select>
-            </label>
+          <div className="tab-bar">
+            <button
+              className={activeTab === "config" ? "tab active" : "tab"}
+              onClick={() => setActiveTab("config")}
+              type="button"
+            >
+              配置
+            </button>
+            <button
+              className={activeTab === "logs" ? "tab active" : "tab"}
+              onClick={() => setActiveTab("logs")}
+              type="button"
+            >
+              操作日志
+            </button>
           </div>
 
-          <div className="toggle-row">
-            <label className="checkbox">
-              <input
-                checked={draft.host_key_check}
-                onChange={(event) =>
-                  setDraft({ ...draft, host_key_check: event.target.checked })
-                }
-                type="checkbox"
-              />
-              <span>按 known_hosts 校验主机指纹</span>
-            </label>
-
-            {!isCreating ? (
-              <label className="checkbox">
-                <input
-                  checked={draft.keep_existing_secret}
-                  onChange={(event) =>
-                    setDraft({ ...draft, keep_existing_secret: event.target.checked })
-                  }
-                  type="checkbox"
-                />
-                <span>如果密钥字段为空，则保留已存凭据</span>
-              </label>
-            ) : null}
-          </div>
-
-          {requiresPassword ? (
-            <label className="field-block">
-              <span>SSH 密码</span>
-              <input
-                onChange={(event) => setDraft({ ...draft, password: event.target.value })}
-                placeholder={
-                  isCreating
-                    ? "远程账户密码"
-                    : "留空则保留已保存的 SSH 密码"
-                }
-                type="password"
-                value={draft.password}
-              />
-            </label>
-          ) : null}
-
-          {requiresKey ? (
+          {activeTab === "config" ? (
             <>
-              <label className="field-block">
-                <span>SSH 私钥</span>
-                <textarea
-                  onChange={(event) => setDraft({ ...draft, private_key: event.target.value })}
-                  placeholder={
-                    isCreating
-                      ? "粘贴 OpenSSH 私钥内容"
-                      : "留空则保留已保存的私钥"
-                  }
-                  rows={4}
-                  value={draft.private_key}
-                />
-              </label>
-              <label className="field-block">
-                <span>私钥口令</span>
-                <input
-                  onChange={(event) => setDraft({ ...draft, passphrase: event.target.value })}
-                  placeholder="可选口令"
-                  type="password"
-                  value={draft.passphrase}
-                />
-              </label>
+              <div className="tab-content">
+                <div className="form-grid">
+                  <label className="field-span-2">
+                    <span>SSH 目标</span>
+                    <div className="target-row">
+                      <input
+                        onChange={(event) => setTargetInput(event.target.value)}
+                        placeholder="例如：ssh://root@10.0.0.10:22 或 root@10.0.0.10"
+                        value={targetInput}
+                      />
+                      <button className="ghost-button" onClick={applyTargetInput} type="button">
+                        解析
+                      </button>
+                    </div>
+                  </label>
+                  <label>
+                    <span>连接 ID</span>
+                    <input
+                      disabled={!isCreating}
+                      onChange={(event) => setDraft({ ...draft, instance_id: event.target.value })}
+                      placeholder="例如：prod-server"
+                      value={draft.instance_id}
+                    />
+                  </label>
+                  <label>
+                    <span>显示名称</span>
+                    <input
+                      onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+                      placeholder="例如：生产服务器"
+                      value={draft.name}
+                    />
+                  </label>
+                  <label>
+                    <span>主机</span>
+                    <input
+                      onChange={(event) => setDraft({ ...draft, host: event.target.value })}
+                      placeholder="10.0.0.10"
+                      value={draft.host}
+                    />
+                  </label>
+                  <label>
+                    <span>端口</span>
+                    <input
+                      min={1}
+                      onChange={(event) =>
+                        setDraft({
+                          ...draft,
+                          port: Number.parseInt(event.target.value, 10) || 22,
+                        })
+                      }
+                      type="number"
+                      value={draft.port}
+                    />
+                  </label>
+                  <label>
+                    <span>用户名</span>
+                    <input
+                      onChange={(event) => setDraft({ ...draft, username: event.target.value })}
+                      placeholder="root"
+                      value={draft.username}
+                    />
+                  </label>
+                  <label>
+                    <span>认证方式</span>
+                    <select
+                      onChange={(event) =>
+                        setDraft({
+                          ...draft,
+                          auth_kind: event.target.value as AuthKind,
+                        })
+                      }
+                      value={draft.auth_kind}
+                    >
+                      <option value="password">密码</option>
+                      <option value="private_key">私钥</option>
+                    </select>
+                  </label>
+                </div>
+
+                <div className="toggle-row">
+                  <label className="checkbox">
+                    <input
+                      checked={draft.host_key_check}
+                      onChange={(event) =>
+                        setDraft({ ...draft, host_key_check: event.target.checked })
+                      }
+                      type="checkbox"
+                    />
+                    <span>按 known_hosts 校验主机指纹</span>
+                  </label>
+
+                  {!isCreating ? (
+                    <label className="checkbox">
+                      <input
+                        checked={draft.keep_existing_secret}
+                        onChange={(event) =>
+                          setDraft({ ...draft, keep_existing_secret: event.target.checked })
+                        }
+                        type="checkbox"
+                      />
+                      <span>如果密钥字段为空，则保留已存凭据</span>
+                    </label>
+                  ) : null}
+                </div>
+
+                {requiresPassword ? (
+                  <label className="field-block">
+                    <span>SSH 密码</span>
+                    <input
+                      onChange={(event) => setDraft({ ...draft, password: event.target.value })}
+                      placeholder={
+                        isCreating
+                          ? "远程账户密码"
+                          : "留空则保留已保存的 SSH 密码"
+                      }
+                      type="password"
+                      value={draft.password}
+                    />
+                  </label>
+                ) : null}
+
+                {requiresKey ? (
+                  <>
+                    <label className="field-block">
+                      <span>SSH 私钥</span>
+                      <textarea
+                        onChange={(event) => setDraft({ ...draft, private_key: event.target.value })}
+                        placeholder={
+                          isCreating
+                            ? "粘贴 OpenSSH 私钥内容"
+                            : "留空则保留已保存的私钥"
+                        }
+                        rows={4}
+                        value={draft.private_key}
+                      />
+                    </label>
+                    <label className="field-block">
+                      <span>私钥口令</span>
+                      <input
+                        onChange={(event) => setDraft({ ...draft, passphrase: event.target.value })}
+                        placeholder="可选口令"
+                        type="password"
+                        value={draft.passphrase}
+                      />
+                    </label>
+                  </>
+                ) : null}
+
+                <label className="field-block">
+                  <span>备注</span>
+                  <textarea
+                    onChange={(event) => setDraft({ ...draft, notes: event.target.value })}
+                    placeholder="可选备注、标签或使用说明"
+                    rows={2}
+                    value={draft.notes}
+                  />
+                </label>
+
+                <div className="action-row">
+                  <button className="primary-button" disabled={saving} onClick={handleSave} type="button">
+                    {saving ? "保存中..." : "保存连接"}
+                  </button>
+                  <button className="secondary-button" disabled={testing} onClick={handleTest} type="button">
+                    {testing ? "测试中..." : "测试连接"}
+                  </button>
+                  {!isCreating ? (
+                    <button className="danger-button" onClick={handleDelete} type="button">
+                      删除
+                    </button>
+                  ) : null}
+                </div>
+              </div>
             </>
-          ) : null}
+          ) : (
+            <div className="tab-content log-viewer">
+              <div className="log-toolbar">
+                <span className="log-summary">
+                  {logs.length > 0
+                    ? `共 ${logs.length} 条操作记录`
+                    : loadingLogs
+                      ? "加载中..."
+                      : "暂无操作记录"}
+                </span>
+                <div className="log-toolbar-actions">
+                  <label className="toggle-switch" title={autoRefresh ? "暂停自动刷新" : "恢复自动刷新"}>
+                    <input
+                      type="checkbox"
+                      checked={autoRefresh}
+                      onChange={() => setAutoRefresh((v) => !v)}
+                    />
+                    <span className="toggle-slider" />
+                    <span className="toggle-label">自动</span>
+                  </label>
+                  <button
+                    className="ghost-button icon-button"
+                    disabled={loadingLogs}
+                    onClick={() => void loadLogs()}
+                    title="手动刷新"
+                    type="button"
+                  >
+                    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M1 8a7 7 0 0 1 13.2-3.2M15 8a7 7 0 0 1-13.2 3.2" />
+                      <path d="M14 2v4h-4M2 14v-4h4" />
+                    </svg>
+                  </button>
+                  <button
+                    className={`ghost-button icon-button${expandedStdout === 10 ? " active" : ""}`}
+                    onClick={() => setExpandedStdout((v) => (v === 10 ? 0 : 10))}
+                    title={expandedStdout === 10 ? "折叠 stdout" : "展开最近 10 条 stdout"}
+                    type="button"
+                  >
+                    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M4 6h8M8 2v8" />
+                    </svg>
+                    <span className="icon-badge">10</span>
+                  </button>
+                  <button
+                    className={`ghost-button icon-button${expandedStdout === 20 ? " active" : ""}`}
+                    onClick={() => setExpandedStdout((v) => (v === 20 ? 0 : 20))}
+                    title={expandedStdout === 20 ? "折叠 stdout" : "展开最近 20 条 stdout"}
+                    type="button"
+                  >
+                    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M4 6h8M8 2v8" />
+                    </svg>
+                    <span className="icon-badge">20</span>
+                  </button>
+                </div>
+              </div>
 
-          <label className="field-block">
-            <span>备注</span>
-            <textarea
-              onChange={(event) => setDraft({ ...draft, notes: event.target.value })}
-              placeholder="可选备注、标签或使用说明"
-              rows={2}
-              value={draft.notes}
-            />
-          </label>
+              <div className="log-list" ref={logListRef}>
+                {logs.map((entry, index) => {
+                  const prev = index > 0 ? logs[index - 1] : null;
+                  const sessionChange = !prev || prev.session_id !== entry.session_id;
+                  const execCount = logs
+                    .slice(latestNExecIndex(logs, expandedStdout))
+                    .filter((e) => e.operation === "execute_command")
+                    .length;
+                  const shouldOpen = expandedStdout > 0
+                    && entry.operation === "execute_command"
+                    && index >= latestNExecIndex(logs, expandedStdout)
+                    && entry.operation === "execute_command";
 
-          <div className="action-row">
-            <button className="primary-button" disabled={saving} onClick={handleSave} type="button">
-              {saving ? "保存中..." : "保存连接"}
-            </button>
-            <button className="secondary-button" disabled={testing} onClick={handleTest} type="button">
-              {testing ? "测试中..." : "测试连接"}
-            </button>
-            {!isCreating ? (
-              <button className="danger-button" onClick={handleDelete} type="button">
-                删除
-              </button>
-            ) : null}
-          </div>
+                  return (
+                    <div key={entry.id}>
+                      {sessionChange ? (
+                        <div className="log-separator">
+                          <span className="log-separator-label">
+                            {parseLogInstanceName(entry)}
+                          </span>
+                        </div>
+                      ) : null}
+                      <div className="log-entry">
+                        <div className="log-entry-meta">
+                          <span className="log-time">{formatLogTime(entry.created_at)}</span>
+                          <span className={`log-op-badge log-op-${entry.operation}`}>
+                            {entry.operation}
+                          </span>
+                        </div>
+                        <div className="log-entry-body">
+                          <LogEntryBody entry={entry} autoOpenStdout={shouldOpen} />
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </section>
       </main>
 
@@ -549,6 +758,102 @@ function startCreateMode() {
       ) : null}
     </div>
   );
+}
+
+function formatLogTime(iso: string): string {
+  try {
+    const date = new Date(iso);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  } catch {
+    return iso;
+  }
+}
+
+function parseLogInstanceName(entry: OperationLogEntry): string {
+  try {
+    const d = JSON.parse(entry.details);
+    return (d.instance_name as string) || entry.instance_id;
+  } catch {
+    return entry.instance_id;
+  }
+}
+
+function latestNExecIndex(logs: OperationLogEntry[], n: number): number {
+  if (n === 0) return logs.length;
+  let count = 0;
+  for (let i = logs.length - 1; i >= 0; i--) {
+    if (logs[i].operation === "execute_command") {
+      count++;
+      if (count === n) return i;
+    }
+  }
+  return 0;
+}
+
+function LogEntryBody({ entry, autoOpenStdout }: { entry: OperationLogEntry; autoOpenStdout: boolean }) {
+  let parsed: Record<string, unknown> = {};
+  try {
+    parsed = JSON.parse(entry.details);
+  } catch {
+    return <pre className="log-body">{entry.details}</pre>;
+  }
+
+  if (entry.operation === "execute_command") {
+    return (
+      <div className="log-body">
+        <span className="log-cmd">
+          <span className="log-cmd-prefix">$</span> {String(parsed.command ?? "")}
+        </span>
+        <span className="log-exit">
+          exit:{String(parsed.exit_code ?? "?")}
+        </span>
+        {parsed.stdout ? (
+          <details className="log-output-block" open={autoOpenStdout}>
+            <summary className="log-output-summary">stdout</summary>
+            <pre className="log-output">{String(parsed.stdout)}</pre>
+          </details>
+        ) : null}
+        {parsed.stderr ? (
+          <details className="log-output-block" open={autoOpenStdout}>
+            <summary className="log-output-summary">stderr</summary>
+            <pre className="log-output log-output-stderr">{String(parsed.stderr)}</pre>
+          </details>
+        ) : null}
+      </div>
+    );
+  }
+
+  if (entry.operation === "create_session") {
+    const hostInfo = parsed.host
+      ? ` (${String(parsed.name ?? parsed.instance_id)} @ ${String(parsed.host)}:${String(parsed.port)})`
+      : "";
+    return (
+      <div className="log-body">
+        <span>session: {entry.session_id.slice(0, 8)}...{hostInfo}</span>
+      </div>
+    );
+  }
+
+  if (entry.operation === "upload_file") {
+    return (
+      <div className="log-body">
+        <span className="log-path">{String(parsed.remote_path ?? "")}</span>
+        <span className="log-meta">{Number(parsed.bytes_written ?? 0)} bytes</span>
+      </div>
+    );
+  }
+
+  if (entry.operation === "download_file") {
+    return (
+      <div className="log-body">
+        <span className="log-path">{String(parsed.remote_path ?? "")}</span>
+        <span className="log-meta">{Number(parsed.size ?? 0)} bytes · {String(parsed.encoding ?? "")}</span>
+      </div>
+    );
+  }
+
+  return <pre className="log-body">{entry.details}</pre>;
 }
 
 function asMessage(error: unknown): string {

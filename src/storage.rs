@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 
-use crate::models::{AuthKind, InstanceDraft, SecretPayload, StoredInstance};
+use crate::models::{AuthKind, InstanceDraft, OperationLogEntry, RuleAction, RuleType, SecretPayload, StoredInstance, WhitelistRule};
 
 #[derive(Clone)]
 pub struct InstanceStore {
@@ -121,7 +121,30 @@ impl InstanceStore {
                 secret_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(instance_id) REFERENCES instances(instance_id) ON DELETE CASCADE
-            );",
+            );
+
+            CREATE TABLE IF NOT EXISTS operation_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                instance_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                details TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_operation_logs_created_at ON operation_logs(created_at);
+
+            CREATE TABLE IF NOT EXISTS whitelist_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_type TEXT NOT NULL CHECK(rule_type IN ('tool','command','path','instance')),
+                pattern TEXT NOT NULL,
+                action TEXT NOT NULL CHECK(action IN ('allow','deny')),
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+
+            INSERT OR IGNORE INTO whitelist_rules (rule_type, pattern, action, created_at)
+            VALUES ('tool', 'list_servers', 'allow', datetime('now'));",
         )?;
         Ok(())
     }
@@ -176,9 +199,161 @@ impl InstanceStore {
         Ok(self.load_secret(instance_id)?.is_some())
     }
 
+    pub fn insert_log(
+        &self,
+        session_id: &str,
+        instance_id: &str,
+        operation: &str,
+        details: &str,
+    ) -> Result<()> {
+        let connection = self.open()?;
+        connection.execute(
+            "DELETE FROM operation_logs WHERE created_at < datetime('now', '-3 days')",
+            [],
+        )?;
+        let now = Utc::now().to_rfc3339();
+        connection.execute(
+            "INSERT INTO operation_logs (session_id, instance_id, operation, details, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_id, instance_id, operation, details, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_operation_logs(&self, limit: Option<u64>) -> Result<Vec<OperationLogEntry>> {
+        let connection = self.open()?;
+        let limit = limit.unwrap_or(200) as i64;
+        let mut statement = connection.prepare(
+            "SELECT id, session_id, instance_id, operation, details, created_at
+             FROM operation_logs
+             ORDER BY id DESC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit], |row| {
+            Ok(OperationLogEntry {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                instance_id: row.get(2)?,
+                operation: row.get(3)?,
+                details: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list operation logs")
+    }
+
+    pub fn get_operation_logs_since(
+        &self,
+        since_id: i64,
+        limit: u64,
+    ) -> Result<Vec<OperationLogEntry>> {
+        let connection = self.open()?;
+        let limit = limit as i64;
+        let mut statement = connection.prepare(
+            "SELECT id, session_id, instance_id, operation, details, created_at
+             FROM operation_logs
+             WHERE id > ?1
+             ORDER BY id ASC
+             LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![since_id, limit], |row| {
+            Ok(OperationLogEntry {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                instance_id: row.get(2)?,
+                operation: row.get(3)?,
+                details: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list operation logs since")
+    }
+
+    pub fn list_whitelist_rules(&self) -> Result<Vec<WhitelistRule>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT id, rule_type, pattern, action, enabled, created_at
+             FROM whitelist_rules
+             ORDER BY id ASC",
+        )?;
+
+        let rows = statement.query_map([], |row| {
+            Ok(WhitelistRule {
+                id: row.get(0)?,
+                rule_type: RuleType::from_str(row.get::<_, String>(1)?.as_str())
+                    .unwrap_or(RuleType::Tool),
+                pattern: row.get(2)?,
+                action: RuleAction::from_str(row.get::<_, String>(3)?.as_str())
+                    .unwrap_or(RuleAction::Deny),
+                enabled: row.get::<_, i64>(4)? != 0,
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list whitelist rules")
+    }
+
+    pub fn get_whitelist_rules_by_type(&self, rule_type: &RuleType) -> Result<Vec<WhitelistRule>> {
+        let connection = self.open()?;
+        let type_str = rule_type.as_str();
+        let mut statement = connection.prepare(
+            "SELECT id, rule_type, pattern, action, enabled, created_at
+             FROM whitelist_rules
+             WHERE rule_type = ?1 AND enabled = 1
+             ORDER BY id ASC",
+        )?;
+
+        let rows = statement.query_map([type_str], |row| {
+            Ok(WhitelistRule {
+                id: row.get(0)?,
+                rule_type: RuleType::from_str(row.get::<_, String>(1)?.as_str())
+                    .unwrap_or(RuleType::Tool),
+                pattern: row.get(2)?,
+                action: RuleAction::from_str(row.get::<_, String>(3)?.as_str())
+                    .unwrap_or(RuleAction::Deny),
+                enabled: true,
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list whitelist rules by type")
+    }
+
+    pub fn add_whitelist_rule(
+        &self,
+        rule_type: &RuleType,
+        pattern: &str,
+        action: &RuleAction,
+    ) -> Result<i64> {
+        let connection = self.open()?;
+        let now = Utc::now().to_rfc3339();
+        connection.execute(
+            "INSERT INTO whitelist_rules (rule_type, pattern, action, enabled, created_at)
+             VALUES (?1, ?2, ?3, 1, ?4)",
+            params![rule_type.as_str(), pattern, action.as_str(), now],
+        )?;
+
+        Ok(connection.last_insert_rowid())
+    }
+
+    pub fn remove_whitelist_rule(&self, id: i64) -> Result<()> {
+        let connection = self.open()?;
+        let affected = connection
+            .execute("DELETE FROM whitelist_rules WHERE id = ?1", [id])
+            .context("failed to remove whitelist rule")?;
+        if affected == 0 {
+            bail!("whitelist rule with id {} not found", id);
+        }
+        Ok(())
+    }
+
     fn open(&self) -> Result<Connection> {
-        Connection::open(&self.db_path)
-            .with_context(|| format!("failed to open SQLite database '{}'", self.db_path.display()))
+        let conn = Connection::open(&self.db_path)
+            .with_context(|| format!("failed to open SQLite database '{}'", self.db_path.display()))?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+        Ok(conn)
     }
 }
 
