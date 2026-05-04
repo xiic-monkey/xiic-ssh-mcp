@@ -4,7 +4,10 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 
-use crate::models::{AuthKind, InstanceDraft, OperationLogEntry, RuleAction, RuleType, SecretPayload, StoredInstance, WhitelistRule};
+use crate::models::{
+    AuthKind, InstanceDraft, OperationLogEntry, RuleAction, RuleType, SecretPayload,
+    StoredInstance, WhitelistRule,
+};
 
 #[derive(Clone)]
 pub struct InstanceStore {
@@ -95,7 +98,10 @@ impl InstanceStore {
     pub fn delete_instance(&self, instance_id: &str) -> Result<()> {
         let connection = self.open()?;
         connection
-            .execute("DELETE FROM instances WHERE instance_id = ?1", [instance_id])
+            .execute(
+                "DELETE FROM instances WHERE instance_id = ?1",
+                [instance_id],
+            )
             .with_context(|| format!("failed to delete instance '{}'", instance_id))?;
         Ok(())
     }
@@ -190,7 +196,10 @@ impl InstanceStore {
     pub fn delete_secret(&self, instance_id: &str) -> Result<()> {
         let connection = self.open()?;
         connection
-            .execute("DELETE FROM instance_secrets WHERE instance_id = ?1", [instance_id])
+            .execute(
+                "DELETE FROM instance_secrets WHERE instance_id = ?1",
+                [instance_id],
+            )
             .with_context(|| format!("failed to delete secret '{}'", instance_id))?;
         Ok(())
     }
@@ -350,8 +359,12 @@ impl InstanceStore {
     }
 
     fn open(&self) -> Result<Connection> {
-        let conn = Connection::open(&self.db_path)
-            .with_context(|| format!("failed to open SQLite database '{}'", self.db_path.display()))?;
+        let conn = Connection::open(&self.db_path).with_context(|| {
+            format!(
+                "failed to open SQLite database '{}'",
+                self.db_path.display()
+            )
+        })?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
         Ok(conn)
     }

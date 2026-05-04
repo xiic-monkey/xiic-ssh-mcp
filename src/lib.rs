@@ -1,4 +1,5 @@
 pub mod app_core;
+pub mod approval;
 pub mod credentials;
 pub mod mcp;
 pub mod models;

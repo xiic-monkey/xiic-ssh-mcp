@@ -261,16 +261,14 @@ mod tests {
 
     #[test]
     fn evaluate_needs_elicitation() {
-        let rules = vec![
-            WhitelistRule {
-                id: 1,
-                rule_type: RuleType::Tool,
-                pattern: "list_servers".into(),
-                action: RuleAction::Allow,
-                enabled: true,
-                created_at: String::new(),
-            },
-        ];
+        let rules = vec![WhitelistRule {
+            id: 1,
+            rule_type: RuleType::Tool,
+            pattern: "list_servers".into(),
+            action: RuleAction::Allow,
+            enabled: true,
+            created_at: String::new(),
+        }];
 
         let ctx = OperationContext {
             tool_name: "execute_command".into(),

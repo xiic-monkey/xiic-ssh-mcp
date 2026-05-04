@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -7,8 +8,9 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::app_core::DesktopCore;
+use crate::approval::LocalApproval;
 use crate::models::{
-    CreateSessionResult, DownloadFileArgs, DownloadFileResult, ExecuteCommandArgs,
+    ApprovalMode, CreateSessionResult, DownloadFileArgs, DownloadFileResult, ExecuteCommandArgs,
     ExecuteCommandResult, OperationContext, PendingToolCall, RuleDecision, ToolCall,
     UploadFileArgs, UploadFileResult, WhitelistMode,
 };
@@ -33,25 +35,41 @@ struct IncomingMessage {
 enum DispatchResult {
     Respond(Value),
     NoResponse,
-    NeedsElicitation {
-        elicitation: Value,
+    NeedsApproval {
+        flow: ApprovalFlow,
         pending: PendingToolCall,
     },
+}
+
+enum ApprovalFlow {
+    Elicitation(Value),
+    Local,
 }
 
 pub struct McpServer {
     core: Arc<DesktopCore>,
     whitelist_mode: WhitelistMode,
+    approval_mode: ApprovalMode,
+    client_supports_elicitation: bool,
     checker: WhitelistChecker,
+    local_approval: LocalApproval,
 }
 
 impl McpServer {
-    pub fn new(core: Arc<DesktopCore>, whitelist_mode: WhitelistMode) -> Self {
+    pub fn new(
+        core: Arc<DesktopCore>,
+        whitelist_mode: WhitelistMode,
+        approval_mode: ApprovalMode,
+        notify_socket: Option<PathBuf>,
+    ) -> Self {
         let checker = core.create_whitelist_checker();
         Self {
             core,
             whitelist_mode,
+            approval_mode,
+            client_supports_elicitation: false,
             checker,
+            local_approval: LocalApproval::new(notify_socket),
         }
     }
 
@@ -93,53 +111,47 @@ impl McpServer {
                     );
                 }
                 DispatchResult::NoResponse => {
-                    eprintln!(
-                        "[xiic-ssh-mcp] No response needed for method={}",
-                        method
-                    );
+                    eprintln!("[xiic-ssh-mcp] No response needed for method={}", method);
                 }
-                DispatchResult::NeedsElicitation {
-                    elicitation,
-                    pending,
-                } => {
-                    eprintln!(
-                        "[xiic-ssh-mcp] Sending elicitation for tool='{}'",
-                        pending.tool_call.name
-                    );
-                    write_message(&mut writer, &elicitation, framing)?;
-
-                    let elicitation_response = read_message(&mut reader)?
-                        .ok_or_else(|| anyhow!("stdin closed while waiting for elicitation response"))?;
-
-                    let result = elicitation_response
-                        .payload
-                        .get("result")
-                        .and_then(|r| r.get("action"))
-                        .and_then(|a| a.as_str());
-
-                    match result {
-                        Some("accept") => {
+                DispatchResult::NeedsApproval { flow, pending } => {
+                    let accepted = match flow {
+                        ApprovalFlow::Elicitation(elicitation) => self
+                            .request_elicitation_approval(
+                                &mut reader,
+                                &mut writer,
+                                framing,
+                                &pending,
+                                elicitation,
+                            )?,
+                        ApprovalFlow::Local => {
                             eprintln!(
-                                "[xiic-ssh-mcp] Elicitation accepted for tool='{}'",
+                                "[xiic-ssh-mcp] Requesting local approval for tool='{}'",
                                 pending.tool_call.name
                             );
-                            self.checker.cache_approval(&pending.operation);
-                            let exec_result = self.execute_tool(&pending.tool_call)?;
-                            let response = success_response(pending.id, exec_result);
-                            write_message(&mut writer, &response, framing)?;
+                            self.local_approval.request(&pending.operation)?
                         }
-                        Some("decline") | _ => {
-                            eprintln!(
-                                "[xiic-ssh-mcp] Elicitation declined for tool='{}'",
-                                pending.tool_call.name
-                            );
-                            let response = error_response(
-                                pending.id,
-                                -32000,
-                                "operation declined by user".to_string(),
-                            );
-                            write_message(&mut writer, &response, framing)?;
-                        }
+                    };
+
+                    if accepted {
+                        eprintln!(
+                            "[xiic-ssh-mcp] Approval accepted for tool='{}'",
+                            pending.tool_call.name
+                        );
+                        self.checker.cache_approval(&pending.operation);
+                        let exec_result = self.execute_tool(&pending.tool_call)?;
+                        let response = success_response(pending.id, exec_result);
+                        write_message(&mut writer, &response, framing)?;
+                    } else {
+                        eprintln!(
+                            "[xiic-ssh-mcp] Approval declined for tool='{}'",
+                            pending.tool_call.name
+                        );
+                        let response = error_response(
+                            pending.id,
+                            -32000,
+                            "operation declined by user".to_string(),
+                        );
+                        write_message(&mut writer, &response, framing)?;
                     }
                 }
             }
@@ -149,7 +161,7 @@ impl McpServer {
         Ok(())
     }
 
-    fn dispatch(&self, message: Value) -> Result<DispatchResult> {
+    fn dispatch(&mut self, message: Value) -> Result<DispatchResult> {
         let method = message
             .get("method")
             .and_then(Value::as_str)
@@ -191,15 +203,17 @@ impl McpServer {
         }
     }
 
-    fn handle_initialize(&self, params: Value) -> Result<Value> {
+    fn handle_initialize(&mut self, params: Value) -> Result<Value> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct InitializeParams {
             protocol_version: Option<String>,
+            capabilities: Option<Value>,
         }
 
         let params: InitializeParams =
             serde_json::from_value(params).context("invalid initialize params")?;
+        self.client_supports_elicitation = has_elicitation_capability(params.capabilities.as_ref());
 
         Ok(json!({
             "protocolVersion": params.protocol_version.unwrap_or_else(|| DEFAULT_PROTOCOL_VERSION.to_string()),
@@ -212,7 +226,7 @@ impl McpServer {
                 "name": SERVER_NAME,
                 "version": SERVER_VERSION
             },
-            "instructions": "Manage SSH sessions stored by the local Xiic SSH Manager desktop app. Operations not in the whitelist require elicitation approval."
+            "instructions": "Manage SSH sessions stored by the local Xiic SSH Manager desktop app. Operations not in the whitelist require approval."
         }))
     }
 
@@ -316,11 +330,7 @@ impl McpServer {
                     "[xiic-ssh-mcp] Whitelist DENY for tool='{}': {}",
                     ctx.tool_name, reason
                 );
-                Ok(DispatchResult::Respond(error_response(
-                    id,
-                    -32001,
-                    reason,
-                )))
+                Ok(DispatchResult::Respond(error_response(id, -32001, reason)))
             }
             RuleDecision::NeedsElicitation => {
                 let elicitation_id = Uuid::new_v4().to_string();
@@ -350,12 +360,49 @@ impl McpServer {
                     operation: ctx,
                 };
 
-                Ok(DispatchResult::NeedsElicitation {
-                    elicitation,
-                    pending,
-                })
+                let flow = if self.should_use_elicitation() {
+                    ApprovalFlow::Elicitation(elicitation)
+                } else {
+                    ApprovalFlow::Local
+                };
+
+                Ok(DispatchResult::NeedsApproval { flow, pending })
             }
         }
+    }
+
+    fn should_use_elicitation(&self) -> bool {
+        should_use_elicitation_mode(self.approval_mode, self.client_supports_elicitation)
+    }
+
+    fn request_elicitation_approval<R, W>(
+        &self,
+        reader: &mut BufReader<R>,
+        writer: &mut W,
+        framing: MessageFraming,
+        pending: &PendingToolCall,
+        elicitation: Value,
+    ) -> Result<bool>
+    where
+        R: Read,
+        W: Write,
+    {
+        eprintln!(
+            "[xiic-ssh-mcp] Sending elicitation for tool='{}'",
+            pending.tool_call.name
+        );
+        write_message(writer, &elicitation, framing)?;
+
+        let elicitation_response = read_message(reader)?
+            .ok_or_else(|| anyhow!("stdin closed while waiting for elicitation response"))?;
+
+        let result = elicitation_response
+            .payload
+            .get("result")
+            .and_then(|r| r.get("action"))
+            .and_then(|a| a.as_str());
+
+        Ok(matches!(result, Some("accept")))
     }
 
     fn build_context(&self, tool_call: &ToolCall) -> Result<OperationContext> {
@@ -449,6 +496,20 @@ impl McpServer {
             }
             _ => bail!("unknown tool '{}'", tool_call.name),
         }
+    }
+}
+
+fn has_elicitation_capability(capabilities: Option<&Value>) -> bool {
+    capabilities
+        .and_then(|capabilities| capabilities.get("elicitation"))
+        .is_some()
+}
+
+fn should_use_elicitation_mode(mode: ApprovalMode, client_supports_elicitation: bool) -> bool {
+    match mode {
+        ApprovalMode::Elicitation => true,
+        ApprovalMode::Local => false,
+        ApprovalMode::Auto => client_supports_elicitation,
     }
 }
 
@@ -639,7 +700,12 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{MessageFraming, read_message, write_message};
+    use crate::models::ApprovalMode;
+
+    use super::{
+        MessageFraming, has_elicitation_capability, read_message, should_use_elicitation_mode,
+        write_message,
+    };
 
     fn initialize_payload() -> serde_json::Value {
         json!({
@@ -721,5 +787,28 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(body).unwrap(),
             payload
         );
+    }
+
+    #[test]
+    fn detects_elicitation_capability() {
+        let capabilities = json!({
+            "roots": {},
+            "elicitation": {}
+        });
+
+        assert!(has_elicitation_capability(Some(&capabilities)));
+        assert!(!has_elicitation_capability(Some(&json!({ "roots": {} }))));
+        assert!(!has_elicitation_capability(None));
+    }
+
+    #[test]
+    fn approval_mode_selects_expected_flow() {
+        assert!(should_use_elicitation_mode(ApprovalMode::Auto, true));
+        assert!(!should_use_elicitation_mode(ApprovalMode::Auto, false));
+        assert!(should_use_elicitation_mode(
+            ApprovalMode::Elicitation,
+            false
+        ));
+        assert!(!should_use_elicitation_mode(ApprovalMode::Local, true));
     }
 }

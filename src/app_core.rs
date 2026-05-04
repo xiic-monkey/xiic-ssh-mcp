@@ -190,6 +190,8 @@ impl DesktopCore {
             args.push("--notify-socket".to_string());
             args.push(socket.to_string());
         }
+        args.push("--approval-mode".to_string());
+        args.push("auto".to_string());
 
         let stdio_json = serde_json::to_string_pretty(&serde_json::json!({
             "mcpServers": {
@@ -399,9 +401,7 @@ impl DesktopCore {
         )?;
         self.notify_ui();
 
-        Ok(UploadFileResult {
-            bytes_written,
-        })
+        Ok(UploadFileResult { bytes_written })
     }
 
     pub fn download_file(&self, args: DownloadFileArgs) -> Result<DownloadFileResult> {

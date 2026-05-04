@@ -55,6 +55,20 @@ type OperationLogEntry = {
   created_at: string;
 };
 
+type OperationContext = {
+  tool_name: string;
+  command: string | null;
+  remote_path: string | null;
+  instance_id: string | null;
+};
+
+type ApprovalRequest = {
+  kind: string;
+  request_id: string;
+  message: string;
+  operation: OperationContext;
+};
+
 type ParsedTarget = {
   host: string;
   port: number;
@@ -114,6 +128,8 @@ export default function App() {
   const [loadingLogs, setLoadingLogs] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [expandedStdout, setExpandedStdout] = useState<0 | 10 | 20>(0);
+  const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null);
+  const [resolvingApproval, setResolvingApproval] = useState(false);
   const [lastLogId, setLastLogId] = useState(0);
   const logListRef = useRef<HTMLDivElement>(null);
   const activeTabRef = useRef(activeTab);
@@ -177,6 +193,20 @@ export default function App() {
         if (activeTabRef.current === "logs" && autoRefreshRef.current) {
           setTimeout(() => void loadNewLogs(), 150);
         }
+      });
+      return unlisten;
+    };
+    let unlisten: (() => void) | undefined;
+    setup().then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, []);
+
+  useEffect(() => {
+    const setup = async () => {
+      const unlisten = await listen<ApprovalRequest>("approval-requested", (event) => {
+        setPendingApproval(event.payload);
+        setStatus("有高危 SSH 操作等待审批。");
+        setStatusTone("danger");
       });
       return unlisten;
     };
@@ -340,6 +370,28 @@ function startCreateMode() {
       await appWindow.startDragging();
     } catch {
       // Ignore drag failures and keep the UI silent.
+    }
+  }
+
+  async function resolveApproval(accepted: boolean) {
+    if (!pendingApproval) {
+      return;
+    }
+
+    setResolvingApproval(true);
+    try {
+      await invoke("resolve_approval", {
+        requestId: pendingApproval.request_id,
+        accepted,
+      });
+      setStatus(accepted ? "已允许执行该操作。" : "已拒绝执行该操作。");
+      setStatusTone(accepted ? "success" : "danger");
+      setPendingApproval(null);
+    } catch (error) {
+      setStatus(asMessage(error));
+      setStatusTone("danger");
+    } finally {
+      setResolvingApproval(false);
     }
   }
 
@@ -756,8 +808,79 @@ function startCreateMode() {
           </section>
         </div>
       ) : null}
+
+      {pendingApproval ? (
+        <div className="dialog-backdrop approval-backdrop" role="presentation">
+          <section aria-label="SSH 操作审批" className="approval-dialog">
+            <div className="approval-header">
+              <span className="approval-kicker">需要审批</span>
+              <h2>高危 SSH 操作</h2>
+            </div>
+            <div className="approval-summary">
+              <ApprovalField label="工具" value={approvalToolName(pendingApproval.operation.tool_name)} />
+              <ApprovalField label="连接" value={pendingApproval.operation.instance_id ?? "-"} />
+              {pendingApproval.operation.command ? (
+                <ApprovalField label="命令" value={pendingApproval.operation.command} mono />
+              ) : null}
+              {pendingApproval.operation.remote_path ? (
+                <ApprovalField label="路径" value={pendingApproval.operation.remote_path} mono />
+              ) : null}
+            </div>
+            <div className="approval-actions">
+              <button
+                className="secondary-button"
+                disabled={resolvingApproval}
+                onClick={() => void resolveApproval(false)}
+                type="button"
+              >
+                拒绝
+              </button>
+              <button
+                className="primary-button"
+                disabled={resolvingApproval}
+                onClick={() => void resolveApproval(true)}
+                type="button"
+              >
+                允许执行
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
+}
+
+function ApprovalField({
+  label,
+  value,
+  mono = false,
+}: {
+  label: string;
+  value: string;
+  mono?: boolean;
+}) {
+  return (
+    <div className="approval-field">
+      <span>{label}</span>
+      <strong className={mono ? "mono-value" : ""}>{value}</strong>
+    </div>
+  );
+}
+
+function approvalToolName(toolName: string): string {
+  switch (toolName) {
+    case "execute_command":
+      return "执行命令";
+    case "upload_file":
+      return "上传文件";
+    case "download_file":
+      return "下载文件";
+    case "create_session":
+      return "创建会话";
+    default:
+      return toolName;
+  }
 }
 
 function formatLogTime(iso: string): string {

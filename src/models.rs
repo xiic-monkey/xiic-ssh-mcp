@@ -271,7 +271,7 @@ pub struct WhitelistRule {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationContext {
     pub tool_name: String,
     pub command: Option<String>,
@@ -304,6 +304,28 @@ pub struct PendingToolCall {
 pub enum WhitelistMode {
     Strict,
     Off,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalMode {
+    Auto,
+    Elicitation,
+    Local,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    pub kind: String,
+    pub request_id: String,
+    pub message: String,
+    pub operation: OperationContext,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalResponse {
+    pub kind: String,
+    pub request_id: String,
+    pub accepted: bool,
 }
 
 fn trim_to_none(value: Option<String>) -> Option<String> {

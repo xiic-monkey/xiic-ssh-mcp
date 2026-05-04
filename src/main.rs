@@ -5,16 +5,22 @@ use std::sync::Arc;
 use anyhow::Result;
 use xiic_ssh_mcp::app_core::{DEFAULT_KEYRING_SERVICE, DesktopCore};
 use xiic_ssh_mcp::mcp::McpServer;
-use xiic_ssh_mcp::models::WhitelistMode;
+use xiic_ssh_mcp::models::{ApprovalMode, WhitelistMode};
 
 fn main() -> Result<()> {
     let options = CliOptions::parse(env::args().skip(1))?;
+    let notify_socket = options.notify_socket.clone();
     let core = Arc::new(DesktopCore::new_with_socket(
         options.db_path,
         options.keyring_service,
         options.notify_socket,
     )?);
-    let mut server = McpServer::new(core, options.whitelist_mode);
+    let mut server = McpServer::new(
+        core,
+        options.whitelist_mode,
+        options.approval_mode,
+        notify_socket,
+    );
     server.run()
 }
 
@@ -23,6 +29,7 @@ struct CliOptions {
     keyring_service: String,
     notify_socket: Option<PathBuf>,
     whitelist_mode: WhitelistMode,
+    approval_mode: ApprovalMode,
 }
 
 impl CliOptions {
@@ -34,6 +41,7 @@ impl CliOptions {
         let mut keyring_service = DEFAULT_KEYRING_SERVICE.to_string();
         let mut notify_socket = None;
         let mut whitelist_mode = WhitelistMode::Strict;
+        let mut approval_mode = ApprovalMode::Auto;
         let mut iter = args.into_iter();
 
         while let Some(arg) = iter.next() {
@@ -56,15 +64,33 @@ impl CliOptions {
                     notify_socket = Some(PathBuf::from(value));
                 }
                 "--whitelist" => {
-                    let value = iter.next().ok_or_else(|| {
-                        anyhow::anyhow!("--whitelist requires 'strict' or 'off'")
-                    })?;
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("--whitelist requires 'strict' or 'off'"))?;
                     whitelist_mode = match value.as_str() {
                         "strict" => WhitelistMode::Strict,
                         "off" => WhitelistMode::Off,
                         _ => {
                             return Err(anyhow::anyhow!(
                                 "--whitelist must be 'strict' or 'off', got '{}'",
+                                value
+                            ));
+                        }
+                    };
+                }
+                "--approval-mode" => {
+                    let value = iter.next().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--approval-mode requires 'auto', 'elicitation', or 'local'"
+                        )
+                    })?;
+                    approval_mode = match value.as_str() {
+                        "auto" => ApprovalMode::Auto,
+                        "elicitation" => ApprovalMode::Elicitation,
+                        "local" => ApprovalMode::Local,
+                        _ => {
+                            return Err(anyhow::anyhow!(
+                                "--approval-mode must be 'auto', 'elicitation', or 'local', got '{}'",
                                 value
                             ));
                         }
@@ -89,6 +115,7 @@ impl CliOptions {
             keyring_service,
             notify_socket,
             whitelist_mode,
+            approval_mode,
         })
     }
 }
@@ -97,12 +124,13 @@ fn print_help() {
     println!(
         "xiic-ssh-mcp\n\n\
          Usage:\n  \
-         xiic-ssh-mcp --db-path <path> [--keyring-service <service>] [--notify-socket <path>] [--whitelist strict|off]\n\n\
+         xiic-ssh-mcp --db-path <path> [--keyring-service <service>] [--notify-socket <path>] [--whitelist strict|off] [--approval-mode auto|elicitation|local]\n\n\
          Options:\n  \
          --db-path <path>          Path to SQLite database\n  \
          --keyring-service <srv>   Keyring service name (default: {})\n  \
          --notify-socket <path>    Unix socket path for UI notifications\n  \
-         --whitelist <mode>        Whitelist mode: 'strict' (default) or 'off'\n",
+         --whitelist <mode>        Whitelist mode: 'strict' (default) or 'off'\n  \
+         --approval-mode <mode>    Approval mode: 'auto' (default), 'elicitation', or 'local'\n",
         DEFAULT_KEYRING_SERVICE,
     );
 }
