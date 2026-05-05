@@ -14,7 +14,7 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            use_system_approval: false,
+            use_system_approval: true,
         }
     }
 }

@@ -26,24 +26,18 @@ impl LocalApprovalClient {
     }
 
     pub fn request(&self, metadata: &ApprovalOperationMetadata) -> Result<bool> {
-        // 如果设置了系统弹窗审批，直接跳过 Tauri App，使用原生对话框
-        if crate::settings::load_settings().use_system_approval {
-            eprintln!("[xiic-ssh-mcp] 使用系统弹窗进行审批（settings.use_system_approval）");
-            let request = ApprovalRequest {
-                kind: "approval_request".to_string(),
-                request_id: Uuid::new_v4().to_string(),
-                message: approval_message(metadata),
-                metadata: metadata.clone(),
-            };
-            return request_via_native_dialog(&request);
-        }
-
         let request = ApprovalRequest {
             kind: "approval_request".to_string(),
             request_id: Uuid::new_v4().to_string(),
             message: approval_message(metadata),
             metadata: metadata.clone(),
         };
+
+        // 如果用户启用了系统弹窗审批，直接走原生对话框，不启动审批 App
+        if crate::settings::load_settings().use_system_approval {
+            eprintln!("[xiic-ssh-mcp] 使用系统弹窗进行审批（settings.use_system_approval）");
+            return request_via_native_dialog(&request);
+        }
 
         if let Some(endpoint) = &self.approval_endpoint {
             if let Ok(accepted) = request_via_app(endpoint, &request) {
