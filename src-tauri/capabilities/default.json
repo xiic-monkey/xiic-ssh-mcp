@@ -1,7 +1,7 @@
 {
   "identifier": "default",
   "description": "Default capability for the desktop SSH manager.",
-  "windows": ["main", "approval"],
+  "windows": ["main"],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",

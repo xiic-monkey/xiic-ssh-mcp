@@ -14,6 +14,7 @@
       {
         "label": "main",
         "title": "Xiic SSH Manager",
+        "url": "index.html",
         "width": 1040,
         "height": 690,
         "minWidth": 1040,
@@ -30,24 +31,6 @@
         "visible": false,
         "resizable": false,
         "maximizable": false
-      },
-      {
-        "label": "approval",
-        "title": "Xiic SSH 审批",
-        "width": 640,
-        "height": 340,
-        "minWidth": 640,
-        "minHeight": 340,
-        "maxWidth": 640,
-        "maxHeight": 340,
-        "decorations": true,
-        "visible": false,
-        "resizable": false,
-        "maximizable": false,
-        "minimizable": false,
-        "focus": false,
-        "center": true,
-        "skipTaskbar": true
       }
     ]
   },

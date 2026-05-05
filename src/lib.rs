@@ -4,5 +4,7 @@ pub mod credentials;
 pub mod local_ipc;
 pub mod mcp;
 pub mod models;
+pub mod paths;
+pub mod settings;
 pub mod storage;
 pub mod whitelist;

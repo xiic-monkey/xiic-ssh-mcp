@@ -72,6 +72,11 @@ impl McpServer {
         }
     }
 
+    /// 预启动审批桌面 App，避免首次审批请求的冷启动延迟。
+    pub fn pre_launch(&self) {
+        self.local_approval.pre_launch();
+    }
+
     pub fn run(&mut self) -> Result<()> {
         let stdin = io::stdin();
         let stdout = io::stdout();
@@ -263,10 +268,9 @@ impl McpServer {
                         "properties": {
                             "session_id": { "type": "string" },
                             "command": { "type": "string" },
-                            "command_description": { "type": "string" },
                             "timeout_secs": { "type": "integer", "minimum": 1 }
                         },
-                        "required": ["session_id", "command", "command_description"],
+                        "required": ["session_id", "command"],
                         "additionalProperties": false
                     }
                 },
@@ -315,7 +319,17 @@ impl McpServer {
 
         let ctx = self.build_context(&tool_call)?;
 
-        match self.checker.check(&ctx)? {
+        let check_result = self.checker.check(&ctx)?;
+        let _ = std::fs::write(
+            "/tmp/xiic-ssh-debug.log",
+            format!(
+                "[pid={}] DEBUG whitelist check for '{}': {:?} (ctx: instance_id={:?}, use_system={})\n",
+                std::process::id(),
+                ctx.tool_name, check_result, ctx.instance_id,
+                crate::settings::load_settings().use_system_approval,
+            ),
+        );
+        match check_result {
             RuleDecision::Allow => {
                 eprintln!(
                     "[xiic-ssh-mcp] Whitelist ALLOW for tool='{}' cmd='{}'",
@@ -337,7 +351,6 @@ impl McpServer {
                 let details = json!({
                     "tool_name": ctx.tool_name,
                     "command": ctx.command,
-                    "command_description": ctx.command_description,
                     "remote_path": ctx.remote_path,
                     "instance_id": ctx.instance_id,
                 });
@@ -363,7 +376,10 @@ impl McpServer {
                     approval,
                 };
 
-                let flow = if self.should_use_elicitation() {
+                // 如果用户启用了系统弹窗审批，则强制使用本地审批流，
+                // 这样 local_approval.request() 会读取设置并弹出原生对话框。
+                let use_system = crate::settings::load_settings().use_system_approval;
+                let flow = if !use_system && self.should_use_elicitation() {
                     ApprovalFlow::Elicitation(elicitation)
                 } else {
                     ApprovalFlow::Local
@@ -413,7 +429,6 @@ impl McpServer {
             "list_servers" => Ok(OperationContext {
                 tool_name: "list_servers".into(),
                 command: None,
-                command_description: None,
                 remote_path: None,
                 instance_id: None,
             }),
@@ -426,22 +441,16 @@ impl McpServer {
                 Ok(OperationContext {
                     tool_name: "create_session".into(),
                     command: None,
-                    command_description: None,
                     remote_path: None,
                     instance_id: Some(args.instance_id),
                 })
             }
             "execute_command" => {
                 let args: ExecuteCommandArgs = deserialize_args(tool_call.arguments.clone())?;
-                let command_description = args.command_description.trim().to_string();
-                if command_description.is_empty() {
-                    bail!("command_description cannot be empty");
-                }
                 let instance_id = self.lookup_session_instance(&args.session_id)?;
                 Ok(OperationContext {
                     tool_name: "execute_command".into(),
                     command: Some(args.command),
-                    command_description: Some(command_description),
                     remote_path: None,
                     instance_id: Some(instance_id),
                 })
@@ -452,7 +461,6 @@ impl McpServer {
                 Ok(OperationContext {
                     tool_name: "upload_file".into(),
                     command: None,
-                    command_description: None,
                     remote_path: Some(args.remote_path),
                     instance_id: Some(instance_id),
                 })
@@ -463,7 +471,6 @@ impl McpServer {
                 Ok(OperationContext {
                     tool_name: "download_file".into(),
                     command: None,
-                    command_description: None,
                     remote_path: Some(args.remote_path),
                     instance_id: Some(instance_id),
                 })
@@ -718,7 +725,7 @@ mod tests {
     use crate::models::{ApprovalMode, WhitelistMode};
 
     use super::{
-        McpServer, MessageFraming, has_elicitation_capability, read_message,
+        McpServer, MessageFraming, deserialize_args, has_elicitation_capability, read_message,
         should_use_elicitation_mode, write_message,
     };
 
@@ -828,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_command_schema_requires_command_description() {
+    fn execute_command_schema_does_not_require_command_description() {
         let server = test_server();
         let tools = server.handle_tools_list();
         let execute = tools["tools"]
@@ -838,37 +845,23 @@ mod tests {
             .find(|tool| tool["name"] == "execute_command")
             .unwrap();
 
-        assert_eq!(
-            execute["inputSchema"]["properties"]["command_description"]["type"],
-            "string"
-        );
         assert!(
-            execute["inputSchema"]["required"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value == "command_description")
+            execute["inputSchema"]["properties"]
+                .get("command_description")
+                .is_none()
         );
     }
 
     #[test]
-    fn build_context_rejects_empty_command_description() {
-        let server = test_server();
-        let err = server
-            .build_context(&crate::models::ToolCall {
-                name: "execute_command".into(),
-                arguments: json!({
-                    "session_id": "session-1",
-                    "command": "uname -a",
-                    "command_description": "   "
-                }),
-            })
-            .unwrap_err();
+    fn execute_command_args_deserialize_without_command_description() {
+        let args: crate::models::ExecuteCommandArgs = deserialize_args(json!({
+            "session_id": "session-1",
+            "command": "uname -a"
+        }))
+        .unwrap();
 
-        assert!(
-            err.to_string()
-                .contains("command_description cannot be empty")
-        );
+        assert_eq!(args.session_id, "session-1");
+        assert_eq!(args.command, "uname -a");
     }
 
     fn test_server() -> McpServer {

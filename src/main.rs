@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use xiic_ssh_mcp::app_core::{DEFAULT_KEYRING_SERVICE, DesktopCore};
+use xiic_ssh_mcp::local_ipc::remove_stale_endpoint;
 use xiic_ssh_mcp::mcp::McpServer;
 use xiic_ssh_mcp::models::{ApprovalMode, WhitelistMode};
 
@@ -19,8 +20,15 @@ fn main() -> Result<()> {
         core,
         options.whitelist_mode,
         options.approval_mode,
-        approval_endpoint,
+        approval_endpoint.clone(),
     );
+
+    // 启动前清除残留的 approval socket，防止审批 App 绑定失败
+    if let Some(ref ep) = approval_endpoint {
+        remove_stale_endpoint(ep);
+    }
+
+    server.pre_launch();
     server.run()
 }
 

@@ -2,8 +2,11 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use serde_json::json;
 
 pub const LOG_NOTIFICATION_PAYLOAD: &str = "log_updated";
+pub const APPROVAL_HEALTH_CHECK_KIND: &str = "health_check";
+pub const APPROVAL_HEALTH_OK_KIND: &str = "health_ok";
 
 #[cfg(target_os = "windows")]
 pub const WINDOWS_NOTIFY_PIPE: &str = r"\\.\pipe\com.xiic.sshmanager.notify";
@@ -83,6 +86,25 @@ pub fn send_request(endpoint: &str, payload: &str) -> Result<String> {
             .context("failed to read IPC response")?;
         Ok(response.trim().to_string())
     })
+}
+
+pub fn approval_server_healthy(endpoint: &str) -> bool {
+    let payload = json!({
+        "kind": APPROVAL_HEALTH_CHECK_KIND
+    });
+
+    let Ok(response) = send_request(endpoint, &payload.to_string()) else {
+        return false;
+    };
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&response) else {
+        return false;
+    };
+
+    value
+        .get("kind")
+        .and_then(|kind| kind.as_str())
+        == Some(APPROVAL_HEALTH_OK_KIND)
 }
 
 fn with_stream<T, F>(endpoint: &str, op: F) -> Result<T>

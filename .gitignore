@@ -4,3 +4,7 @@
 /src-tauri/target
 /src-tauri/gen
 /src-tauri/Cargo.lock
+/approval-tauri/target
+/approval-tauri/gen
+/approval-tauri/Cargo.lock
+.codebuddy

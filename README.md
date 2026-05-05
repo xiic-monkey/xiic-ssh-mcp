@@ -1,50 +1,50 @@
 # xiic-ssh-mcp
 
-一个本地桌面 SSH 连接管理器，同时对外暴露 MCP 接口。
+一个本地桌面 SSH 连接管理器，用来可视化维护远程服务器连接，并把这些连接安全地暴露给支持 MCP 的 agent 使用。
 
-这版实现不做终端模拟器。核心目标是：
+这一版不做终端模拟器：它不是一个新的 Terminal，而是一个本地 SSH 连接配置中心 + MCP 桥接工具。
+
+## 主要功能
 
 - 可视化管理 SSH 连接
-- 新增、修改、删除连接
-- 保存前支持测试连接
+- 新增、修改、删除连接配置
+- 保存前测试 SSH 连接是否可用
 - 本地持久化连接配置
+- 使用系统钥匙串保存 SSH 密码、私钥和私钥口令
 - 对 agent 暴露 4 个 MCP 工具
-- 一键复制 HTTP / SSE 两种 MCP JSON 配置
+- 一键复制 MCP JSON 配置
+- 独立审批应用处理高危 SSH 操作
 
-## 先说清楚：没有软件账号登录
+## 没有软件账号登录
 
-这个软件没有自己的登录系统，没有“平台账号密码”。
+这个软件没有自己的登录系统，也没有“平台账号密码”。
 
-你在界面里看到的：
+界面里的这些字段：
 
 - `SSH target`
 - `SSH password`
 - `SSH private key`
+- `passphrase`
 
-这些都是远程服务器的 SSH 凭据，不是这个软件的登录密码。
+都指向远程服务器的 SSH 凭据，不是这个软件的登录密码。
 
-例如你平时在终端里这样连：
+例如你平时在终端里这样连接服务器：
 
 ```bash
 ssh root@192.168.1.20
 ```
 
-那这里的：
+那在软件里：
 
-- `username` 就是 `root`
-- `host` 就是 `192.168.1.20`
-- `SSH password` 就是这台远程机器上 `root` 用户的登录密码
+- `username` 填 `root`
+- `host` 填 `192.168.1.20`
+- `SSH password` 填这台远程机器上 `root` 用户的 SSH 登录密码
 
-如果 macOS 弹出系统密码窗口，那也不是这个软件在登录，而是：
+如果 macOS 弹出系统密码窗口，那也不是软件账号登录，而是系统钥匙串 `Keychain` 在请求授权，用于保存或读取 SSH 密码、SSH 私钥等敏感信息。
 
-- 系统钥匙串 `Keychain`
-- 在请求授权保存或读取 SSH 密钥 / SSH 密码
+## SSH Target 填写方式
 
-## 更自然的填写方式
-
-UI 已经支持直接填 SSH 目标地址。
-
-你可以在 `SSH target` 输入这些格式：
+你可以直接在 `SSH target` 输入常见 SSH 地址格式：
 
 ```text
 ssh://root@192.168.1.20:22
@@ -53,161 +53,91 @@ root@192.168.1.20
 192.168.1.20
 ```
 
-点 `Parse` 后会自动填充：
+点击 `Parse` 后会自动填充：
 
 - `username`
 - `host`
 - `port`
 
-然后你再单独补：
+然后再单独填写认证信息：
 
-- `SSH password`
-  或
+- `SSH password`，或
 - `SSH private key`
 
-密码本来就不应该从 URL 里自动带出来，所以它仍然要单独填。
+密码和私钥不会从 URL 里自动提取，需要单独填写。
 
-## 当前能力
+## 连接管理
 
-桌面应用提供：
+每个 SSH 连接配置包含：
 
-- 连接列表
-- 新建连接
-- 编辑连接
-- 删除连接
-- 测试连接
-- 一键复制 STDIO MCP 配置
+- `instance_id`：给 agent 使用的连接标识
+- `name`：界面展示名称
+- `host` / `port`：远程服务器地址和端口
+- `username`：远程服务器 SSH 用户名
+- `auth_kind`：密码或私钥认证
+- `host_key_check`：是否检查主机密钥
+- `notes`：备注
 
-MCP 工具保持为：
+保存前可以点击测试连接。测试连接会使用当前表单内容发起一次真实 SSH 认证，并返回成功或失败原因。
 
-- `create_session`
-- `execute_command`
-- `upload_file`
-- `download_file`
+## 本地数据保存
 
-## 产品形态
+连接数据分两类保存：
 
-这是一个本地单用户桌面应用：
+- 非敏感信息保存在本地 SQLite
+- 敏感信息保存在系统钥匙串
 
-- UI：`Tauri v2 + React + TypeScript + Vite`
-- 核心逻辑：`Rust`
-- SSH / SFTP：`ssh2`
-- 元数据存储：`SQLite`
-- 密码 / 私钥存储：系统钥匙串 `keyring`
-- MCP 接入：`stdio`
+敏感信息包括：
 
-## 安装
+- SSH 密码
+- SSH 私钥
+- 私钥口令
 
-### GitHub Release 一键安装
+这些数据只保存在本机，不需要上传到任何平台账号。
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh | bash -s -- --repo <owner>/<repo>
-```
+## 审批工作方式
 
-如果你在发布前已经把 `install.sh` 里的 `DEFAULT_GITHUB_REPOSITORY` 写成真实仓库，用户可以直接：
+高危 SSH 操作不会在主界面里弹一层网页风 overlay，也不会强行把主窗口带到前台。
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh | bash
-```
+这一版改成了独立审批进程：
 
-默认会安装到：
+- `xiic-ssh-manager-desktop`：管理连接、查看日志、复制 MCP 配置
+- `xiic-ssh-approval`：只负责接收审批请求、弹出审批小窗、允许或拒绝
+- `xiic-ssh-mcp`：给 agent 提供 MCP stdio 服务
 
-```bash
-~/.local/bin/xiic-ssh-manager-desktop
-~/.local/bin/xiic-ssh-mcp
-```
+执行链路是：
 
-安装完成后直接运行：
+1. agent 通过 `xiic-ssh-mcp` 调用 SSH 工具
+2. 命中需要审批的高危操作
+3. helper 优先连接本地审批通道
+4. 如果审批应用未启动，helper 自动拉起 `xiic-ssh-approval`
+5. 用户在独立审批窗里点击允许或拒绝
+6. helper 再继续执行或拒绝这次工具调用
 
-```bash
-~/.local/bin/xiic-ssh-manager-desktop
-```
+如果当前环境没有可用的独立审批 UI，helper 会回退到系统原生确认窗，不会再弹一个空白的大白窗。
 
-### 本地源码安装
+## MCP 工具
 
-```bash
-./install.sh
-```
+软件对 agent 暴露 4 个 MCP 工具：
 
-源码安装会自动执行：
+- `create_session`：根据 `instance_id` 创建 SSH 会话
+- `execute_command`：在远程服务器执行命令
+- `upload_file`：上传文件内容到远程服务器
+- `download_file`：从远程服务器下载文件内容
 
-- `npm install`（如果 `node_modules` 不存在）
-- `npm run build`
-- `cargo build --manifest-path src-tauri/Cargo.toml --release`
+典型调用流程：
 
-然后把桌面可执行文件复制到：
+1. agent 调用 `create_session` 创建会话
+2. 返回 `session_id`
+3. agent 使用 `session_id` 执行命令、上传文件或下载文件
 
-```bash
-~/.local/bin/xiic-ssh-manager-desktop
-~/.local/bin/xiic-ssh-mcp
-```
+`session_id` 只在当前 MCP 进程内有效。应用或 MCP 进程重启后，需要重新创建会话。
 
-## GitHub Release 产物命名
+## MCP 配置
 
-`install.sh` 期望你的 Release 里有这些桌面二进制压缩包：
+桌面界面会生成可直接复制的 MCP JSON 配置。复制后粘贴到支持 MCP 的客户端配置里即可使用。
 
-- `xiic-ssh-manager-desktop-x86_64-unknown-linux-gnu.tar.gz`
-- `xiic-ssh-manager-desktop-aarch64-unknown-linux-gnu.tar.gz`
-- `xiic-ssh-manager-desktop-x86_64-apple-darwin.tar.gz`
-- `xiic-ssh-manager-desktop-aarch64-apple-darwin.tar.gz`
-
-每个压缩包里至少包含两个可执行文件：
-
-```text
-xiic-ssh-manager-desktop
-xiic-ssh-mcp
-```
-
-## 工作原理
-
-### 连接管理
-
-连接信息分两层保存：
-
-- 非敏感信息写入 SQLite
-  - `instance_id`
-  - `name`
-  - `host`
-  - `port`
-  - `username`
-  - `auth_kind`
-  - `host_key_check`
-  - `notes`
-- 敏感信息写入系统钥匙串
-  - `password`
-  - `private_key`
-  - `passphrase`
-
-### 测试连接
-
-UI 里的“测试连接”不会创建 MCP 会话。它只会：
-
-1. 使用当前表单内容建立一次真实 SSH 连接
-2. 完成认证
-3. 返回成功或失败消息
-
-这样可以在保存前就验证配置是否可用。
-
-### MCP 会话
-
-agent 调用 MCP 时：
-
-1. 先用 `create_session` 传入 `instance_id`
-2. `stdio` helper 读取 SQLite 元数据和钥匙串凭据
-3. 建立真实 SSH 连接并返回 `session_id`
-4. 后续通过 `session_id` 调用命令执行、上传、下载
-
-注意：
-
-- `session_id` 只保存在当前进程内
-- 应用重启后旧会话全部失效
-- 当前不做自动重连
-
-## MCP 配置复制
-
-桌面 UI 会直接生成并复制一份 `stdio` JSON 片段。
-
-### STDIO 示例
+当前本地 helper 使用 `stdio` 方式启动 MCP server，配置形态类似：
 
 ```json
 {
@@ -218,18 +148,30 @@ agent 调用 MCP 时：
         "--db-path",
         "/Users/you/Library/Application Support/com.xiic.sshmanager/instances.sqlite3",
         "--keyring-service",
-        "com.xiic.ssh-manager"
-      ]
+        "com.xiic.ssh-manager",
+        "--notify-socket",
+        "/Users/you/Library/Application Support/com.xiic.sshmanager/notify.sock",
+        "--approval-mode",
+        "auto",
+        "--approval-endpoint",
+        "/Users/you/Library/Application Support/com.xiic.sshmanager/approval.sock"
+      ],
+      "env": {
+        "HOME": "/Users/you",
+        "SSH_ASKPASS_REQUIRE": "never"
+      }
     }
   }
 }
 ```
 
-## MCP 工具说明
+请优先使用界面里复制出来的配置，因为里面会包含当前机器上的实际路径。
 
-### `create_session`
+配置里的 `--approval-endpoint` 由桌面应用自动生成，用来让 helper 和独立审批应用通信。这个字段不需要手动改。
 
-输入：
+## 工具参数示例
+
+### create_session
 
 ```json
 {
@@ -237,27 +179,17 @@ agent 调用 MCP 时：
 }
 ```
 
-### `execute_command`
-
-输入：
+### execute_command
 
 ```json
 {
   "session_id": "uuid",
   "command": "uname -a",
-  "command_description": "确认远程服务器的内核和系统信息",
   "timeout_secs": 30
 }
 ```
 
-说明：
-
-- `command_description` 为必填字段，用于审批弹窗说明这条命令的目的
-- 该说明也会写入操作日志，便于后续回看
-
-### `upload_file`
-
-输入：
+### upload_file
 
 ```json
 {
@@ -269,9 +201,7 @@ agent 调用 MCP 时：
 }
 ```
 
-### `download_file`
-
-输入：
+### download_file
 
 ```json
 {
@@ -281,75 +211,91 @@ agent 调用 MCP 时：
 }
 ```
 
-说明：
+上传和下载支持：
 
-- 上传支持 `utf8` / `base64`
-- 下载支持 `utf8` / `base64`
-- 下载默认返回 `base64`
-- 不支持交互式 shell
+- `utf8`
+- `base64`
 
-## 本地开发
+## 安装与运行
 
-### 安装依赖
+### 本地开发
+
+安装依赖：
 
 ```bash
 npm install
 ```
 
-### 启动桌面开发模式
+启动桌面开发模式：
 
 ```bash
 npm run tauri:dev
 ```
 
-### 构建前端
+启动独立审批开发模式：
+
+```bash
+npm run approval:dev
+```
+
+如果你只启动了主界面开发模式，没有构建或启动审批应用，helper 在开发态会直接回退系统原生审批窗，避免再出现白屏审批窗口。
+
+构建前端：
 
 ```bash
 npm run build
 ```
 
-### 检查桌面 Rust 侧
+检查 Rust 代码：
 
 ```bash
+cargo check
 cargo check --manifest-path src-tauri/Cargo.toml
+cargo check --manifest-path approval-tauri/Cargo.toml
 ```
 
-### 检查核心 Rust 侧
+### 本地安装
 
 ```bash
-cargo test
+./install.sh
 ```
 
-## 目录结构
+默认安装到：
 
-- `web/`
-  React 前端
-- `src-tauri/`
-  Tauri 桌面应用入口
-- `src/app_core.rs`
-  SQLite、钥匙串、SSH 会话、连接测试
-- `src/mcp.rs`
-  `stdio` MCP helper
-- `src/storage.rs`
-  SQLite 持久化
-- `src/credentials.rs`
-  系统钥匙串读写
+```text
+~/.local/bin/xiic-ssh-manager-desktop
+~/.local/bin/xiic-ssh-approval
+~/.local/bin/xiic-ssh-mcp
+```
+
+启动桌面应用：
+
+```bash
+~/.local/bin/xiic-ssh-manager-desktop
+```
+
+审批应用通常不需要手动启动。发生高危操作审批时，helper 会自动拉起：
+
+```bash
+~/.local/bin/xiic-ssh-approval
+```
+
+## 技术栈
+
+- 桌面应用：`Tauri v2`
+- 前端：`React`、`TypeScript`、`Vite`
+- 核心逻辑：`Rust`
+- SSH / SFTP：`ssh2`
+- 本地数据库：`SQLite`
+- 凭据存储：系统钥匙串 `keyring`
+- MCP helper：`stdio`
 
 ## 当前限制
 
-- 只支持本地单用户
-- 不支持终端界面
+- 不提供终端模拟器
+- 不支持交互式 shell
 - 不支持端口转发
 - 不支持目录级同步
 - 不支持自动重连
-- 不支持多人共享同一个配置中心
-
-## 验证状态
-
-当前仓库已通过这些本地检查：
-
-- `cargo check`
-- `cargo check --manifest-path src-tauri/Cargo.toml`
-- `cargo test`
-- `npm exec tsc --noEmit`
-- `npm run build`
+- 不提供多人共享配置中心
+- 开发态下如果独立审批前端未就绪，会回退系统原生审批窗

@@ -261,10 +261,6 @@ impl DesktopCore {
         if args.command.trim().is_empty() {
             bail!("command cannot be empty");
         }
-        let command_description = args.command_description.trim().to_string();
-        if command_description.is_empty() {
-            bail!("command_description cannot be empty");
-        }
 
         let timeout_ms = args
             .timeout_secs
@@ -328,7 +324,6 @@ impl DesktopCore {
 
         let details = serde_json::json!({
             "instance_name": instance_name,
-            "command_description": command_description,
             "command": command,
             "stdout": result.stdout,
             "stderr": result.stderr,

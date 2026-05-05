@@ -181,7 +181,6 @@ impl Default for DownloadEncoding {
 pub struct ExecuteCommandArgs {
     pub session_id: String,
     pub command: String,
-    pub command_description: String,
     pub timeout_secs: Option<u64>,
 }
 
@@ -276,7 +275,6 @@ pub struct WhitelistRule {
 pub struct OperationContext {
     pub tool_name: String,
     pub command: Option<String>,
-    pub command_description: Option<String>,
     pub remote_path: Option<String>,
     pub instance_id: Option<String>,
 }
@@ -320,7 +318,6 @@ pub enum ApprovalMode {
 pub struct ApprovalOperationMetadata {
     pub tool_name: String,
     pub command: Option<String>,
-    pub command_description: Option<String>,
     pub remote_path: Option<String>,
     pub instance_id: Option<String>,
 }
@@ -330,7 +327,6 @@ impl From<&OperationContext> for ApprovalOperationMetadata {
         Self {
             tool_name: value.tool_name.clone(),
             command: value.command.clone(),
-            command_description: value.command_description.clone(),
             remote_path: value.remote_path.clone(),
             instance_id: value.instance_id.clone(),
         }

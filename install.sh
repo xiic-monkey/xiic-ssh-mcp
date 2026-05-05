@@ -3,6 +3,7 @@
 set -euo pipefail
 
 APP_NAME="xiic-ssh-manager-desktop"
+APPROVAL_APP_NAME="xiic-ssh-approval"
 HELPER_NAME="xiic-ssh-mcp"
 DEFAULT_INSTALL_ROOT="${HOME}/.local"
 DEFAULT_GITHUB_REPOSITORY=""
@@ -24,6 +25,7 @@ Options:
 
 The installed binaries will be:
   <install-root>/bin/xiic-ssh-manager-desktop
+  <install-root>/bin/xiic-ssh-approval
   <install-root>/bin/xiic-ssh-mcp
 EOF
 }
@@ -120,9 +122,11 @@ ensure_path_hint() {
 
 print_success() {
   local app_install_path="$1"
-  local helper_install_path="$2"
+  local approval_install_path="$2"
+  local helper_install_path="$3"
 
   log "Installed desktop binary: ${app_install_path}"
+  log "Installed approval binary: ${approval_install_path}"
   log "Installed MCP helper: ${helper_install_path}"
   ensure_path_hint
 
@@ -159,17 +163,22 @@ install_from_source() {
   log "Building Tauri desktop binary"
   if [[ "${BUILD_MODE}" == "release" ]]; then
     (cd "${SCRIPT_DIR}" && cargo build --manifest-path src-tauri/Cargo.toml --release)
+    (cd "${SCRIPT_DIR}" && cargo build --manifest-path approval-tauri/Cargo.toml --release)
     cp "${SCRIPT_DIR}/src-tauri/target/release/${APP_NAME}" "${INSTALL_ROOT}/bin/${APP_NAME}"
+    cp "${SCRIPT_DIR}/approval-tauri/target/release/${APPROVAL_APP_NAME}" "${INSTALL_ROOT}/bin/${APPROVAL_APP_NAME}"
     cp "${SCRIPT_DIR}/target/release/${HELPER_NAME}" "${INSTALL_ROOT}/bin/${HELPER_NAME}"
   else
     (cd "${SCRIPT_DIR}" && cargo build --manifest-path src-tauri/Cargo.toml)
+    (cd "${SCRIPT_DIR}" && cargo build --manifest-path approval-tauri/Cargo.toml)
     cp "${SCRIPT_DIR}/src-tauri/target/debug/${APP_NAME}" "${INSTALL_ROOT}/bin/${APP_NAME}"
+    cp "${SCRIPT_DIR}/approval-tauri/target/debug/${APPROVAL_APP_NAME}" "${INSTALL_ROOT}/bin/${APPROVAL_APP_NAME}"
     cp "${SCRIPT_DIR}/target/debug/${HELPER_NAME}" "${INSTALL_ROOT}/bin/${HELPER_NAME}"
   fi
 
   chmod 755 "${INSTALL_ROOT}/bin/${APP_NAME}"
+  chmod 755 "${INSTALL_ROOT}/bin/${APPROVAL_APP_NAME}"
   chmod 755 "${INSTALL_ROOT}/bin/${HELPER_NAME}"
-  print_success "${INSTALL_ROOT}/bin/${APP_NAME}" "${INSTALL_ROOT}/bin/${HELPER_NAME}"
+  print_success "${INSTALL_ROOT}/bin/${APP_NAME}" "${INSTALL_ROOT}/bin/${APPROVAL_APP_NAME}" "${INSTALL_ROOT}/bin/${HELPER_NAME}"
 }
 
 install_from_release() {
@@ -179,7 +188,7 @@ install_from_release() {
 
   [[ -n "${GITHUB_REPOSITORY}" ]] || fail "missing GitHub repository slug; pass --repo <owner/repo> or set DEFAULT_GITHUB_REPOSITORY in install.sh before publishing"
 
-  local target asset_name release_url tmp_dir archive_path extracted_app extracted_helper app_install_path helper_install_path
+  local target asset_name release_url tmp_dir archive_path extracted_app extracted_approval extracted_helper app_install_path approval_install_path helper_install_path
   target="$(detect_target)"
   asset_name="${APP_NAME}-${target}.tar.gz"
 
@@ -199,16 +208,20 @@ install_from_release() {
   log "Extracting ${asset_name}"
   tar -xzf "${archive_path}" -C "${tmp_dir}"
   extracted_app="$(find "${tmp_dir}" -type f -name "${APP_NAME}" | head -n 1)"
+  extracted_approval="$(find "${tmp_dir}" -type f -name "${APPROVAL_APP_NAME}" | head -n 1)"
   extracted_helper="$(find "${tmp_dir}" -type f -name "${HELPER_NAME}" | head -n 1)"
   [[ -n "${extracted_app}" ]] || fail "downloaded archive did not contain ${APP_NAME}"
+  [[ -n "${extracted_approval}" ]] || fail "downloaded archive did not contain ${APPROVAL_APP_NAME}"
   [[ -n "${extracted_helper}" ]] || fail "downloaded archive did not contain ${HELPER_NAME}"
 
   mkdir -p "${INSTALL_ROOT}/bin"
   app_install_path="${INSTALL_ROOT}/bin/${APP_NAME}"
+  approval_install_path="${INSTALL_ROOT}/bin/${APPROVAL_APP_NAME}"
   helper_install_path="${INSTALL_ROOT}/bin/${HELPER_NAME}"
   install -m 755 "${extracted_app}" "${app_install_path}"
+  install -m 755 "${extracted_approval}" "${approval_install_path}"
   install -m 755 "${extracted_helper}" "${helper_install_path}"
-  print_success "${app_install_path}" "${helper_install_path}"
+  print_success "${app_install_path}" "${approval_install_path}" "${helper_install_path}"
 }
 
 if [[ -z "${GITHUB_REPOSITORY}" ]] && is_local_checkout; then

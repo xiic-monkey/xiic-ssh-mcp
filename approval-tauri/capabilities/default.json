@@ -1,0 +1,9 @@
+{
+  "identifier": "default",
+  "description": "Default capability for the standalone SSH approval window.",
+  "windows": ["approval"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging"
+  ]
+}

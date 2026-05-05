@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::SyncSender;
@@ -8,7 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use uuid::Uuid;
 
-use crate::local_ipc::send_request;
+use crate::local_ipc::{approval_server_healthy, send_request};
 use crate::models::{
     ApprovalOperationMetadata, ApprovalRequest, ApprovalRequestedEvent, ApprovalResolvedEvent,
     ApprovalResponse,
@@ -25,6 +26,18 @@ impl LocalApprovalClient {
     }
 
     pub fn request(&self, metadata: &ApprovalOperationMetadata) -> Result<bool> {
+        // 如果设置了系统弹窗审批，直接跳过 Tauri App，使用原生对话框
+        if crate::settings::load_settings().use_system_approval {
+            eprintln!("[xiic-ssh-mcp] 使用系统弹窗进行审批（settings.use_system_approval）");
+            let request = ApprovalRequest {
+                kind: "approval_request".to_string(),
+                request_id: Uuid::new_v4().to_string(),
+                message: approval_message(metadata),
+                metadata: metadata.clone(),
+            };
+            return request_via_native_dialog(&request);
+        }
+
         let request = ApprovalRequest {
             kind: "approval_request".to_string(),
             request_id: Uuid::new_v4().to_string(),
@@ -37,26 +50,71 @@ impl LocalApprovalClient {
                 return Ok(accepted);
             }
 
-            let _ = launch_desktop_app();
-            let deadline = Instant::now() + Duration::from_secs(5);
+            if !approval_server_healthy(endpoint) {
+                if let Err(e) = launch_desktop_app() {
+                    eprintln!("[xiic-ssh-mcp] 启动审批 App 失败: {e:#}");
+                }
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(150));
+                thread::sleep(Duration::from_millis(200));
                 if let Ok(accepted) = request_via_app(endpoint, &request) {
                     return Ok(accepted);
                 }
             }
+
+            eprintln!(
+                "[xiic-ssh-mcp] 审批 App 未能在 10 秒内就绪（endpoint={endpoint}），降级到系统原生弹窗"
+            );
         }
 
         request_via_native_dialog(&request)
+    }
+
+    /// 预启动审批 App 并等待其就绪。
+    /// 在 MCP 服务器初始化阶段调用，避免首次审批请求的冷启动延迟。
+    pub fn pre_launch(&self) {
+        let endpoint = match &self.approval_endpoint {
+            Some(ep) => ep.clone(),
+            None => return,
+        };
+
+        if approval_server_healthy(&endpoint) {
+            eprintln!("[xiic-ssh-mcp] 审批 App 已在运行");
+            return;
+        }
+
+        eprintln!("[xiic-ssh-mcp] 正在预启动审批 App...");
+
+        match launch_desktop_app() {
+            Ok(_) => {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut waited = 0u32;
+                while Instant::now() < deadline {
+                    if approval_server_healthy(&endpoint) {
+                        eprintln!("[xiic-ssh-mcp] 审批 App 已就绪（约 {waited} 秒）");
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                    waited += 1;
+                }
+                eprintln!(
+                    "[xiic-ssh-mcp] 预启动完成但审批 App 未在 10 秒内就绪，后续将自动重试"
+                );
+            }
+            Err(e) => {
+                eprintln!("[xiic-ssh-mcp] 预启动审批 App 失败: {e:#}");
+            }
+        }
     }
 }
 
 pub fn approval_message(metadata: &ApprovalOperationMetadata) -> String {
     match metadata.tool_name.as_str() {
         "execute_command" => format!(
-            "是否允许在连接 '{}' 上执行命令？\n\n说明：{}\n\n命令：\n{}",
+            "是否允许在连接 '{}' 上执行命令？\n\n命令：\n{}",
             metadata.instance_id.as_deref().unwrap_or("-"),
-            metadata.command_description.as_deref().unwrap_or("-"),
             metadata.command.as_deref().unwrap_or("-"),
         ),
         "upload_file" => format!(
@@ -199,46 +257,96 @@ impl ApprovalQueue {
 
 fn launch_desktop_app() -> Result<()> {
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
-    let desktop = resolve_desktop_binary(&current_exe)
-        .ok_or_else(|| anyhow!("xiic-ssh-manager-desktop binary was not found"))?;
-    Command::new(desktop)
-        .arg("--approval-only")
+    let approval_app = resolve_approval_binary(&current_exe)
+        .ok_or_else(|| anyhow!("xiic-ssh-approval binary was not found"))?;
+
+    // 如果是 debug 构建且 Vite 开发服务器未运行，自动启动它
+    if binary_requires_dev_server(&approval_app) && !approval_dev_server_is_ready() {
+        eprintln!("[xiic-ssh-mcp] 正在启动 Vite 开发服务器 (port 1430)...");
+        let repo_root = current_exe
+            .ancestors()
+            .nth(3)
+            .ok_or_else(|| anyhow!("failed to resolve project root"))?;
+
+        let _vite_child = Command::new("npx")
+            .args(["vite", "--port", "1430"])
+            .current_dir(&repo_root)
+            .spawn()
+            .context("failed to launch Vite dev server")?;
+
+        // 等待 Vite 开发服务器就绪（最多 15 秒）
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut ready = false;
+        while Instant::now() < deadline {
+            if approval_dev_server_is_ready() {
+                ready = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(300));
+        }
+
+        if ready {
+            eprintln!("[xiic-ssh-mcp] Vite 开发服务器已就绪");
+        } else {
+            eprintln!("[xiic-ssh-mcp] 警告: Vite 开发服务器未能在 15 秒内就绪，审批窗口可能无法正常显示");
+        }
+    }
+
+    Command::new(approval_app)
+        .env("TAURI_DEV", "1")
         .spawn()
-        .context("failed to launch xiic-ssh-manager-desktop")?;
+        .context("failed to launch xiic-ssh-approval")?;
     Ok(())
 }
 
-fn resolve_desktop_binary(current_exe: &Path) -> Option<PathBuf> {
-    let desktop_name = desktop_binary_name();
-    let sibling = current_exe.with_file_name(desktop_name);
+fn resolve_approval_binary(current_exe: &Path) -> Option<PathBuf> {
+    let approval_name = approval_binary_name();
+    let sibling = current_exe.with_file_name(approval_name);
     if sibling.exists() {
         return Some(sibling);
     }
 
     let repo_root = current_exe.ancestors().nth(3)?;
-    let profile_name = current_exe.parent()?.file_name()?;
-    let dev_desktop = repo_root
-        .join("src-tauri")
-        .join("target")
-        .join(profile_name)
-        .join(desktop_name);
-    if dev_desktop.exists() {
-        return Some(dev_desktop);
+
+    for profile in ["debug", "release"] {
+        let candidate = repo_root
+            .join("approval-tauri")
+            .join("target")
+            .join(profile)
+            .join(approval_name);
+        if candidate.exists() {
+            return Some(candidate);
+        }
     }
 
     None
 }
 
-fn desktop_binary_name() -> &'static str {
+fn approval_binary_name() -> &'static str {
     #[cfg(target_os = "windows")]
     {
-        "xiic-ssh-manager-desktop.exe"
+        "xiic-ssh-approval.exe"
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        "xiic-ssh-manager-desktop"
+        "xiic-ssh-approval"
     }
+}
+
+fn binary_requires_dev_server(path: &Path) -> bool {
+    matches!(
+        path.parent().and_then(|dir| dir.file_name()).and_then(|name| name.to_str()),
+        Some("debug")
+    )
+}
+
+fn approval_dev_server_is_ready() -> bool {
+    let addr: SocketAddr = match "127.0.0.1:1430".parse() {
+        Ok(addr) => addr,
+        Err(_) => return false,
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -325,14 +433,13 @@ mod tests {
 
     use crate::models::{ApprovalOperationMetadata, ApprovalRequest};
 
-    use super::{ApprovalQueue, approval_message, resolve_desktop_binary};
+    use super::{ApprovalQueue, approval_message, resolve_approval_binary};
 
     #[test]
     fn formats_command_approval_message() {
         let metadata = ApprovalOperationMetadata {
             tool_name: "execute_command".into(),
             command: Some("rm -rf /tmp/demo".into()),
-            command_description: Some("清理测试目录".into()),
             remote_path: None,
             instance_id: Some("dev".into()),
         };
@@ -340,15 +447,14 @@ mod tests {
         let message = approval_message(&metadata);
 
         assert!(message.contains("dev"));
-        assert!(message.contains("清理测试目录"));
         assert!(message.contains("rm -rf /tmp/demo"));
     }
 
     #[test]
-    fn missing_desktop_binary_returns_none() {
+    fn missing_approval_binary_returns_none() {
         let path = PathBuf::from("/tmp/xiic-ssh-mcp-test/target/debug/xiic-ssh-mcp");
 
-        assert!(resolve_desktop_binary(&path).is_none());
+        assert!(resolve_approval_binary(&path).is_none());
     }
 
     #[test]
@@ -392,7 +498,6 @@ mod tests {
             metadata: ApprovalOperationMetadata {
                 tool_name: "execute_command".into(),
                 command: Some("echo hello".into()),
-                command_description: Some("输出问候".into()),
                 remote_path: None,
                 instance_id: Some("dev".into()),
             },

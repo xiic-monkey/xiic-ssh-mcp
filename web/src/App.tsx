@@ -55,30 +55,8 @@ type OperationLogEntry = {
   created_at: string;
 };
 
-type ApprovalOperationMetadata = {
-  tool_name: string;
-  command: string | null;
-  command_description: string | null;
-  remote_path: string | null;
-  instance_id: string | null;
-};
-
-type ApprovalRequest = {
-  kind: string;
-  request_id: string;
-  message: string;
-  metadata: ApprovalOperationMetadata;
-};
-
-type ApprovalRequestedEvent = {
-  request: ApprovalRequest;
-  pending_count: number;
-};
-
-type ApprovalResolvedEvent = {
-  request_id: string;
-  accepted: boolean;
-  pending_count: number;
+type AppSettings = {
+  use_system_approval: boolean;
 };
 
 type ParsedTarget = {
@@ -86,6 +64,8 @@ type ParsedTarget = {
   port: number;
   username: string;
 };
+
+const appWindow = getCurrentWindow();
 
 const emptyDraft = (): InstanceDraft => ({
   instance_id: "",
@@ -119,9 +99,6 @@ function fromSummary(instance: InstanceSummary): InstanceDraft {
   };
 }
 
-const appWindow = getCurrentWindow();
-const isApprovalWindow = appWindow.label === "approval";
-
 export default function App() {
   const [instances, setInstances] = useState<InstanceSummary[]>([]);
   const [draft, setDraft] = useState<InstanceDraft>(emptyDraft());
@@ -141,36 +118,17 @@ export default function App() {
   const [loadingLogs, setLoadingLogs] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [expandedStdout, setExpandedStdout] = useState<0 | 10 | 20>(0);
-  const [activeApproval, setActiveApproval] = useState<ApprovalRequest | null>(null);
-  const [pendingApprovalCount, setPendingApprovalCount] = useState(0);
-  const [resolvingApproval, setResolvingApproval] = useState(false);
   const [lastLogId, setLastLogId] = useState(0);
+  const [showSettings, setShowSettings] = useState(false);
+  const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [restartingMcp, setRestartingMcp] = useState(false);
+  const [restartResult, setRestartResult] = useState<{ kind: "success" | "error"; message: string } | null>(null);
   const logListRef = useRef<HTMLDivElement>(null);
   const activeTabRef = useRef(activeTab);
   const autoRefreshRef = useRef(autoRefresh);
 
   useEffect(() => {
-    if (!isApprovalWindow) {
-      return;
-    }
-    const loadApproval = async () => {
-      try {
-        const current = await invoke<ApprovalRequestedEvent | null>("get_active_approval");
-        if (current) {
-          setActiveApproval(current.request);
-          setPendingApprovalCount(current.pending_count);
-        }
-      } catch {
-        // ignore hydration errors for the detached approval window
-      }
-    };
-    void loadApproval();
-  }, []);
-
-  useEffect(() => {
-    if (isApprovalWindow) {
-      return;
-    }
     void loadData();
   }, []);
 
@@ -196,6 +154,11 @@ export default function App() {
       if (loadedInstances.length > 0) {
         setSelectedId(loadedInstances[0].instance_id);
         setDraft(fromSummary(loadedInstances[0]));
+        setTargetInput(formatTarget(
+          loadedInstances[0].username,
+          loadedInstances[0].host,
+          loadedInstances[0].port,
+        ));
         setIsCreating(false);
       } else {
         startCreateMode();
@@ -209,9 +172,6 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (isApprovalWindow) {
-      return;
-    }
     if (activeTab === "logs") {
       void loadLogs();
     }
@@ -226,44 +186,11 @@ export default function App() {
   }, [autoRefresh]);
 
   useEffect(() => {
-    if (isApprovalWindow) {
-      return;
-    }
     const setup = async () => {
       const unlisten = await listen("log-updated", () => {
         if (activeTabRef.current === "logs" && autoRefreshRef.current) {
           setTimeout(() => void loadNewLogs(), 150);
         }
-      });
-      return unlisten;
-    };
-    let unlisten: (() => void) | undefined;
-    setup().then((fn) => { unlisten = fn; });
-    return () => { unlisten?.(); };
-  }, []);
-
-  useEffect(() => {
-    const setup = async () => {
-      const unlisten = await listen<ApprovalRequestedEvent>("approval-requested", (event) => {
-        setActiveApproval(event.payload.request);
-        setPendingApprovalCount(event.payload.pending_count);
-        setStatus("有高危 SSH 操作等待审批。");
-        setStatusTone("danger");
-      });
-      return unlisten;
-    };
-    let unlisten: (() => void) | undefined;
-    setup().then((fn) => { unlisten = fn; });
-    return () => { unlisten?.(); };
-  }, []);
-
-  useEffect(() => {
-    const setup = async () => {
-      const unlisten = await listen<ApprovalResolvedEvent>("approval-resolved", (event) => {
-        setPendingApprovalCount(event.payload.pending_count);
-        setActiveApproval((current) =>
-          current?.request_id === event.payload.request_id ? null : current,
-        );
       });
       return unlisten;
     };
@@ -306,7 +233,7 @@ export default function App() {
       const maxId = entries.reduce((max, e) => Math.max(max, e.id), lastLogId);
       setLastLogId(maxId);
     } catch {
-      // silently fail on background refresh
+      // ignore background refresh failures
     }
   }
 
@@ -316,12 +243,12 @@ export default function App() {
     }
   }, [logs]);
 
-function startCreateMode() {
-  setSelectedId(null);
-  setDraft(emptyDraft());
-  setTargetInput("");
-  setIsCreating(true);
-}
+  function startCreateMode() {
+    setSelectedId(null);
+    setDraft(emptyDraft());
+    setTargetInput("");
+    setIsCreating(true);
+  }
 
   function selectInstance(instance: InstanceSummary) {
     setSelectedId(instance.instance_id);
@@ -386,6 +313,64 @@ function startCreateMode() {
     }
   }
 
+  async function loadSettings() {
+    try {
+      const settings = await invoke<AppSettings>("get_settings");
+      setAppSettings(settings);
+    } catch {
+      // ignore loading failure
+    }
+  }
+
+  async function handleToggleSystemApproval(useSystem: boolean) {
+    setSavingSettings(true);
+    const newSettings: AppSettings = { use_system_approval: useSystem };
+    try {
+      await invoke("save_settings", { settings: newSettings });
+      setAppSettings(newSettings);
+      setStatus(useSystem ? "已启用系统弹窗审批。" : "已禁用系统弹窗审批。");
+      setStatusTone("success");
+    } catch (error) {
+      setStatus(asMessage(error));
+      setStatusTone("danger");
+    } finally {
+      setSavingSettings(false);
+    }
+  }
+
+  async function handleRestartMcp() {
+    const confirmed = window.confirm(
+      "确定要重启 MCP 服务器吗？\n\n任何正在进行的 SSH 操作将被中断，IDE 将在几秒后自动重新连接。"
+    );
+    if (!confirmed) return;
+
+    setRestartingMcp(true);
+    setRestartResult(null);
+    try {
+      const msg = await invoke<string>("restart_mcp");
+      setRestartResult({ kind: "success", message: msg });
+      setStatus(msg);
+      setStatusTone("success");
+    } catch (error) {
+      const errMsg = asMessage(error);
+      setRestartResult({ kind: "error", message: errMsg });
+      setStatus(errMsg);
+      setStatusTone("danger");
+    } finally {
+      setRestartingMcp(false);
+      setTimeout(() => setRestartResult(null), 3000);
+    }
+  }
+
+  function openSettings() {
+    setShowSettings(true);
+    void loadSettings();
+  }
+
+  function closeSettings() {
+    setShowSettings(false);
+  }
+
   async function copyConfig(label: string, content: string) {
     try {
       await writeText(content);
@@ -426,80 +411,8 @@ function startCreateMode() {
     try {
       await appWindow.startDragging();
     } catch {
-      // Ignore drag failures and keep the UI silent.
+      // ignore
     }
-  }
-
-  async function resolveApproval(accepted: boolean) {
-    if (!activeApproval) {
-      return;
-    }
-
-    setResolvingApproval(true);
-    try {
-      await invoke("resolve_approval", {
-        requestId: activeApproval.request_id,
-        accepted,
-      });
-      setStatus(accepted ? "已允许执行该操作。" : "已拒绝执行该操作。");
-      setStatusTone(accepted ? "success" : "danger");
-    } catch (error) {
-      setStatus(asMessage(error));
-      setStatusTone("danger");
-    } finally {
-      setResolvingApproval(false);
-    }
-  }
-
-  if (isApprovalWindow) {
-    return (
-      <div className="approval-window-shell">
-        {activeApproval ? (
-          <section aria-label="SSH 操作审批" className="approval-dialog approval-dialog-window">
-            <div className="approval-header">
-              <span className="approval-kicker">需要审批</span>
-              <h2>高危 SSH 操作</h2>
-              {pendingApprovalCount > 0 ? (
-                <p className="approval-subtitle">后面还有 {pendingApprovalCount} 个待审批请求</p>
-              ) : null}
-            </div>
-            <div className="approval-summary">
-              <ApprovalField label="工具" value={approvalToolName(activeApproval.metadata.tool_name)} />
-              <ApprovalField label="连接" value={activeApproval.metadata.instance_id ?? "-"} />
-              {activeApproval.metadata.command_description ? (
-                <ApprovalField label="命令说明" value={activeApproval.metadata.command_description} />
-              ) : null}
-              {activeApproval.metadata.command ? (
-                <ApprovalCommandField value={activeApproval.metadata.command} />
-              ) : null}
-              {activeApproval.metadata.remote_path ? (
-                <ApprovalField label="路径" value={activeApproval.metadata.remote_path} mono />
-              ) : null}
-            </div>
-            <div className="approval-actions">
-              <button
-                className="secondary-button"
-                disabled={resolvingApproval}
-                onClick={() => void resolveApproval(false)}
-                type="button"
-              >
-                拒绝
-              </button>
-              <button
-                className="primary-button"
-                disabled={resolvingApproval}
-                onClick={() => void resolveApproval(true)}
-                type="button"
-              >
-                允许执行
-              </button>
-            </div>
-          </section>
-        ) : (
-          <div className="approval-window-idle">等待审批请求…</div>
-        )}
-      </div>
-    );
   }
 
   return (
@@ -558,9 +471,34 @@ function startCreateMode() {
             </div>
           ) : null}
         </div>
+
+        <div className="sidebar-bottom">
+          <button
+            className={"sidebar-settings-btn" + (showSettings ? " active" : "")}
+            onClick={showSettings ? closeSettings : openSettings}
+            type="button"
+          >
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="8" cy="8" r="2.5" />
+              <path d="M8 1v2M8 13v2M1 8h2M13 8h2M2.5 2.5l1.5 1.5M12 12l1.5 1.5M2.5 13.5l1.5-1.5M12 4l1.5-1.5" />
+            </svg>
+            <span>设置</span>
+          </button>
+        </div>
       </aside>
 
       <main className="content">
+        {showSettings ? (
+          <SettingsPanel
+            appSettings={appSettings}
+            saving={savingSettings}
+            restartingMcp={restartingMcp}
+            restartResult={restartResult}
+            onToggleSystemApproval={handleToggleSystemApproval}
+            onRestartMcp={handleRestartMcp}
+            onClose={closeSettings}
+          />
+        ) : (
         <section className="panel-main">
           <div className="panel-header">
             <div>
@@ -597,180 +535,178 @@ function startCreateMode() {
           </div>
 
           {activeTab === "config" ? (
-            <>
-              <div className="tab-content">
-                <div className="form-grid">
-                  <label className="field-span-2">
-                    <span>SSH 目标</span>
-                    <div className="target-row">
-                      <input
-                        onChange={(event) => setTargetInput(event.target.value)}
-                        placeholder="例如：ssh://root@10.0.0.10:22 或 root@10.0.0.10"
-                        value={targetInput}
-                      />
-                      <button className="ghost-button" onClick={applyTargetInput} type="button">
-                        解析
-                      </button>
-                    </div>
-                  </label>
-                  <label>
-                    <span>连接 ID</span>
+            <div className="tab-content">
+              <div className="form-grid">
+                <label className="field-span-2">
+                  <span>SSH 目标</span>
+                  <div className="target-row">
                     <input
-                      disabled={!isCreating}
-                      onChange={(event) => setDraft({ ...draft, instance_id: event.target.value })}
-                      placeholder="例如：prod-server"
-                      value={draft.instance_id}
+                      onChange={(event) => setTargetInput(event.target.value)}
+                      placeholder="例如：ssh://root@10.0.0.10:22 或 root@10.0.0.10"
+                      value={targetInput}
                     />
-                  </label>
-                  <label>
-                    <span>显示名称</span>
-                    <input
-                      onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-                      placeholder="例如：生产服务器"
-                      value={draft.name}
-                    />
-                  </label>
-                  <label>
-                    <span>主机</span>
-                    <input
-                      onChange={(event) => setDraft({ ...draft, host: event.target.value })}
-                      placeholder="10.0.0.10"
-                      value={draft.host}
-                    />
-                  </label>
-                  <label>
-                    <span>端口</span>
-                    <input
-                      min={1}
-                      onChange={(event) =>
-                        setDraft({
-                          ...draft,
-                          port: Number.parseInt(event.target.value, 10) || 22,
-                        })
-                      }
-                      type="number"
-                      value={draft.port}
-                    />
-                  </label>
-                  <label>
-                    <span>用户名</span>
-                    <input
-                      onChange={(event) => setDraft({ ...draft, username: event.target.value })}
-                      placeholder="root"
-                      value={draft.username}
-                    />
-                  </label>
-                  <label>
-                    <span>认证方式</span>
-                    <select
-                      onChange={(event) =>
-                        setDraft({
-                          ...draft,
-                          auth_kind: event.target.value as AuthKind,
-                        })
-                      }
-                      value={draft.auth_kind}
-                    >
-                      <option value="password">密码</option>
-                      <option value="private_key">私钥</option>
-                    </select>
-                  </label>
-                </div>
+                    <button className="ghost-button" onClick={applyTargetInput} type="button">
+                      解析
+                    </button>
+                  </div>
+                </label>
+                <label>
+                  <span>连接 ID</span>
+                  <input
+                    disabled={!isCreating}
+                    onChange={(event) => setDraft({ ...draft, instance_id: event.target.value })}
+                    placeholder="例如：prod-server"
+                    value={draft.instance_id}
+                  />
+                </label>
+                <label>
+                  <span>显示名称</span>
+                  <input
+                    onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+                    placeholder="例如：生产服务器"
+                    value={draft.name}
+                  />
+                </label>
+                <label>
+                  <span>主机</span>
+                  <input
+                    onChange={(event) => setDraft({ ...draft, host: event.target.value })}
+                    placeholder="10.0.0.10"
+                    value={draft.host}
+                  />
+                </label>
+                <label>
+                  <span>端口</span>
+                  <input
+                    min={1}
+                    onChange={(event) =>
+                      setDraft({
+                        ...draft,
+                        port: Number.parseInt(event.target.value, 10) || 22,
+                      })
+                    }
+                    type="number"
+                    value={draft.port}
+                  />
+                </label>
+                <label>
+                  <span>用户名</span>
+                  <input
+                    onChange={(event) => setDraft({ ...draft, username: event.target.value })}
+                    placeholder="root"
+                    value={draft.username}
+                  />
+                </label>
+                <label>
+                  <span>认证方式</span>
+                  <select
+                    onChange={(event) =>
+                      setDraft({
+                        ...draft,
+                        auth_kind: event.target.value as AuthKind,
+                      })
+                    }
+                    value={draft.auth_kind}
+                  >
+                    <option value="password">密码</option>
+                    <option value="private_key">私钥</option>
+                  </select>
+                </label>
+              </div>
 
-                <div className="toggle-row">
+              <div className="toggle-row">
+                <label className="checkbox">
+                  <input
+                    checked={draft.host_key_check}
+                    onChange={(event) =>
+                      setDraft({ ...draft, host_key_check: event.target.checked })
+                    }
+                    type="checkbox"
+                  />
+                  <span>按 known_hosts 校验主机指纹</span>
+                </label>
+
+                {!isCreating ? (
                   <label className="checkbox">
                     <input
-                      checked={draft.host_key_check}
+                      checked={draft.keep_existing_secret}
                       onChange={(event) =>
-                        setDraft({ ...draft, host_key_check: event.target.checked })
+                        setDraft({ ...draft, keep_existing_secret: event.target.checked })
                       }
                       type="checkbox"
                     />
-                    <span>按 known_hosts 校验主机指纹</span>
-                  </label>
-
-                  {!isCreating ? (
-                    <label className="checkbox">
-                      <input
-                        checked={draft.keep_existing_secret}
-                        onChange={(event) =>
-                          setDraft({ ...draft, keep_existing_secret: event.target.checked })
-                        }
-                        type="checkbox"
-                      />
-                      <span>如果密钥字段为空，则保留已存凭据</span>
-                    </label>
-                  ) : null}
-                </div>
-
-                {requiresPassword ? (
-                  <label className="field-block">
-                    <span>SSH 密码</span>
-                    <input
-                      onChange={(event) => setDraft({ ...draft, password: event.target.value })}
-                      placeholder={
-                        isCreating
-                          ? "远程账户密码"
-                          : "留空则保留已保存的 SSH 密码"
-                      }
-                      type="password"
-                      value={draft.password}
-                    />
+                    <span>如果密钥字段为空，则保留已存凭据</span>
                   </label>
                 ) : null}
+              </div>
 
-                {requiresKey ? (
-                  <>
-                    <label className="field-block">
-                      <span>SSH 私钥</span>
-                      <textarea
-                        onChange={(event) => setDraft({ ...draft, private_key: event.target.value })}
-                        placeholder={
-                          isCreating
-                            ? "粘贴 OpenSSH 私钥内容"
-                            : "留空则保留已保存的私钥"
-                        }
-                        rows={4}
-                        value={draft.private_key}
-                      />
-                    </label>
-                    <label className="field-block">
-                      <span>私钥口令</span>
-                      <input
-                        onChange={(event) => setDraft({ ...draft, passphrase: event.target.value })}
-                        placeholder="可选口令"
-                        type="password"
-                        value={draft.passphrase}
-                      />
-                    </label>
-                  </>
-                ) : null}
-
+              {requiresPassword ? (
                 <label className="field-block">
-                  <span>备注</span>
-                  <textarea
-                    onChange={(event) => setDraft({ ...draft, notes: event.target.value })}
-                    placeholder="可选备注、标签或使用说明"
-                    rows={2}
-                    value={draft.notes}
+                  <span>SSH 密码</span>
+                  <input
+                    onChange={(event) => setDraft({ ...draft, password: event.target.value })}
+                    placeholder={
+                      isCreating
+                        ? "远程账户密码"
+                        : "留空则保留已保存的 SSH 密码"
+                    }
+                    type="password"
+                    value={draft.password}
                   />
                 </label>
+              ) : null}
 
-                <div className="action-row">
-                  <button className="primary-button" disabled={saving} onClick={handleSave} type="button">
-                    {saving ? "保存中..." : "保存连接"}
+              {requiresKey ? (
+                <>
+                  <label className="field-block">
+                    <span>SSH 私钥</span>
+                    <textarea
+                      onChange={(event) => setDraft({ ...draft, private_key: event.target.value })}
+                      placeholder={
+                        isCreating
+                          ? "粘贴 OpenSSH 私钥内容"
+                          : "留空则保留已保存的私钥"
+                      }
+                      rows={4}
+                      value={draft.private_key}
+                    />
+                  </label>
+                  <label className="field-block">
+                    <span>私钥口令</span>
+                    <input
+                      onChange={(event) => setDraft({ ...draft, passphrase: event.target.value })}
+                      placeholder="可选口令"
+                      type="password"
+                      value={draft.passphrase}
+                    />
+                  </label>
+                </>
+              ) : null}
+
+              <label className="field-block">
+                <span>备注</span>
+                <textarea
+                  onChange={(event) => setDraft({ ...draft, notes: event.target.value })}
+                  placeholder="可选备注、标签或使用说明"
+                  rows={2}
+                  value={draft.notes}
+                />
+              </label>
+
+              <div className="action-row">
+                <button className="primary-button" disabled={saving} onClick={handleSave} type="button">
+                  {saving ? "保存中..." : "保存连接"}
+                </button>
+                <button className="secondary-button" disabled={testing} onClick={handleTest} type="button">
+                  {testing ? "测试中..." : "测试连接"}
+                </button>
+                {!isCreating ? (
+                  <button className="danger-button" onClick={handleDelete} type="button">
+                    删除
                   </button>
-                  <button className="secondary-button" disabled={testing} onClick={handleTest} type="button">
-                    {testing ? "测试中..." : "测试连接"}
-                  </button>
-                  {!isCreating ? (
-                    <button className="danger-button" onClick={handleDelete} type="button">
-                      删除
-                    </button>
-                  ) : null}
-                </div>
+                ) : null}
               </div>
-            </>
+            </div>
           ) : (
             <div className="tab-content log-viewer">
               <div className="log-toolbar">
@@ -832,10 +768,6 @@ function startCreateMode() {
                 {logs.map((entry, index) => {
                   const prev = index > 0 ? logs[index - 1] : null;
                   const sessionChange = !prev || prev.session_id !== entry.session_id;
-                  const execCount = logs
-                    .slice(latestNExecIndex(logs, expandedStdout))
-                    .filter((e) => e.operation === "execute_command")
-                    .length;
                   const shouldOpen = expandedStdout > 0
                     && entry.operation === "execute_command"
                     && index >= latestNExecIndex(logs, expandedStdout)
@@ -868,6 +800,7 @@ function startCreateMode() {
             </div>
           )}
         </section>
+        )}
       </main>
 
       {showConfigDialog ? (
@@ -915,111 +848,84 @@ function startCreateMode() {
           </section>
         </div>
       ) : null}
-
-      {activeApproval ? (
-        <div className="dialog-backdrop approval-backdrop" role="presentation">
-          <section aria-label="SSH 操作审批" className="approval-dialog">
-            <div className="approval-header">
-              <span className="approval-kicker">需要审批</span>
-              <h2>高危 SSH 操作</h2>
-              {pendingApprovalCount > 0 ? (
-                <p className="approval-subtitle">后面还有 {pendingApprovalCount} 个待审批请求</p>
-              ) : null}
-            </div>
-            <div className="approval-summary">
-              <ApprovalField label="工具" value={approvalToolName(activeApproval.metadata.tool_name)} />
-              <ApprovalField label="连接" value={activeApproval.metadata.instance_id ?? "-"} />
-              {activeApproval.metadata.command_description ? (
-                <ApprovalField label="命令说明" value={activeApproval.metadata.command_description} />
-              ) : null}
-              {activeApproval.metadata.command ? (
-                <ApprovalCommandField value={activeApproval.metadata.command} />
-              ) : null}
-              {activeApproval.metadata.remote_path ? (
-                <ApprovalField label="路径" value={activeApproval.metadata.remote_path} mono />
-              ) : null}
-            </div>
-            <div className="approval-actions">
-              <button
-                className="secondary-button"
-                disabled={resolvingApproval}
-                onClick={() => void resolveApproval(false)}
-                type="button"
-              >
-                拒绝
-              </button>
-              <button
-                className="primary-button"
-                disabled={resolvingApproval}
-                onClick={() => void resolveApproval(true)}
-                type="button"
-              >
-                允许执行
-              </button>
-            </div>
-          </section>
-        </div>
-      ) : null}
     </div>
   );
 }
 
-function ApprovalField({
-  label,
-  value,
-  mono = false,
+function SettingsPanel({
+  appSettings,
+  saving,
+  restartingMcp,
+  onToggleSystemApproval,
+  onRestartMcp,
+  onClose,
 }: {
-  label: string;
-  value: string;
-  mono?: boolean;
+  appSettings: AppSettings | null;
+  saving: boolean;
+  restartingMcp: boolean;
+  onToggleSystemApproval: (useSystem: boolean) => void;
+  onRestartMcp: () => Promise<void>;
+  onClose: () => void;
 }) {
   return (
-    <div className="approval-field">
-      <span>{label}</span>
-      <strong className={mono ? "mono-value" : ""}>{value}</strong>
-    </div>
-  );
-}
-
-function ApprovalCommandField({ value }: { value: string }) {
-  async function handleCopy() {
-    try {
-      await writeText(value);
-    } catch {
-      // keep the approval window silent on clipboard failure
-    }
-  }
-
-  return (
-    <div className="approval-command-field">
-      <span>命令</span>
-      <div className="approval-command-shell">
-        <button
-          className="approval-copy-button"
-          onClick={() => void handleCopy()}
-          type="button"
-        >
-          复制
-        </button>
-        <pre className="approval-command-code">{value}</pre>
+    <section className="panel-main">
+      <div className="panel-header">
+        <div>
+          <h2>软件设置</h2>
+        </div>
+        <div className="header-actions">
+          <button className="ghost-button utility-button" onClick={onClose} type="button">
+            返回
+          </button>
+        </div>
       </div>
-    </div>
-  );
-}
 
-function approvalToolName(toolName: string): string {
-  switch (toolName) {
-    case "execute_command":
-      return "执行命令";
-    case "upload_file":
-      return "上传文件";
-    case "download_file":
-      return "下载文件";
-    case "create_session":
-      return "创建会话";
-    default:
-      return toolName;
-  }
+      <div className="settings-shell">
+        <div className="settings-section">
+          <h3 className="settings-section-title">审批</h3>
+          <p className="settings-section-desc">配置 SSH 操作执行时的审批行为。</p>
+
+          <div className="settings-item">
+            <div className="settings-item-info">
+              <strong>启用系统弹窗进行审核</strong>
+              <p>开启后，所有需审批的 SSH 操作将直接使用系统原生对话框，不再弹出独立的审批窗口。</p>
+            </div>
+            <label className="toggle-switch settings-toggle">
+              <input
+                type="checkbox"
+                checked={appSettings?.use_system_approval ?? false}
+                disabled={saving}
+                onChange={(e) => onToggleSystemApproval(e.target.checked)}
+              />
+              <span className="toggle-slider" />
+              <span className="toggle-label">{appSettings?.use_system_approval ? "开启" : "关闭"}</span>
+            </label>
+          </div>
+        </div>
+
+        <div className="settings-section">
+          <h3 className="settings-section-title">MCP 服务器</h3>
+          <p className="settings-section-desc">管理 MCP 后台进程。如果服务器意外退出导致工具调用超时，可尝试重启。</p>
+
+          <div className="settings-item">
+            <div className="settings-item-info">
+              <strong>重启 MCP 服务器</strong>
+              <p>结束当前 MCP 进程并清理残留文件，IDE 将在几秒后自动重连。正在进行的操作将被中断。</p>
+            </div>
+            <button
+              className="danger-button"
+              disabled={restartingMcp}
+              onClick={onRestartMcp}
+              style={{ flexShrink: 0 }}
+              type="button"
+            >
+              {restartingMcp ? "重启中..." : "重启服务器"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
 }
 
 function formatLogTime(iso: string): string {

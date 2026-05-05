@@ -8,7 +8,9 @@
     "build": "vite build",
     "preview": "vite preview",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "approval:dev": "tauri dev --config approval-tauri/tauri.conf.json",
+    "approval:build": "tauri build --config approval-tauri/tauri.conf.json"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",
