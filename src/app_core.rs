@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,6 +14,7 @@ use ssh2::{CheckResult, KnownHostFileKind, Session};
 use uuid::Uuid;
 
 use crate::credentials::SecretStore;
+use crate::local_ipc::send_notification;
 use crate::models::{
     AuthKind, CreateSessionResult, DownloadEncoding, DownloadFileArgs, DownloadFileResult,
     ExecuteCommandArgs, ExecuteCommandResult, InstanceDraft, InstanceSummary, ListServersResult,
@@ -31,7 +31,7 @@ pub struct DesktopCore {
     store: InstanceStore,
     secrets: SecretStore,
     sessions: Arc<Mutex<HashMap<String, ManagedSession>>>,
-    notify_socket: Option<PathBuf>,
+    notify_endpoint: Option<String>,
 }
 
 struct ManagedSession {
@@ -52,13 +52,13 @@ impl DesktopCore {
     pub fn new_with_socket(
         db_path: PathBuf,
         keyring_service: impl Into<String>,
-        notify_socket: Option<PathBuf>,
+        notify_endpoint: Option<String>,
     ) -> Result<Self> {
         Ok(Self {
             store: InstanceStore::new(db_path)?,
             secrets: SecretStore::new(keyring_service),
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            notify_socket,
+            notify_endpoint,
         })
     }
 
@@ -91,10 +91,8 @@ impl DesktopCore {
     }
 
     fn notify_ui(&self) {
-        if let Some(socket_path) = &self.notify_socket {
-            if let Ok(mut stream) = UnixStream::connect(socket_path) {
-                let _ = stream.write_all(b"1");
-            }
+        if let Some(endpoint) = &self.notify_endpoint {
+            let _ = send_notification(endpoint);
         }
     }
 
@@ -178,7 +176,8 @@ impl DesktopCore {
         command_path: &str,
         db_path: &str,
         keyring_service: &str,
-        notify_socket: Option<&str>,
+        notify_endpoint: Option<&str>,
+        approval_endpoint: Option<&str>,
     ) -> Result<McpConfigBundle> {
         let mut args = vec![
             "--db-path".to_string(),
@@ -186,12 +185,16 @@ impl DesktopCore {
             "--keyring-service".to_string(),
             keyring_service.to_string(),
         ];
-        if let Some(socket) = notify_socket {
+        if let Some(endpoint) = notify_endpoint {
             args.push("--notify-socket".to_string());
-            args.push(socket.to_string());
+            args.push(endpoint.to_string());
         }
         args.push("--approval-mode".to_string());
         args.push("auto".to_string());
+        if let Some(endpoint) = approval_endpoint {
+            args.push("--approval-endpoint".to_string());
+            args.push(endpoint.to_string());
+        }
 
         let stdio_json = serde_json::to_string_pretty(&serde_json::json!({
             "mcpServers": {
@@ -258,6 +261,10 @@ impl DesktopCore {
         if args.command.trim().is_empty() {
             bail!("command cannot be empty");
         }
+        let command_description = args.command_description.trim().to_string();
+        if command_description.is_empty() {
+            bail!("command_description cannot be empty");
+        }
 
         let timeout_ms = args
             .timeout_secs
@@ -321,6 +328,7 @@ impl DesktopCore {
 
         let details = serde_json::json!({
             "instance_name": instance_name,
+            "command_description": command_description,
             "command": command,
             "stdout": result.stdout,
             "stderr": result.stderr,

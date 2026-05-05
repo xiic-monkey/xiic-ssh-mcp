@@ -9,7 +9,7 @@ use xiic_ssh_mcp::models::{ApprovalMode, WhitelistMode};
 
 fn main() -> Result<()> {
     let options = CliOptions::parse(env::args().skip(1))?;
-    let notify_socket = options.notify_socket.clone();
+    let approval_endpoint = options.approval_endpoint.clone();
     let core = Arc::new(DesktopCore::new_with_socket(
         options.db_path,
         options.keyring_service,
@@ -19,7 +19,7 @@ fn main() -> Result<()> {
         core,
         options.whitelist_mode,
         options.approval_mode,
-        notify_socket,
+        approval_endpoint,
     );
     server.run()
 }
@@ -27,9 +27,10 @@ fn main() -> Result<()> {
 struct CliOptions {
     db_path: PathBuf,
     keyring_service: String,
-    notify_socket: Option<PathBuf>,
+    notify_socket: Option<String>,
     whitelist_mode: WhitelistMode,
     approval_mode: ApprovalMode,
+    approval_endpoint: Option<String>,
 }
 
 impl CliOptions {
@@ -42,6 +43,7 @@ impl CliOptions {
         let mut notify_socket = None;
         let mut whitelist_mode = WhitelistMode::Strict;
         let mut approval_mode = ApprovalMode::Auto;
+        let mut approval_endpoint = None;
         let mut iter = args.into_iter();
 
         while let Some(arg) = iter.next() {
@@ -61,7 +63,7 @@ impl CliOptions {
                     let value = iter
                         .next()
                         .ok_or_else(|| anyhow::anyhow!("--notify-socket requires a value"))?;
-                    notify_socket = Some(PathBuf::from(value));
+                    notify_socket = Some(value);
                 }
                 "--whitelist" => {
                     let value = iter
@@ -96,6 +98,12 @@ impl CliOptions {
                         }
                     };
                 }
+                "--approval-endpoint" => {
+                    approval_endpoint =
+                        Some(iter.next().ok_or_else(|| {
+                            anyhow::anyhow!("--approval-endpoint requires a value")
+                        })?);
+                }
                 "-h" | "--help" => {
                     print_help();
                     std::process::exit(0);
@@ -116,6 +124,7 @@ impl CliOptions {
             notify_socket,
             whitelist_mode,
             approval_mode,
+            approval_endpoint,
         })
     }
 }
@@ -124,11 +133,12 @@ fn print_help() {
     println!(
         "xiic-ssh-mcp\n\n\
          Usage:\n  \
-         xiic-ssh-mcp --db-path <path> [--keyring-service <service>] [--notify-socket <path>] [--whitelist strict|off] [--approval-mode auto|elicitation|local]\n\n\
+         xiic-ssh-mcp --db-path <path> [--keyring-service <service>] [--notify-socket <path>] [--approval-endpoint <path-or-pipe>] [--whitelist strict|off] [--approval-mode auto|elicitation|local]\n\n\
          Options:\n  \
          --db-path <path>          Path to SQLite database\n  \
          --keyring-service <srv>   Keyring service name (default: {})\n  \
-         --notify-socket <path>    Unix socket path for UI notifications\n  \
+         --notify-socket <path>    Local IPC endpoint for UI log notifications\n  \
+         --approval-endpoint <x>   Local IPC endpoint for approval request/response\n  \
          --whitelist <mode>        Whitelist mode: 'strict' (default) or 'off'\n  \
          --approval-mode <mode>    Approval mode: 'auto' (default), 'elicitation', or 'local'\n",
         DEFAULT_KEYRING_SERVICE,

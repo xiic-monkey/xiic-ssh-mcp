@@ -1,5 +1,4 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -8,11 +7,11 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::app_core::DesktopCore;
-use crate::approval::LocalApproval;
+use crate::approval::LocalApprovalClient;
 use crate::models::{
-    ApprovalMode, CreateSessionResult, DownloadFileArgs, DownloadFileResult, ExecuteCommandArgs,
-    ExecuteCommandResult, OperationContext, PendingToolCall, RuleDecision, ToolCall,
-    UploadFileArgs, UploadFileResult, WhitelistMode,
+    ApprovalMode, ApprovalOperationMetadata, CreateSessionResult, DownloadFileArgs,
+    DownloadFileResult, ExecuteCommandArgs, ExecuteCommandResult, OperationContext,
+    PendingToolCall, RuleDecision, ToolCall, UploadFileArgs, UploadFileResult, WhitelistMode,
 };
 use crate::whitelist::WhitelistChecker;
 
@@ -52,7 +51,7 @@ pub struct McpServer {
     approval_mode: ApprovalMode,
     client_supports_elicitation: bool,
     checker: WhitelistChecker,
-    local_approval: LocalApproval,
+    local_approval: LocalApprovalClient,
 }
 
 impl McpServer {
@@ -60,7 +59,7 @@ impl McpServer {
         core: Arc<DesktopCore>,
         whitelist_mode: WhitelistMode,
         approval_mode: ApprovalMode,
-        notify_socket: Option<PathBuf>,
+        approval_endpoint: Option<String>,
     ) -> Self {
         let checker = core.create_whitelist_checker();
         Self {
@@ -69,7 +68,7 @@ impl McpServer {
             approval_mode,
             client_supports_elicitation: false,
             checker,
-            local_approval: LocalApproval::new(notify_socket),
+            local_approval: LocalApprovalClient::new(approval_endpoint),
         }
     }
 
@@ -128,7 +127,7 @@ impl McpServer {
                                 "[xiic-ssh-mcp] Requesting local approval for tool='{}'",
                                 pending.tool_call.name
                             );
-                            self.local_approval.request(&pending.operation)?
+                            self.local_approval.request(&pending.approval)?
                         }
                     };
 
@@ -264,9 +263,10 @@ impl McpServer {
                         "properties": {
                             "session_id": { "type": "string" },
                             "command": { "type": "string" },
+                            "command_description": { "type": "string" },
                             "timeout_secs": { "type": "integer", "minimum": 1 }
                         },
-                        "required": ["session_id", "command"],
+                        "required": ["session_id", "command", "command_description"],
                         "additionalProperties": false
                     }
                 },
@@ -337,6 +337,7 @@ impl McpServer {
                 let details = json!({
                     "tool_name": ctx.tool_name,
                     "command": ctx.command,
+                    "command_description": ctx.command_description,
                     "remote_path": ctx.remote_path,
                     "instance_id": ctx.instance_id,
                 });
@@ -354,10 +355,12 @@ impl McpServer {
                     }
                 });
 
+                let approval = ApprovalOperationMetadata::from(&ctx);
                 let pending = PendingToolCall {
                     id,
                     tool_call,
                     operation: ctx,
+                    approval,
                 };
 
                 let flow = if self.should_use_elicitation() {
@@ -410,6 +413,7 @@ impl McpServer {
             "list_servers" => Ok(OperationContext {
                 tool_name: "list_servers".into(),
                 command: None,
+                command_description: None,
                 remote_path: None,
                 instance_id: None,
             }),
@@ -422,16 +426,22 @@ impl McpServer {
                 Ok(OperationContext {
                     tool_name: "create_session".into(),
                     command: None,
+                    command_description: None,
                     remote_path: None,
                     instance_id: Some(args.instance_id),
                 })
             }
             "execute_command" => {
                 let args: ExecuteCommandArgs = deserialize_args(tool_call.arguments.clone())?;
+                let command_description = args.command_description.trim().to_string();
+                if command_description.is_empty() {
+                    bail!("command_description cannot be empty");
+                }
                 let instance_id = self.lookup_session_instance(&args.session_id)?;
                 Ok(OperationContext {
                     tool_name: "execute_command".into(),
                     command: Some(args.command),
+                    command_description: Some(command_description),
                     remote_path: None,
                     instance_id: Some(instance_id),
                 })
@@ -442,6 +452,7 @@ impl McpServer {
                 Ok(OperationContext {
                     tool_name: "upload_file".into(),
                     command: None,
+                    command_description: None,
                     remote_path: Some(args.remote_path),
                     instance_id: Some(instance_id),
                 })
@@ -452,6 +463,7 @@ impl McpServer {
                 Ok(OperationContext {
                     tool_name: "download_file".into(),
                     command: None,
+                    command_description: None,
                     remote_path: Some(args.remote_path),
                     instance_id: Some(instance_id),
                 })
@@ -697,14 +709,17 @@ fn _type_assertions(
 #[cfg(test)]
 mod tests {
     use std::io::{BufReader, Cursor};
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
     use serde_json::json;
 
-    use crate::models::ApprovalMode;
+    use crate::app_core::{DEFAULT_KEYRING_SERVICE, DesktopCore};
+    use crate::models::{ApprovalMode, WhitelistMode};
 
     use super::{
-        MessageFraming, has_elicitation_capability, read_message, should_use_elicitation_mode,
-        write_message,
+        McpServer, MessageFraming, has_elicitation_capability, read_message,
+        should_use_elicitation_mode, write_message,
     };
 
     fn initialize_payload() -> serde_json::Value {
@@ -810,5 +825,63 @@ mod tests {
             false
         ));
         assert!(!should_use_elicitation_mode(ApprovalMode::Local, true));
+    }
+
+    #[test]
+    fn execute_command_schema_requires_command_description() {
+        let server = test_server();
+        let tools = server.handle_tools_list();
+        let execute = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "execute_command")
+            .unwrap();
+
+        assert_eq!(
+            execute["inputSchema"]["properties"]["command_description"]["type"],
+            "string"
+        );
+        assert!(
+            execute["inputSchema"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "command_description")
+        );
+    }
+
+    #[test]
+    fn build_context_rejects_empty_command_description() {
+        let server = test_server();
+        let err = server
+            .build_context(&crate::models::ToolCall {
+                name: "execute_command".into(),
+                arguments: json!({
+                    "session_id": "session-1",
+                    "command": "uname -a",
+                    "command_description": "   "
+                }),
+            })
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("command_description cannot be empty")
+        );
+    }
+
+    fn test_server() -> McpServer {
+        let db_path = PathBuf::from(format!(
+            "/private/tmp/xiic-ssh-mcp-test-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let core = Arc::new(
+            DesktopCore::new(db_path.clone(), DEFAULT_KEYRING_SERVICE)
+                .expect("test core should initialize"),
+        );
+        let server = McpServer::new(core, WhitelistMode::Strict, ApprovalMode::Auto, None);
+        let _ = std::fs::remove_file(db_path);
+        server
     }
 }

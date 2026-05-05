@@ -217,6 +217,7 @@ mod tests {
         let ctx = OperationContext {
             tool_name: "execute_command".into(),
             command: Some("ls -la".into()),
+            command_description: Some("查看目录".into()),
             remote_path: None,
             instance_id: Some("dev-server".into()),
         };
@@ -250,6 +251,7 @@ mod tests {
         let ctx = OperationContext {
             tool_name: "execute_command".into(),
             command: Some("rm -rf /".into()),
+            command_description: Some("危险删除".into()),
             remote_path: None,
             instance_id: Some("dev-server".into()),
         };
@@ -273,6 +275,7 @@ mod tests {
         let ctx = OperationContext {
             tool_name: "execute_command".into(),
             command: Some("ls -la".into()),
+            command_description: Some("查看目录".into()),
             remote_path: None,
             instance_id: Some("dev-server".into()),
         };

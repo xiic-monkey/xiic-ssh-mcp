@@ -55,9 +55,10 @@ type OperationLogEntry = {
   created_at: string;
 };
 
-type OperationContext = {
+type ApprovalOperationMetadata = {
   tool_name: string;
   command: string | null;
+  command_description: string | null;
   remote_path: string | null;
   instance_id: string | null;
 };
@@ -66,7 +67,18 @@ type ApprovalRequest = {
   kind: string;
   request_id: string;
   message: string;
-  operation: OperationContext;
+  metadata: ApprovalOperationMetadata;
+};
+
+type ApprovalRequestedEvent = {
+  request: ApprovalRequest;
+  pending_count: number;
+};
+
+type ApprovalResolvedEvent = {
+  request_id: string;
+  accepted: boolean;
+  pending_count: number;
 };
 
 type ParsedTarget = {
@@ -108,6 +120,7 @@ function fromSummary(instance: InstanceSummary): InstanceDraft {
 }
 
 const appWindow = getCurrentWindow();
+const isApprovalWindow = appWindow.label === "approval";
 
 export default function App() {
   const [instances, setInstances] = useState<InstanceSummary[]>([]);
@@ -128,7 +141,8 @@ export default function App() {
   const [loadingLogs, setLoadingLogs] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [expandedStdout, setExpandedStdout] = useState<0 | 10 | 20>(0);
-  const [pendingApproval, setPendingApproval] = useState<ApprovalRequest | null>(null);
+  const [activeApproval, setActiveApproval] = useState<ApprovalRequest | null>(null);
+  const [pendingApprovalCount, setPendingApprovalCount] = useState(0);
   const [resolvingApproval, setResolvingApproval] = useState(false);
   const [lastLogId, setLastLogId] = useState(0);
   const logListRef = useRef<HTMLDivElement>(null);
@@ -136,6 +150,27 @@ export default function App() {
   const autoRefreshRef = useRef(autoRefresh);
 
   useEffect(() => {
+    if (!isApprovalWindow) {
+      return;
+    }
+    const loadApproval = async () => {
+      try {
+        const current = await invoke<ApprovalRequestedEvent | null>("get_active_approval");
+        if (current) {
+          setActiveApproval(current.request);
+          setPendingApprovalCount(current.pending_count);
+        }
+      } catch {
+        // ignore hydration errors for the detached approval window
+      }
+    };
+    void loadApproval();
+  }, []);
+
+  useEffect(() => {
+    if (isApprovalWindow) {
+      return;
+    }
     void loadData();
   }, []);
 
@@ -174,6 +209,9 @@ export default function App() {
   }
 
   useEffect(() => {
+    if (isApprovalWindow) {
+      return;
+    }
     if (activeTab === "logs") {
       void loadLogs();
     }
@@ -188,6 +226,9 @@ export default function App() {
   }, [autoRefresh]);
 
   useEffect(() => {
+    if (isApprovalWindow) {
+      return;
+    }
     const setup = async () => {
       const unlisten = await listen("log-updated", () => {
         if (activeTabRef.current === "logs" && autoRefreshRef.current) {
@@ -203,10 +244,26 @@ export default function App() {
 
   useEffect(() => {
     const setup = async () => {
-      const unlisten = await listen<ApprovalRequest>("approval-requested", (event) => {
-        setPendingApproval(event.payload);
+      const unlisten = await listen<ApprovalRequestedEvent>("approval-requested", (event) => {
+        setActiveApproval(event.payload.request);
+        setPendingApprovalCount(event.payload.pending_count);
         setStatus("有高危 SSH 操作等待审批。");
         setStatusTone("danger");
+      });
+      return unlisten;
+    };
+    let unlisten: (() => void) | undefined;
+    setup().then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, []);
+
+  useEffect(() => {
+    const setup = async () => {
+      const unlisten = await listen<ApprovalResolvedEvent>("approval-resolved", (event) => {
+        setPendingApprovalCount(event.payload.pending_count);
+        setActiveApproval((current) =>
+          current?.request_id === event.payload.request_id ? null : current,
+        );
       });
       return unlisten;
     };
@@ -374,25 +431,75 @@ function startCreateMode() {
   }
 
   async function resolveApproval(accepted: boolean) {
-    if (!pendingApproval) {
+    if (!activeApproval) {
       return;
     }
 
     setResolvingApproval(true);
     try {
       await invoke("resolve_approval", {
-        requestId: pendingApproval.request_id,
+        requestId: activeApproval.request_id,
         accepted,
       });
       setStatus(accepted ? "已允许执行该操作。" : "已拒绝执行该操作。");
       setStatusTone(accepted ? "success" : "danger");
-      setPendingApproval(null);
     } catch (error) {
       setStatus(asMessage(error));
       setStatusTone("danger");
     } finally {
       setResolvingApproval(false);
     }
+  }
+
+  if (isApprovalWindow) {
+    return (
+      <div className="approval-window-shell">
+        {activeApproval ? (
+          <section aria-label="SSH 操作审批" className="approval-dialog approval-dialog-window">
+            <div className="approval-header">
+              <span className="approval-kicker">需要审批</span>
+              <h2>高危 SSH 操作</h2>
+              {pendingApprovalCount > 0 ? (
+                <p className="approval-subtitle">后面还有 {pendingApprovalCount} 个待审批请求</p>
+              ) : null}
+            </div>
+            <div className="approval-summary">
+              <ApprovalField label="工具" value={approvalToolName(activeApproval.metadata.tool_name)} />
+              <ApprovalField label="连接" value={activeApproval.metadata.instance_id ?? "-"} />
+              {activeApproval.metadata.command_description ? (
+                <ApprovalField label="命令说明" value={activeApproval.metadata.command_description} />
+              ) : null}
+              {activeApproval.metadata.command ? (
+                <ApprovalCommandField value={activeApproval.metadata.command} />
+              ) : null}
+              {activeApproval.metadata.remote_path ? (
+                <ApprovalField label="路径" value={activeApproval.metadata.remote_path} mono />
+              ) : null}
+            </div>
+            <div className="approval-actions">
+              <button
+                className="secondary-button"
+                disabled={resolvingApproval}
+                onClick={() => void resolveApproval(false)}
+                type="button"
+              >
+                拒绝
+              </button>
+              <button
+                className="primary-button"
+                disabled={resolvingApproval}
+                onClick={() => void resolveApproval(true)}
+                type="button"
+              >
+                允许执行
+              </button>
+            </div>
+          </section>
+        ) : (
+          <div className="approval-window-idle">等待审批请求…</div>
+        )}
+      </div>
+    );
   }
 
   return (
@@ -809,21 +916,27 @@ function startCreateMode() {
         </div>
       ) : null}
 
-      {pendingApproval ? (
+      {activeApproval ? (
         <div className="dialog-backdrop approval-backdrop" role="presentation">
           <section aria-label="SSH 操作审批" className="approval-dialog">
             <div className="approval-header">
               <span className="approval-kicker">需要审批</span>
               <h2>高危 SSH 操作</h2>
+              {pendingApprovalCount > 0 ? (
+                <p className="approval-subtitle">后面还有 {pendingApprovalCount} 个待审批请求</p>
+              ) : null}
             </div>
             <div className="approval-summary">
-              <ApprovalField label="工具" value={approvalToolName(pendingApproval.operation.tool_name)} />
-              <ApprovalField label="连接" value={pendingApproval.operation.instance_id ?? "-"} />
-              {pendingApproval.operation.command ? (
-                <ApprovalField label="命令" value={pendingApproval.operation.command} mono />
+              <ApprovalField label="工具" value={approvalToolName(activeApproval.metadata.tool_name)} />
+              <ApprovalField label="连接" value={activeApproval.metadata.instance_id ?? "-"} />
+              {activeApproval.metadata.command_description ? (
+                <ApprovalField label="命令说明" value={activeApproval.metadata.command_description} />
               ) : null}
-              {pendingApproval.operation.remote_path ? (
-                <ApprovalField label="路径" value={pendingApproval.operation.remote_path} mono />
+              {activeApproval.metadata.command ? (
+                <ApprovalCommandField value={activeApproval.metadata.command} />
+              ) : null}
+              {activeApproval.metadata.remote_path ? (
+                <ApprovalField label="路径" value={activeApproval.metadata.remote_path} mono />
               ) : null}
             </div>
             <div className="approval-actions">
@@ -864,6 +977,32 @@ function ApprovalField({
     <div className="approval-field">
       <span>{label}</span>
       <strong className={mono ? "mono-value" : ""}>{value}</strong>
+    </div>
+  );
+}
+
+function ApprovalCommandField({ value }: { value: string }) {
+  async function handleCopy() {
+    try {
+      await writeText(value);
+    } catch {
+      // keep the approval window silent on clipboard failure
+    }
+  }
+
+  return (
+    <div className="approval-command-field">
+      <span>命令</span>
+      <div className="approval-command-shell">
+        <button
+          className="approval-copy-button"
+          onClick={() => void handleCopy()}
+          type="button"
+        >
+          复制
+        </button>
+        <pre className="approval-command-code">{value}</pre>
+      </div>
     </div>
   );
 }

@@ -245,9 +245,15 @@ agent 调用 MCP 时：
 {
   "session_id": "uuid",
   "command": "uname -a",
+  "command_description": "确认远程服务器的内核和系统信息",
   "timeout_secs": 30
 }
 ```
+
+说明：
+
+- `command_description` 为必填字段，用于审批弹窗说明这条命令的目的
+- 该说明也会写入操作日志，便于后续回看
 
 ### `upload_file`
 

@@ -181,6 +181,7 @@ impl Default for DownloadEncoding {
 pub struct ExecuteCommandArgs {
     pub session_id: String,
     pub command: String,
+    pub command_description: String,
     pub timeout_secs: Option<u64>,
 }
 
@@ -275,6 +276,7 @@ pub struct WhitelistRule {
 pub struct OperationContext {
     pub tool_name: String,
     pub command: Option<String>,
+    pub command_description: Option<String>,
     pub remote_path: Option<String>,
     pub instance_id: Option<String>,
 }
@@ -298,6 +300,7 @@ pub struct PendingToolCall {
     pub id: Value,
     pub tool_call: ToolCall,
     pub operation: OperationContext,
+    pub approval: ApprovalOperationMetadata,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,11 +317,32 @@ pub enum ApprovalMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalOperationMetadata {
+    pub tool_name: String,
+    pub command: Option<String>,
+    pub command_description: Option<String>,
+    pub remote_path: Option<String>,
+    pub instance_id: Option<String>,
+}
+
+impl From<&OperationContext> for ApprovalOperationMetadata {
+    fn from(value: &OperationContext) -> Self {
+        Self {
+            tool_name: value.tool_name.clone(),
+            command: value.command.clone(),
+            command_description: value.command_description.clone(),
+            remote_path: value.remote_path.clone(),
+            instance_id: value.instance_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     pub kind: String,
     pub request_id: String,
     pub message: String,
-    pub operation: OperationContext,
+    pub metadata: ApprovalOperationMetadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +350,19 @@ pub struct ApprovalResponse {
     pub kind: String,
     pub request_id: String,
     pub accepted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalRequestedEvent {
+    pub request: ApprovalRequest,
+    pub pending_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalResolvedEvent {
+    pub request_id: String,
+    pub accepted: bool,
+    pub pending_count: usize,
 }
 
 fn trim_to_none(value: Option<String>) -> Option<String> {
