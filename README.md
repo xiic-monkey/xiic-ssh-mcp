@@ -1,163 +1,112 @@
-# xiic-ssh-mcp
+# Xiic SSH MCP
 
-一个本地桌面 SSH 连接管理器，用来可视化维护远程服务器连接，并把这些连接安全地暴露给支持 MCP 的 agent 使用。
+通过 MCP（Model Context Protocol）让 AI 编码助手安全地操作远程服务器。
 
-这一版不做终端模拟器：它不是一个新的 Terminal，而是一个本地 SSH 连接配置中心 + MCP 桥接工具。
+## 它做什么
 
-## 主要功能
+Xiic SSH MCP 是一个本地 MCP 服务器，为 Cursor、Claude Desktop 等 AI 工具提供 SSH 能力——创建会话、执行命令、上传下载文件。所有操作经过白名单过滤和人工审批，确保 AI 只能做你允许的事。
 
-- 可视化管理 SSH 连接
-- 新增、修改、删除连接配置
-- 保存前测试 SSH 连接是否可用
-- 本地持久化连接配置
-- 使用系统钥匙串保存 SSH 密码、私钥和私钥口令
-- 对 agent 暴露 4 个 MCP 工具
-- 一键复制 MCP JSON 配置
-- 独立审批应用处理高危 SSH 操作
+## 架构
 
-## 没有软件账号登录
+项目由三个组件构成：
 
-这个软件没有自己的登录系统，也没有“平台账号密码”。
+| 组件 | 产物 | 职责 |
+|------|------|------|
+| MCP 核心库 | `xiic-ssh-mcp` | STDIO MCP 服务器，SSH 会话管理，白名单检查，审批调度 |
+| 桌面管理应用 | `xiic-ssh-manager-desktop` | 可视化管理连接、查看日志、配置 MCP、系统设置 |
+| 审批应用 | `xiic-ssh-approval` | 弹窗审批高危 SSH 操作 |
 
-界面里的这些字段：
-
-- `SSH target`
-- `SSH password`
-- `SSH private key`
-- `passphrase`
-
-都指向远程服务器的 SSH 凭据，不是这个软件的登录密码。
-
-例如你平时在终端里这样连接服务器：
-
-```bash
-ssh root@192.168.1.20
-```
-
-那在软件里：
-
-- `username` 填 `root`
-- `host` 填 `192.168.1.20`
-- `SSH password` 填这台远程机器上 `root` 用户的 SSH 登录密码
-
-如果 macOS 弹出系统密码窗口，那也不是软件账号登录，而是系统钥匙串 `Keychain` 在请求授权，用于保存或读取 SSH 密码、SSH 私钥等敏感信息。
-
-## SSH Target 填写方式
-
-你可以直接在 `SSH target` 输入常见 SSH 地址格式：
-
-```text
-ssh://root@192.168.1.20:22
-root@192.168.1.20:22
-root@192.168.1.20
-192.168.1.20
-```
-
-点击 `Parse` 后会自动填充：
-
-- `username`
-- `host`
-- `port`
-
-然后再单独填写认证信息：
-
-- `SSH password`，或
-- `SSH private key`
-
-密码和私钥不会从 URL 里自动提取，需要单独填写。
-
-## 连接管理
-
-每个 SSH 连接配置包含：
-
-- `instance_id`：给 agent 使用的连接标识
-- `name`：界面展示名称
-- `host` / `port`：远程服务器地址和端口
-- `username`：远程服务器 SSH 用户名
-- `auth_kind`：密码或私钥认证
-- `host_key_check`：是否检查主机密钥
-- `notes`：备注
-
-保存前可以点击测试连接。测试连接会使用当前表单内容发起一次真实 SSH 认证，并返回成功或失败原因。
-
-## 本地数据保存
-
-连接数据分两类保存：
-
-- 非敏感信息保存在本地 SQLite
-- 敏感信息保存在系统钥匙串
-
-敏感信息包括：
-
-- SSH 密码
-- SSH 私钥
-- 私钥口令
-
-这些数据只保存在本机，不需要上传到任何平台账号。
-
-## 审批工作方式
-
-高危 SSH 操作不会在主界面里弹一层网页风 overlay，也不会强行把主窗口带到前台。
-
-这一版改成了独立审批进程：
-
-- `xiic-ssh-manager-desktop`：管理连接、查看日志、复制 MCP 配置
-- `xiic-ssh-approval`：只负责接收审批请求、弹出审批小窗、允许或拒绝
-- `xiic-ssh-mcp`：给 agent 提供 MCP stdio 服务
-
-执行链路是：
-
-1. agent 通过 `xiic-ssh-mcp` 调用 SSH 工具
-2. 命中需要审批的高危操作
-3. helper 优先连接本地审批通道
-4. 如果审批应用未启动，helper 自动拉起 `xiic-ssh-approval`
-5. 用户在独立审批窗里点击允许或拒绝
-6. helper 再继续执行或拒绝这次工具调用
-
-如果当前环境没有可用的独立审批 UI，helper 会回退到系统原生确认窗，不会再弹一个空白的大白窗。
+前端共享 `web/` 目录，通过 `index.html` 和 `approval.html` 分别加载管理界面和审批界面。
 
 ## MCP 工具
 
-软件对 agent 暴露 4 个 MCP 工具：
+| 工具 | 说明 |
+|------|------|
+| `list_servers` | 列出所有已配置的 SSH 连接 |
+| `create_session` | 建立新的 SSH 会话 |
+| `execute_command` | 在会话中执行远程命令 |
+| `upload_file` | 通过 SFTP 上传文件 |
+| `download_file` | 通过 SFTP 下载文件 |
 
-- `create_session`：根据 `instance_id` 创建 SSH 会话
-- `execute_command`：在远程服务器执行命令
-- `upload_file`：上传文件内容到远程服务器
-- `download_file`：从远程服务器下载文件内容
+## 安全机制
 
-典型调用流程：
+### 白名单
 
-1. agent 调用 `create_session` 创建会话
-2. 返回 `session_id`
-3. agent 使用 `session_id` 执行命令、上传文件或下载文件
+白名单按四个维度匹配操作：**工具名**、**命令**、**路径**、**实例**。支持 glob 模式。
 
-`session_id` 只在当前 MCP 进程内有效。应用或 MCP 进程重启后，需要重新创建会话。
+- 所有维度都被 Allow 规则覆盖 → 直接放行
+- 命中 Deny 规则 → 直接拒绝
+- 部分维度未覆盖 → 进入审批流程
 
-## MCP 配置
+### 审批
 
-桌面界面会生成可直接复制的 MCP JSON 配置。复制后粘贴到支持 MCP 的客户端配置里即可使用。
+当操作未被白名单放行时，进入审批流程。支持两种审批方式：
 
-当前本地 helper 使用 `stdio` 方式启动 MCP server，配置形态类似：
+- **Elicitation 模式**：通过 MCP 协议让 AI 客户端自身弹出审批（客户端需支持 elicitation 能力）
+- **Local 模式**：弹出独立的审批窗口（Tauri 应用），或使用系统原生弹窗
+
+审批模式由 `--approval-mode` 参数控制：
+- `auto`（默认）：客户端支持 elicitation 则用 elicitation，否则用 local
+- `elicitation`：强制 elicitation
+- `local`：强制本地审批
+
+设置中的「使用系统弹窗进行审核」开关可让 local 模式直接调用系统原生对话框（macOS AppleScript / Windows PowerShell / Linux zenity），跳过审批 App。
+
+### 凭据存储
+
+SSH 密码和私钥通过操作系统 Keychain 安全存储，私钥仅驻留内存、不落盘。
+
+## 安装
+
+### 从源码构建
+
+```bash
+./install.sh
+```
+
+需要 `cargo` 和 `npm`。构建完成后三个二进制安装到 `~/.local/bin/`：
+
+```
+~/.local/bin/xiic-ssh-manager-desktop
+~/.local/bin/xiic-ssh-approval
+~/.local/bin/xiic-ssh-mcp
+```
+
+可选参数：
+
+```bash
+./install.sh --root /usr/local    # 指定安装目录
+./install.sh --debug              # 构建 debug 版本
+```
+
+### 从 GitHub Releases 安装
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh | bash -s -- --repo <owner>/<repo>
+```
+
+## 配置 AI 客户端
+
+1. 启动桌面管理应用 `xiic-ssh-manager-desktop`
+2. 添加 SSH 连接
+3. 在应用内复制 MCP JSON 配置
+4. 粘贴到 AI 客户端的 MCP 服务器配置中
+
+配置示例：
 
 ```json
 {
   "mcpServers": {
     "xiic-ssh": {
-      "command": "/Users/you/.local/bin/xiic-ssh-mcp",
+      "command": "/path/to/xiic-ssh-mcp",
       "args": [
-        "--db-path",
-        "/Users/you/Library/Application Support/com.xiic.sshmanager/instances.sqlite3",
-        "--keyring-service",
-        "com.xiic.ssh-manager",
-        "--notify-socket",
-        "/Users/you/Library/Application Support/com.xiic.sshmanager/notify.sock",
-        "--approval-mode",
-        "auto",
-        "--approval-endpoint",
-        "/Users/you/Library/Application Support/com.xiic.sshmanager/approval.sock"
+        "--db-path", "~/Library/Application Support/com.xiic.sshmanager/instances.sqlite3",
+        "--keyring-service", "com.xiic.ssh-manager",
+        "--notify-socket", "~/Library/Application Support/com.xiic.sshmanager/notify.sock",
+        "--approval-mode", "auto",
+        "--approval-endpoint", "~/Library/Application Support/com.xiic.sshmanager/approval.sock"
       ],
       "env": {
-        "HOME": "/Users/you",
         "SSH_ASKPASS_REQUIRE": "never"
       }
     }
@@ -165,137 +114,44 @@ root@192.168.1.20
 }
 ```
 
-请优先使用界面里复制出来的配置，因为里面会包含当前机器上的实际路径。
+## 命令行参数
 
-配置里的 `--approval-endpoint` 由桌面应用自动生成，用来让 helper 和独立审批应用通信。这个字段不需要手动改。
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--db-path <path>` | SQLite 数据库路径 | 必选 |
+| `--keyring-service <name>` | Keychain 服务名 | `com.xiic.ssh-manager` |
+| `--notify-socket <path>` | 日志通知 IPC 端点 | 无 |
+| `--whitelist <strict\|off>` | 白名单模式 | `strict` |
+| `--approval-mode <auto\|elicitation\|local>` | 审批模式 | `auto` |
+| `--approval-endpoint <path>` | 审批 IPC 端点 | 无 |
 
-## 工具参数示例
-
-### create_session
-
-```json
-{
-  "instance_id": "prod-server"
-}
-```
-
-### execute_command
-
-```json
-{
-  "session_id": "uuid",
-  "command": "uname -a",
-  "timeout_secs": 30
-}
-```
-
-### upload_file
-
-```json
-{
-  "session_id": "uuid",
-  "remote_path": "/tmp/demo.txt",
-  "content": "hello world",
-  "encoding": "utf8",
-  "overwrite": true
-}
-```
-
-### download_file
-
-```json
-{
-  "session_id": "uuid",
-  "remote_path": "/tmp/demo.txt",
-  "encoding": "utf8"
-}
-```
-
-上传和下载支持：
-
-- `utf8`
-- `base64`
-
-## 安装与运行
-
-### 本地开发
-
-安装依赖：
+## 开发
 
 ```bash
+# 安装前端依赖
 npm install
-```
 
-启动桌面开发模式：
+# 启动 Vite 开发服务器
+npx vite --port 1430
 
-```bash
-npm run tauri:dev
-```
+# 构建 MCP 核心库
+cargo build
 
-启动独立审批开发模式：
+# 构建桌面管理应用
+cargo build --manifest-path src-tauri/Cargo.toml
 
-```bash
-npm run approval:dev
-```
+# 构建审批应用
+cargo build --manifest-path approval-tauri/Cargo.toml
 
-如果你只启动了主界面开发模式，没有构建或启动审批应用，helper 在开发态会直接回退系统原生审批窗，避免再出现白屏审批窗口。
-
-构建前端：
-
-```bash
-npm run build
-```
-
-检查 Rust 代码：
-
-```bash
-cargo check
-cargo check --manifest-path src-tauri/Cargo.toml
-cargo check --manifest-path approval-tauri/Cargo.toml
-```
-
-### 本地安装
-
-```bash
-./install.sh
-```
-
-默认安装到：
-
-```text
-~/.local/bin/xiic-ssh-manager-desktop
-~/.local/bin/xiic-ssh-approval
-~/.local/bin/xiic-ssh-mcp
-```
-
-启动桌面应用：
-
-```bash
-~/.local/bin/xiic-ssh-manager-desktop
-```
-
-审批应用通常不需要手动启动。发生高危操作审批时，helper 会自动拉起：
-
-```bash
-~/.local/bin/xiic-ssh-approval
+# 构建 + 启动桌面管理应用（开发模式）
+cargo build --manifest-path src-tauri/Cargo.toml && ./src-tauri/target/debug/xiic-ssh-manager-desktop
 ```
 
 ## 技术栈
 
-- 桌面应用：`Tauri v2`
-- 前端：`React`、`TypeScript`、`Vite`
-- 核心逻辑：`Rust`
-- SSH / SFTP：`ssh2`
-- 本地数据库：`SQLite`
-- 凭据存储：系统钥匙串 `keyring`
-- MCP helper：`stdio`
-
-## 当前限制
-
-- 不提供终端模拟器
-- 不支持交互式 shell
-- 不支持端口转发
-- 不支持目录级同步
-- 不支持自动重连
-- 不提供多人共享配置中心
-- 开发态下如果独立审批前端未就绪，会回退系统原生审批窗
+- **Rust** — 后端核心，SSH 会话管理，MCP 协议实现
+- **Tauri** — 桌面应用框架（管理应用 + 审批应用）
+- **React + TypeScript** — 前端界面
+- **SQLite** — 连接配置、白名单规则、操作日志持久化
+- **ssh2** — SSH/SFTP 协议实现（vendored-openssl）
+- **keyring** — 操作系统 Keychain 凭据存储
