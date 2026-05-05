@@ -102,7 +102,7 @@ export default function ApprovalApp() {
           <div className="approval-panel-header">
             <div className="approval-dot" aria-hidden="true" />
             <div>
-              <h1>Xiic SSH 审批</h1>
+              <h1>操作审批</h1>
               <p>{pendingApprovalCount > 0 ? `后面还有 ${pendingApprovalCount} 个待审批请求` : "请确认是否执行此操作"}</p>
             </div>
           </div>
@@ -140,7 +140,7 @@ export default function ApprovalApp() {
       ) : (
         <div className="approval-idle-shell">
           <div className="approval-idle-card">
-            <strong>Xiic SSH 审批</strong>
+            <strong>操作审批</strong>
             <span>{status}</span>
           </div>
         </div>
