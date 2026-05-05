@@ -51,14 +51,21 @@ jobs:
       - name: Install frontend dependencies
         run: npm install
 
+      - name: Build frontend
+        run: npm run build
+
       - name: Build Tauri App
-        uses: tauri-apps/tauri-action@v0
+        run: npm run tauri:build -- ${{ matrix.args }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Release ${{ github.ref_name }}'
-          releaseBody: 'See the assets to download and install this version.'
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.args }}
+          name: bundle-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            src-tauri/target/release/bundle/**/*.msi
+            src-tauri/target/release/bundle/**/*.exe
+            src-tauri/target/release/bundle/**/*.dmg
+            src-tauri/target/release/bundle/**/*.deb
+            src-tauri/target/release/bundle/**/*.AppImage
