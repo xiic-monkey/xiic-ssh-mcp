@@ -1028,3 +1028,66 @@ pre {
     width: 100%;
   }
 }
+
+/* === 设置反馈与按钮动画 === */
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(143, 73, 61, 0.25);
+  border-top-color: #8f493d;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+.feedback-icon {
+  font-size: 0.85rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.feedback-icon.success {
+  color: #24603a;
+}
+
+.feedback-icon.error {
+  color: #9e4538;
+}
+
+.danger-button.feedback-success {
+  background: #e3f5e6;
+  border-color: #9dcfae;
+  color: #24603a;
+}
+
+.danger-button.feedback-error {
+  background: #fde6df;
+  border-color: #e8b6a6;
+  color: #9e4538;
+}
+
+.settings-feedback {
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-radius: 5px;
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.settings-feedback.success {
+  background: #e3f5e6;
+  border: 1px solid #9dcfae;
+  color: #24603a;
+}
+
+.settings-feedback.error {
+  background: #fde6df;
+  border: 1px solid #e8b6a6;
+  color: #9e4538;
+}

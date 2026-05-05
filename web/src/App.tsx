@@ -856,6 +856,7 @@ function SettingsPanel({
   appSettings,
   saving,
   restartingMcp,
+  restartResult,
   onToggleSystemApproval,
   onRestartMcp,
   onClose,
@@ -863,10 +864,33 @@ function SettingsPanel({
   appSettings: AppSettings | null;
   saving: boolean;
   restartingMcp: boolean;
+  restartResult: { kind: "success" | "error"; message: string } | null;
   onToggleSystemApproval: (useSystem: boolean) => void;
   onRestartMcp: () => Promise<void>;
   onClose: () => void;
 }) {
+  function restartButtonContent() {
+    if (restartingMcp) {
+      return (
+        <>
+          <span className="spinner" />
+          重启中...
+        </>
+      );
+    }
+    if (restartResult) {
+      return (
+        <>
+          <span className={restartResult.kind === "success" ? "feedback-icon success" : "feedback-icon error"}>
+            {restartResult.kind === "success" ? "✓" : "✗"}
+          </span>
+          {restartResult.kind === "success" ? "已重启" : "失败"}
+        </>
+      );
+    }
+    return "重启服务器";
+  }
+
   return (
     <section className="panel-main">
       <div className="panel-header">
@@ -913,15 +937,21 @@ function SettingsPanel({
               <p>结束当前 MCP 进程并清理残留文件，IDE 将在几秒后自动重连。正在进行的操作将被中断。</p>
             </div>
             <button
-              className="danger-button"
+              className={"danger-button" + (restartResult?.kind === "success" ? " feedback-success" : "") + (restartResult?.kind === "error" ? " feedback-error" : "")}
               disabled={restartingMcp}
               onClick={onRestartMcp}
-              style={{ flexShrink: 0 }}
+              style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", gap: "6px" }}
               type="button"
             >
-              {restartingMcp ? "重启中..." : "重启服务器"}
+              {restartButtonContent()}
             </button>
           </div>
+
+          {restartResult ? (
+            <div className={"settings-feedback " + restartResult.kind}>
+              {restartResult.message}
+            </div>
+          ) : null}
         </div>
       </div>
     </section>
