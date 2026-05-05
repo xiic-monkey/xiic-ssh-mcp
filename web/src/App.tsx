@@ -339,15 +339,12 @@ export default function App() {
   }
 
   async function handleRestartMcp() {
-    const confirmed = window.confirm(
-      "确定要重启 MCP 服务器吗？\n\n任何正在进行的 SSH 操作将被中断，IDE 将在几秒后自动重新连接。"
-    );
-    if (!confirmed) return;
-
     setRestartingMcp(true);
     setRestartResult(null);
+    // 确保 loading 状态至少显示 1 秒，让用户能看见转圈
+    const minDelay = new Promise<void>((resolve) => setTimeout(resolve, 1000));
     try {
-      const msg = await invoke<string>("restart_mcp");
+      const [msg] = await Promise.all([invoke<string>("restart_mcp"), minDelay]);
       setRestartResult({ kind: "success", message: msg });
       setStatus(msg);
       setStatusTone("success");

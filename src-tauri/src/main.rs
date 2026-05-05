@@ -107,31 +107,34 @@ fn restart_mcp() -> Result<String, String> {
     Ok("MCP 服务器已重启，IDE 将在几秒后自动重新连接。".to_string())
 }
 
-/// 杀死所有 `xiic-ssh-mcp` 进程（排除当前进程）。
+/// 杀死所有 MCP 子进程（xiic-ssh-mcp 和 xiic-ssh-approval），排除当前 Tauri 进程。
+/// 使用 `pgrep -x` 匹配进程名（精确），避免误杀 Vite 等非目标进程。
 #[cfg(unix)]
 fn kill_mcp_processes() {
     let current_pid = std::process::id();
-    let output = match std::process::Command::new("pgrep")
-        .args(["-f", "xiic-ssh-mcp"])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return,
-    };
-    if !output.status.success() {
-        return;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let pid: u32 = match line.trim().parse() {
-            Ok(p) => p,
+    for name in &["xiic-ssh-mcp", "xiic-ssh-approval"] {
+        let output = match std::process::Command::new("pgrep")
+            .args(["-x", name])
+            .output()
+        {
+            Ok(o) => o,
             Err(_) => continue,
         };
-        if pid != current_pid {
-            let _ = std::process::Command::new("kill")
-                .args([&pid.to_string()])
-                .status();
-            eprintln!("[xiic-ssh] 已杀掉 MCP 进程 (pid={pid})");
+        if !output.status.success() {
+            continue;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let pid: u32 = match line.trim().parse() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if pid != current_pid {
+                let _ = std::process::Command::new("kill")
+                    .args([&pid.to_string()])
+                    .status();
+                eprintln!("[xiic-ssh] 已杀掉 MCP 进程 {name} (pid={pid})");
+            }
         }
     }
 }
