@@ -112,11 +112,38 @@ jobs:
           echo "Normalized bundle directory contents:"
           find "$DEST_DIR" -maxdepth 3 -type f | sort
 
-      - name: Upload build artifacts
+      - name: Collect distributable files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_DIR="src-tauri/target/release/bundle"
+          DIST_DIR="src-tauri/target/release/dist"
+
+          rm -rf "$DIST_DIR"
+          mkdir -p "$DIST_DIR"
+
+          find "$SOURCE_DIR" -type f \( \
+            -name "*.dmg" -o \
+            -name "*.AppImage" -o \
+            -name "*.deb" -o \
+            -name "*.msi" -o \
+            -name "*setup.exe" \
+          \) -exec cp {} "$DIST_DIR"/ \;
+
+          if [ -z "$(find "$DIST_DIR" -maxdepth 1 -type f -print -quit)" ]; then
+            echo "No distributable files were collected from $SOURCE_DIR" >&2
+            exit 1
+          fi
+
+          echo "Collected distributable files:"
+          find "$DIST_DIR" -maxdepth 1 -type f | sort
+
+      - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: bundle-${{ matrix.artifact_name }}
-          path: src-tauri/target/release/bundle
+          name: release-${{ matrix.artifact_name }}
+          path: src-tauri/target/release/dist
           if-no-files-found: error
 
   publish:
@@ -132,14 +159,20 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: release-assets
-          pattern: bundle-*
+          pattern: release-*
           merge-multiple: true
 
       - name: Collect release files
         id: collect_files
         shell: bash
         run: |
-          find release-assets -type f | sort > release-files.txt
+          find release-assets -type f \( \
+            -name "*.dmg" -o \
+            -name "*.AppImage" -o \
+            -name "*.deb" -o \
+            -name "*.msi" -o \
+            -name "*setup.exe" \
+          \) | sort > release-files.txt
           if [ ! -s release-files.txt ]; then
             echo "No release files were downloaded." >&2
             exit 1
