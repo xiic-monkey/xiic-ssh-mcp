@@ -84,7 +84,7 @@ jobs:
 
       - name: Build Tauri app (Windows)
         if: matrix.runner == 'windows-latest'
-        run: npm run tauri:build -- --bundles msi,nsis
+        run: npm run tauri:build -- --bundles nsis
 
       - name: Normalize bundle output path
         shell: bash
@@ -127,7 +127,6 @@ jobs:
             -name "*.dmg" -o \
             -name "*.AppImage" -o \
             -name "*.deb" -o \
-            -name "*.msi" -o \
             -name "*setup.exe" \
           \) -exec cp {} "$DIST_DIR"/ \;
 
@@ -170,7 +169,6 @@ jobs:
             -name "*.dmg" -o \
             -name "*.AppImage" -o \
             -name "*.deb" -o \
-            -name "*.msi" -o \
             -name "*setup.exe" \
           \) | sort > release-files.txt
           if [ ! -s release-files.txt ]; then
