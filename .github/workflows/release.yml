@@ -6,28 +6,42 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    permissions:
-      contents: write
+    name: Build (${{ matrix.platform_label }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: 'macos-latest'
-            args: '--target aarch64-apple-darwin'
-            arch: 'aarch64'
-          - platform: 'macos-latest'
-            args: '--target x86_64-apple-darwin'
-            arch: 'x86_64'
-          - platform: 'ubuntu-22.04'
-            args: ''
-            arch: 'x86_64'
-          - platform: 'windows-latest'
-            args: ''
-            arch: 'x86_64'
+          - platform_label: macOS Apple Silicon
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            bundle_dir: aarch64-apple-darwin/release
+            artifact_name: macos-aarch64
+            rust_targets: aarch64-apple-darwin
+          - platform_label: macOS Intel
+            runner: macos-latest
+            target: x86_64-apple-darwin
+            bundle_dir: x86_64-apple-darwin/release
+            artifact_name: macos-x86_64
+            rust_targets: x86_64-apple-darwin
+          - platform_label: Ubuntu
+            runner: ubuntu-22.04
+            target: ''
+            bundle_dir: release
+            artifact_name: linux-x86_64
+            rust_targets: ''
+          - platform_label: Windows
+            runner: windows-latest
+            target: ''
+            bundle_dir: release
+            artifact_name: windows-x86_64
+            rust_targets: ''
 
-    runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v6
 
@@ -35,38 +49,88 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: lts/*
-          cache: 'npm'
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Add Rust target
+        if: matrix.rust_targets != ''
+        run: rustup target add ${{ matrix.rust_targets }}
 
       - name: Setup Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.platform }}-${{ matrix.arch }}
+          key: ${{ matrix.runner }}-${{ matrix.artifact_name }}
 
       - name: Install dependencies (Ubuntu)
-        if: matrix.platform == 'ubuntu-22.04'
+        if: matrix.runner == 'ubuntu-22.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
       - name: Generate Windows icon
-        if: matrix.platform == 'windows-latest'
+        if: matrix.runner == 'windows-latest'
         run: |
           pip install pillow
           python -c "from PIL import Image; img = Image.open('src-tauri/icons/icon.png'); img.save('src-tauri/icons/icon.ico', format='ICO', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
 
-      - name: Build and publish
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build Tauri app (default target)
+        if: matrix.target == ''
+        run: npm run tauri:build
+
+      - name: Build Tauri app (${{ matrix.target }})
+        if: matrix.target != ''
+        run: npm run tauri:build -- --target ${{ matrix.target }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
         with:
-          tagName: v__VERSION__
-          releaseName: 'v__VERSION__'
-          releaseBody: 'See the assets to download and install this version.'
-          releaseDraft: false
+          name: bundle-${{ matrix.artifact_name }}
+          path: src-tauri/target/${{ matrix.bundle_dir }}/bundle
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download bundled artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: bundle-*
+          merge-multiple: true
+
+      - name: Collect release files
+        id: collect_files
+        shell: bash
+        run: |
+          find release-assets -type f | sort > release-files.txt
+          if [ ! -s release-files.txt ]; then
+            echo "No release files were downloaded." >&2
+            exit 1
+          fi
+          {
+            echo 'files<<EOF'
+            cat release-files.txt
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: See the assets to download and install this version.
+          draft: false
           prerelease: false
-          args: ${{ matrix.args }}
+          fail_on_unmatched_files: true
+          files: ${{ steps.collect_files.outputs.files }}
