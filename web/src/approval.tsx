@@ -6,6 +6,7 @@ type ApprovalOperationMetadata = {
   tool_name: string;
   command: string | null;
   remote_path: string | null;
+  local_path: string | null;
   instance_id: string | null;
 };
 
@@ -113,8 +114,11 @@ export default function ApprovalApp() {
             {activeApproval.metadata.command ? (
               <ApprovalCommandField value={activeApproval.metadata.command} />
             ) : null}
+            {activeApproval.metadata.local_path ? (
+              <ApprovalField label="本地路径" value={activeApproval.metadata.local_path} mono />
+            ) : null}
             {activeApproval.metadata.remote_path ? (
-              <ApprovalField label="路径" value={activeApproval.metadata.remote_path} mono />
+              <ApprovalField label="远端路径" value={activeApproval.metadata.remote_path} mono />
             ) : null}
           </div>
 

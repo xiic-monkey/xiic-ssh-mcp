@@ -112,14 +112,16 @@ pub fn approval_message(metadata: &ApprovalOperationMetadata) -> String {
             metadata.command.as_deref().unwrap_or("-"),
         ),
         "upload_file" => format!(
-            "是否允许上传文件到连接 '{}'？\n\n{}",
+            "是否允许上传本地文件到连接 '{}'？\n\n本地：{}\n远端：{}",
             metadata.instance_id.as_deref().unwrap_or("-"),
+            metadata.local_path.as_deref().unwrap_or("-"),
             metadata.remote_path.as_deref().unwrap_or("-"),
         ),
         "download_file" => format!(
-            "是否允许从连接 '{}' 下载文件？\n\n{}",
+            "是否允许从连接 '{}' 下载文件？\n\n远端：{}\n本地：{}",
             metadata.instance_id.as_deref().unwrap_or("-"),
             metadata.remote_path.as_deref().unwrap_or("-"),
+            metadata.local_path.as_deref().unwrap_or("默认 Downloads 目录"),
         ),
         _ => format!("是否允许执行 SSH 操作 '{}'？", metadata.tool_name),
     }
@@ -435,6 +437,7 @@ mod tests {
             tool_name: "execute_command".into(),
             command: Some("rm -rf /tmp/demo".into()),
             remote_path: None,
+            local_path: None,
             instance_id: Some("dev".into()),
         };
 
@@ -493,6 +496,7 @@ mod tests {
                 tool_name: "execute_command".into(),
                 command: Some("echo hello".into()),
                 remote_path: None,
+                local_path: None,
                 instance_id: Some("dev".into()),
             },
         }

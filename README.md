@@ -25,8 +25,20 @@ Xiic SSH MCP 是一个本地 MCP 服务器，为 Cursor、Claude Desktop 等 AI 
 | `list_servers` | 列出所有已配置的 SSH 连接 |
 | `create_session` | 建立新的 SSH 会话 |
 | `execute_command` | 在会话中执行远程命令 |
-| `upload_file` | 通过 SFTP 上传文件 |
-| `download_file` | 通过 SFTP 下载文件 |
+| `upload_file` | 通过 SFTP 将本地文件上传到远端路径 |
+| `download_file` | 通过 SFTP 将远端文件下载到本地路径 |
+
+文件传输工具的参数语义如下：
+
+- `upload_file`
+  - `session_id`: SSH 会话 ID
+  - `local_path`: 本地文件路径
+  - `remote_path`: 远端目标路径
+  - `overwrite`: 是否覆盖已有远端文件，默认 `true`
+- `download_file`
+  - `session_id`: SSH 会话 ID
+  - `remote_path`: 远端文件路径
+  - `local_path`: 可选，本地保存路径；不传时默认保存到 `~/Downloads/<文件名>`
 
 ## 安全机制
 

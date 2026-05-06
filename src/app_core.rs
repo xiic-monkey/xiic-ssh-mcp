@@ -2,13 +2,11 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::Utc;
 use ssh2::{CheckResult, KnownHostFileKind, Session};
 use uuid::Uuid;
@@ -16,10 +14,10 @@ use uuid::Uuid;
 use crate::credentials::SecretStore;
 use crate::local_ipc::send_notification;
 use crate::models::{
-    AuthKind, CreateSessionResult, DownloadEncoding, DownloadFileArgs, DownloadFileResult,
-    ExecuteCommandArgs, ExecuteCommandResult, InstanceDraft, InstanceSummary, ListServersResult,
-    McpConfigBundle, OperationLogEntry, RuleAction, RuleType, SecretPayload, StoredInstance,
-    TestConnectionResult, UploadEncoding, UploadFileArgs, UploadFileResult, WhitelistRule,
+    AuthKind, CreateSessionResult, DownloadFileArgs, DownloadFileResult, ExecuteCommandArgs,
+    ExecuteCommandResult, InstanceDraft, InstanceSummary, ListServersResult, McpConfigBundle,
+    OperationLogEntry, RuleAction, RuleType, SecretPayload, StoredInstance, TestConnectionResult,
+    UploadFileArgs, UploadFileResult, WhitelistRule,
 };
 use crate::storage::InstanceStore;
 use crate::whitelist::WhitelistChecker;
@@ -341,12 +339,9 @@ impl DesktopCore {
     }
 
     pub fn upload_file(&self, args: UploadFileArgs) -> Result<UploadFileResult> {
-        let bytes = match args.encoding {
-            UploadEncoding::Utf8 => args.content.into_bytes(),
-            UploadEncoding::Base64 => BASE64
-                .decode(args.content)
-                .context("failed to decode upload content as base64")?,
-        };
+        let local_path = args.local_path.clone();
+        let bytes = std::fs::read(&local_path)
+            .with_context(|| format!("failed to read local path '{}'", local_path))?;
 
         let (instance_id, session_id, remote_path, bytes_written) = {
             let mut sessions = self
@@ -393,7 +388,8 @@ impl DesktopCore {
 
         let details = serde_json::json!({
             "instance_name": instance_name,
-            "remote_path": remote_path,
+            "local_path": local_path.clone(),
+            "remote_path": remote_path.clone(),
             "bytes_written": bytes_written,
         });
         self.store.insert_log(
@@ -404,10 +400,18 @@ impl DesktopCore {
         )?;
         self.notify_ui();
 
-        Ok(UploadFileResult { bytes_written })
+        Ok(UploadFileResult {
+            local_path,
+            remote_path,
+            bytes_written,
+        })
     }
 
     pub fn download_file(&self, args: DownloadFileArgs) -> Result<DownloadFileResult> {
+        let resolved_local_path = resolve_download_path(
+            &args.remote_path,
+            args.local_path.as_deref(),
+        )?;
         let (instance_id, session_id, remote_path, result) = {
             let mut sessions = self
                 .sessions
@@ -431,24 +435,26 @@ impl DesktopCore {
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes)
                 .with_context(|| format!("failed to read remote path '{}'", args.remote_path))?;
-
-            let (content, encoding) = match args.encoding {
-                DownloadEncoding::Utf8 => (
-                    String::from_utf8(bytes.clone())
-                        .context("remote file is not valid UTF-8; use base64 encoding instead")?,
-                    "utf8".to_string(),
-                ),
-                DownloadEncoding::Base64 => (BASE64.encode(bytes.clone()), "base64".to_string()),
-            };
+            if let Some(parent) = resolved_local_path.parent() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "failed to create parent directory for '{}'",
+                        resolved_local_path.display()
+                    )
+                })?;
+            }
+            std::fs::write(&resolved_local_path, &bytes).with_context(|| {
+                format!("failed to write local path '{}'", resolved_local_path.display())
+            })?;
 
             (
                 instance_id,
                 args.session_id.clone(),
                 args.remote_path.clone(),
                 DownloadFileResult {
-                    content,
+                    local_path: resolved_local_path.display().to_string(),
+                    remote_path: args.remote_path.clone(),
                     size: bytes.len(),
-                    encoding,
                 },
             )
         };
@@ -461,9 +467,9 @@ impl DesktopCore {
 
         let details = serde_json::json!({
             "instance_name": instance_name,
+            "local_path": result.local_path.clone(),
             "remote_path": remote_path,
             "size": result.size,
-            "encoding": result.encoding,
         });
         self.store.insert_log(
             &session_id,
@@ -602,6 +608,19 @@ impl DesktopCore {
 
         Ok(resolved)
     }
+}
+
+fn resolve_download_path(remote_path: &str, requested_local_path: Option<&str>) -> Result<PathBuf> {
+    if let Some(local_path) = requested_local_path {
+        return Ok(PathBuf::from(local_path));
+    }
+
+    let file_name = Path::new(remote_path)
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow!("remote_path '{}' does not include a file name", remote_path))?;
+    let home = env::var("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join("Downloads").join(file_name))
 }
 
 fn connect(instance: &ResolvedInstance) -> Result<Session> {

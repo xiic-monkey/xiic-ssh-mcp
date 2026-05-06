@@ -1033,6 +1033,8 @@ function LogEntryBody({ entry, autoOpenStdout }: { entry: OperationLogEntry; aut
   if (entry.operation === "upload_file") {
     return (
       <div className="log-body">
+        <span className="log-path">{String(parsed.local_path ?? "")}</span>
+        <span>→</span>
         <span className="log-path">{String(parsed.remote_path ?? "")}</span>
         <span className="log-meta">{Number(parsed.bytes_written ?? 0)} bytes</span>
       </div>
@@ -1043,7 +1045,9 @@ function LogEntryBody({ entry, autoOpenStdout }: { entry: OperationLogEntry; aut
     return (
       <div className="log-body">
         <span className="log-path">{String(parsed.remote_path ?? "")}</span>
-        <span className="log-meta">{Number(parsed.size ?? 0)} bytes · {String(parsed.encoding ?? "")}</span>
+        <span>→</span>
+        <span className="log-path">{String(parsed.local_path ?? "")}</span>
+        <span className="log-meta">{Number(parsed.size ?? 0)} bytes</span>
       </div>
     );
   }

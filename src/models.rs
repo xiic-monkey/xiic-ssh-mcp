@@ -141,40 +141,16 @@ pub struct ExecuteCommandResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadFileResult {
+    pub local_path: String,
+    pub remote_path: String,
     pub bytes_written: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadFileResult {
-    pub content: String,
+    pub local_path: String,
+    pub remote_path: String,
     pub size: usize,
-    pub encoding: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UploadEncoding {
-    Utf8,
-    Base64,
-}
-
-impl Default for UploadEncoding {
-    fn default() -> Self {
-        Self::Utf8
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DownloadEncoding {
-    Utf8,
-    Base64,
-}
-
-impl Default for DownloadEncoding {
-    fn default() -> Self {
-        Self::Base64
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,10 +163,8 @@ pub struct ExecuteCommandArgs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadFileArgs {
     pub session_id: String,
+    pub local_path: String,
     pub remote_path: String,
-    pub content: String,
-    #[serde(default)]
-    pub encoding: UploadEncoding,
     #[serde(default = "default_overwrite")]
     pub overwrite: bool,
 }
@@ -200,7 +174,7 @@ pub struct DownloadFileArgs {
     pub session_id: String,
     pub remote_path: String,
     #[serde(default)]
-    pub encoding: DownloadEncoding,
+    pub local_path: Option<String>,
 }
 
 fn default_overwrite() -> bool {
@@ -276,6 +250,7 @@ pub struct OperationContext {
     pub tool_name: String,
     pub command: Option<String>,
     pub remote_path: Option<String>,
+    pub local_path: Option<String>,
     pub instance_id: Option<String>,
 }
 
@@ -319,6 +294,7 @@ pub struct ApprovalOperationMetadata {
     pub tool_name: String,
     pub command: Option<String>,
     pub remote_path: Option<String>,
+    pub local_path: Option<String>,
     pub instance_id: Option<String>,
 }
 
@@ -328,6 +304,7 @@ impl From<&OperationContext> for ApprovalOperationMetadata {
             tool_name: value.tool_name.clone(),
             command: value.command.clone(),
             remote_path: value.remote_path.clone(),
+            local_path: value.local_path.clone(),
             instance_id: value.instance_id.clone(),
         }
     }

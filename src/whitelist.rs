@@ -218,6 +218,7 @@ mod tests {
             tool_name: "execute_command".into(),
             command: Some("ls -la".into()),
             remote_path: None,
+            local_path: None,
             instance_id: Some("dev-server".into()),
         };
 
@@ -251,6 +252,7 @@ mod tests {
             tool_name: "execute_command".into(),
             command: Some("rm -rf /".into()),
             remote_path: None,
+            local_path: None,
             instance_id: Some("dev-server".into()),
         };
 
@@ -274,6 +276,7 @@ mod tests {
             tool_name: "execute_command".into(),
             command: Some("ls -la".into()),
             remote_path: None,
+            local_path: None,
             instance_id: Some("dev-server".into()),
         };
 

@@ -276,29 +276,28 @@ impl McpServer {
                 },
                 {
                     "name": "upload_file",
-                    "description": "Upload inline content to a remote file over SFTP.",
+                    "description": "Upload a local file to a remote path over SFTP.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "session_id": { "type": "string" },
+                            "local_path": { "type": "string" },
                             "remote_path": { "type": "string" },
-                            "content": { "type": "string" },
-                            "encoding": { "type": "string", "enum": ["utf8", "base64"] },
                             "overwrite": { "type": "boolean" }
                         },
-                        "required": ["session_id", "remote_path", "content"],
+                        "required": ["session_id", "local_path", "remote_path"],
                         "additionalProperties": false
                     }
                 },
                 {
                     "name": "download_file",
-                    "description": "Download a remote file over SFTP and return its contents.",
+                    "description": "Download a remote file over SFTP to a local path.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "session_id": { "type": "string" },
                             "remote_path": { "type": "string" },
-                            "encoding": { "type": "string", "enum": ["utf8", "base64"] }
+                            "local_path": { "type": "string" }
                         },
                         "required": ["session_id", "remote_path"],
                         "additionalProperties": false
@@ -430,6 +429,7 @@ impl McpServer {
                 tool_name: "list_servers".into(),
                 command: None,
                 remote_path: None,
+                local_path: None,
                 instance_id: None,
             }),
             "create_session" => {
@@ -442,6 +442,7 @@ impl McpServer {
                     tool_name: "create_session".into(),
                     command: None,
                     remote_path: None,
+                    local_path: None,
                     instance_id: Some(args.instance_id),
                 })
             }
@@ -452,6 +453,7 @@ impl McpServer {
                     tool_name: "execute_command".into(),
                     command: Some(args.command),
                     remote_path: None,
+                    local_path: None,
                     instance_id: Some(instance_id),
                 })
             }
@@ -462,6 +464,7 @@ impl McpServer {
                     tool_name: "upload_file".into(),
                     command: None,
                     remote_path: Some(args.remote_path),
+                    local_path: Some(args.local_path),
                     instance_id: Some(instance_id),
                 })
             }
@@ -472,6 +475,7 @@ impl McpServer {
                     tool_name: "download_file".into(),
                     command: None,
                     remote_path: Some(args.remote_path),
+                    local_path: args.local_path,
                     instance_id: Some(instance_id),
                 })
             }
