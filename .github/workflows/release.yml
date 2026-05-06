@@ -20,25 +20,21 @@ jobs:
           - platform_label: macOS Apple Silicon
             runner: macos-latest
             target: aarch64-apple-darwin
-            bundle_path: src-tauri/target/release/bundle
             artifact_name: macos-aarch64
             rust_targets: aarch64-apple-darwin
           - platform_label: macOS Intel
             runner: macos-latest
             target: x86_64-apple-darwin
-            bundle_path: src-tauri/target/release/bundle
             artifact_name: macos-x86_64
             rust_targets: x86_64-apple-darwin
           - platform_label: Ubuntu
             runner: ubuntu-22.04
             target: ''
-            bundle_path: src-tauri/target/release/bundle
             artifact_name: linux-x86_64
             rust_targets: ''
           - platform_label: Windows
             runner: windows-latest
             target: ''
-            bundle_path: src-tauri/target/release/bundle
             artifact_name: windows-x86_64
             rust_targets: ''
 
@@ -70,7 +66,7 @@ jobs:
         if: matrix.runner == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2
 
       - name: Generate Windows icon
         if: matrix.runner == 'windows-latest'
@@ -78,23 +74,49 @@ jobs:
           pip install pillow
           python -c "from PIL import Image; img = Image.open('src-tauri/icons/icon.png'); img.save('src-tauri/icons/icon.ico', format='ICO', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
 
-      - name: Build Tauri app (default target)
-        if: matrix.target == '' && matrix.runner != 'macos-latest'
-        run: npm run tauri:build
-
       - name: Build Tauri app (macOS ${{ matrix.target }})
         if: matrix.runner == 'macos-latest'
         run: npm run tauri:build -- --target ${{ matrix.target }} --bundles app,dmg
 
-      - name: Build Tauri app (${{ matrix.target }})
-        if: matrix.target != '' && matrix.runner != 'macos-latest'
-        run: npm run tauri:build -- --target ${{ matrix.target }}
+      - name: Build Tauri app (Linux)
+        if: matrix.runner == 'ubuntu-22.04'
+        run: npm run tauri:build -- --bundles deb,appimage
+
+      - name: Build Tauri app (Windows)
+        if: matrix.runner == 'windows-latest'
+        run: npm run tauri:build -- --bundles msi,nsis
+
+      - name: Normalize bundle output path
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_DIR="src-tauri/target/release/bundle"
+          if [ -n "${{ matrix.target }}" ]; then
+            SOURCE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          fi
+
+          DEST_DIR="src-tauri/target/release/bundle"
+
+          if [ ! -d "$SOURCE_DIR" ]; then
+            echo "Bundle output directory not found: $SOURCE_DIR" >&2
+            exit 1
+          fi
+
+          if [ "$SOURCE_DIR" != "$DEST_DIR" ]; then
+            rm -rf "$DEST_DIR"
+            mkdir -p "$DEST_DIR"
+            cp -R "$SOURCE_DIR"/. "$DEST_DIR"/
+          fi
+
+          echo "Normalized bundle directory contents:"
+          find "$DEST_DIR" -maxdepth 3 -type f | sort
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: bundle-${{ matrix.artifact_name }}
-          path: ${{ matrix.bundle_path }}
+          path: src-tauri/target/release/bundle
           if-no-files-found: error
 
   publish:
