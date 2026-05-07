@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tauri::{Emitter, Manager, State};
@@ -158,13 +158,16 @@ fn main() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(move |app| {
             let (core, db_path, notify_endpoint, approval_endpoint) = build_core()?;
-            let helper_path = resolve_stdio_helper_path(std::env::current_exe()?);
+            let current_exe = std::env::current_exe()?;
+            let helper_resolution = resolve_stdio_helper_path(app.handle(), &current_exe);
             let mcp_config = core.mcp_config_bundle(
-                &helper_path.to_string_lossy(),
+                &helper_resolution.path.to_string_lossy(),
                 &db_path.to_string_lossy(),
                 DEFAULT_KEYRING_SERVICE,
                 Some(&notify_endpoint),
                 Some(&approval_endpoint),
+                helper_resolution.found,
+                helper_resolution.warning,
             )?;
 
             start_notify_listener(app.handle().clone(), notify_endpoint);
@@ -321,19 +324,69 @@ async fn run_windows_notify_listener(
     }
 }
 
-fn resolve_stdio_helper_path(current_exe: PathBuf) -> PathBuf {
+struct HelperResolution {
+    path: PathBuf,
+    found: bool,
+    warning: Option<String>,
+}
+
+fn resolve_stdio_helper_path(app: &tauri::AppHandle, current_exe: &Path) -> HelperResolution {
     let helper_name = if cfg!(target_os = "windows") {
         "xiic-ssh-mcp.exe"
     } else {
         "xiic-ssh-mcp"
     };
 
+    if let Some(found) = find_helper_path(app, current_exe, helper_name) {
+        return HelperResolution {
+            path: found,
+            found: true,
+            warning: None,
+        };
+    }
+
+    HelperResolution {
+        path: current_exe.to_path_buf(),
+        found: false,
+        warning: Some(format!(
+            "未找到 MCP helper `{helper_name}`。当前展示的 command 是桌面主程序路径，仅用于提示发布包缺少 helper，不能直接作为 MCP server 配置使用。"
+        )),
+    }
+}
+
+fn find_helper_path(app: &tauri::AppHandle, current_exe: &Path, helper_name: &str) -> Option<PathBuf> {
     if let Some(parent) = current_exe.parent() {
         let sibling = parent.join(helper_name);
         if sibling.exists() {
-            return sibling;
+            ensure_executable(&sibling);
+            return Some(sibling);
         }
     }
 
-    current_exe
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let bundled = resource_dir.join("binaries").join(helper_name);
+        if bundled.exists() {
+            ensure_executable(&bundled);
+            return Some(bundled);
+        }
+    }
+
+    None
 }
+
+#[cfg(unix)]
+fn ensure_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Ok(metadata) = std::fs::metadata(path) {
+        let mut permissions = metadata.permissions();
+        let mode = permissions.mode();
+        if mode & 0o111 == 0 {
+            permissions.set_mode(mode | 0o755);
+            let _ = std::fs::set_permissions(path, permissions);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_executable(_path: &Path) {}

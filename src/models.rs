@@ -108,6 +108,8 @@ pub struct McpConfigBundle {
     pub command: String,
     pub args: Vec<String>,
     pub stdio_json: String,
+    pub helper_found: bool,
+    pub helper_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

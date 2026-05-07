@@ -831,6 +831,16 @@ pre {
   font-size: 0.8rem;
 }
 
+.config-warning {
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid #f0c36a;
+  background: #fff7e6;
+  color: #7a4b00;
+  line-height: 1.5;
+}
+
 .approval-backdrop {
   background: rgba(18, 25, 36, 0.26);
   z-index: 20;

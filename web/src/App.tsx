@@ -44,6 +44,8 @@ type McpConfigBundle = {
   command: string;
   args: string[];
   stdio_json: string;
+  helper_found: boolean;
+  helper_warning: string | null;
 };
 
 type OperationLogEntry = {
@@ -832,13 +834,18 @@ export default function App() {
                   </div>
                   <button
                     className="ghost-button utility-button"
-                    disabled={!configs}
-                    onClick={() => configs && copyConfig("STDIO", configs.stdio_json)}
+                    disabled={!configs || !configs.helper_found}
+                    onClick={() => configs && configs.helper_found && copyConfig("STDIO", configs.stdio_json)}
                     type="button"
                   >
                     复制 JSON
                   </button>
                 </div>
+                {!configs?.helper_found && configs?.helper_warning ? (
+                  <div className="config-warning" role="alert">
+                    {configs.helper_warning}
+                  </div>
+                ) : null}
                 <pre>{configs?.stdio_json ?? "正在加载..."}</pre>
               </article>
             </div>
