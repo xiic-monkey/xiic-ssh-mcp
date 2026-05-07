@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1430",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run bundle:prepare",
     "frontendDist": "../dist"
   },
   "app": {
@@ -41,6 +41,9 @@
       "icons/icon.ico",
       "icons/icon.icns"
     ],
+    "resources": {
+      "bundled-binaries/": "binaries/"
+    },
     "macOS": {
       "signingIdentity": "-"
     },

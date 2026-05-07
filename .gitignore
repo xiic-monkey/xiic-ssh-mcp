@@ -3,6 +3,8 @@
 /node_modules
 /src-tauri/target
 /src-tauri/gen
+/src-tauri/bundled-binaries/*
+!/src-tauri/bundled-binaries/.gitkeep
 /src-tauri/Cargo.lock
 /approval-tauri/target
 /approval-tauri/gen

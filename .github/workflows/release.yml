@@ -86,40 +86,28 @@ jobs:
         if: matrix.runner == 'windows-latest'
         run: npm run tauri:build -- --bundles nsis
 
-      - name: Normalize bundle output path
+      - name: Collect release artifacts
         shell: bash
         run: |
           set -euo pipefail
 
           SOURCE_DIR="src-tauri/target/release/bundle"
+          ROOT_TARGET_DIR="target/release"
+          APP_TARGET_DIR="src-tauri/target/release"
+          BUNDLED_BIN_DIR="src-tauri/bundled-binaries"
+
           if [ -n "${{ matrix.target }}" ]; then
             SOURCE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+            ROOT_TARGET_DIR="target/${{ matrix.target }}/release"
+            APP_TARGET_DIR="src-tauri/target/${{ matrix.target }}/release"
           fi
-
-          DEST_DIR="src-tauri/target/release/bundle"
 
           if [ ! -d "$SOURCE_DIR" ]; then
             echo "Bundle output directory not found: $SOURCE_DIR" >&2
             exit 1
           fi
 
-          if [ "$SOURCE_DIR" != "$DEST_DIR" ]; then
-            rm -rf "$DEST_DIR"
-            mkdir -p "$DEST_DIR"
-            cp -R "$SOURCE_DIR"/. "$DEST_DIR"/
-          fi
-
-          echo "Normalized bundle directory contents:"
-          find "$DEST_DIR" -maxdepth 3 -type f | sort
-
-      - name: Collect distributable files
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SOURCE_DIR="src-tauri/target/release/bundle"
-          DIST_DIR="src-tauri/target/release/dist"
-
+          DIST_DIR="release-dist"
           rm -rf "$DIST_DIR"
           mkdir -p "$DIST_DIR"
 
@@ -130,19 +118,37 @@ jobs:
             -name "*setup.exe" \
           \) -exec cp {} "$DIST_DIR"/ \;
 
+          PACKAGE_DIR="$(mktemp -d)"
+          trap 'rm -rf "$PACKAGE_DIR"' EXIT
+
+          if [ "${{ matrix.runner }}" = "windows-latest" ]; then
+            cp "$APP_TARGET_DIR/xiic-ssh-manager-desktop.exe" "$PACKAGE_DIR/"
+            cp "$BUNDLED_BIN_DIR/xiic-ssh-approval.exe" "$PACKAGE_DIR/"
+            cp "$BUNDLED_BIN_DIR/xiic-ssh-mcp.exe" "$PACKAGE_DIR/"
+            tar -czf "$DIST_DIR/xiic-ssh-manager-desktop-windows-x86_64.tar.gz" -C "$PACKAGE_DIR" .
+          else
+            cp "$APP_TARGET_DIR/xiic-ssh-manager-desktop" "$PACKAGE_DIR/"
+            cp "$BUNDLED_BIN_DIR/xiic-ssh-approval" "$PACKAGE_DIR/"
+            cp "$BUNDLED_BIN_DIR/xiic-ssh-mcp" "$PACKAGE_DIR/"
+            if [ "${{ matrix.runner }}" = "macos-latest" ]; then
+              tar -czf "$DIST_DIR/xiic-ssh-manager-desktop-${{ matrix.target }}.tar.gz" -C "$PACKAGE_DIR" .
+            else
+              tar -czf "$DIST_DIR/xiic-ssh-manager-desktop-x86_64-unknown-linux-gnu.tar.gz" -C "$PACKAGE_DIR" .
+            fi
+          fi
+
           if [ -z "$(find "$DIST_DIR" -maxdepth 1 -type f -print -quit)" ]; then
-            echo "No distributable files were collected from $SOURCE_DIR" >&2
+            echo "No release files were collected." >&2
             exit 1
           fi
 
-          echo "Collected distributable files:"
           find "$DIST_DIR" -maxdepth 1 -type f | sort
 
-      - name: Upload release artifacts
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.artifact_name }}
-          path: src-tauri/target/release/dist
+          name: bundle-${{ matrix.artifact_name }}
+          path: release-dist
           if-no-files-found: error
 
   publish:
@@ -158,19 +164,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: release-assets
-          pattern: release-*
+          pattern: bundle-*
           merge-multiple: true
 
       - name: Collect release files
         id: collect_files
         shell: bash
         run: |
-          find release-assets -type f \( \
-            -name "*.dmg" -o \
-            -name "*.AppImage" -o \
-            -name "*.deb" -o \
-            -name "*setup.exe" \
-          \) | sort > release-files.txt
+          find release-assets -type f | sort > release-files.txt
           if [ ! -s release-files.txt ]; then
             echo "No release files were downloaded." >&2
             exit 1

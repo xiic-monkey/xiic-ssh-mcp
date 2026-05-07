@@ -176,6 +176,8 @@ impl DesktopCore {
         keyring_service: &str,
         notify_endpoint: Option<&str>,
         approval_endpoint: Option<&str>,
+        helper_found: bool,
+        helper_warning: Option<String>,
     ) -> Result<McpConfigBundle> {
         let mut args = vec![
             "--db-path".to_string(),
@@ -211,6 +213,8 @@ impl DesktopCore {
             command: command_path.to_string(),
             args,
             stdio_json,
+            helper_found,
+            helper_warning,
         })
     }
 
