@@ -74,17 +74,23 @@ jobs:
           pip install pillow
           python -c "from PIL import Image; img = Image.open('src-tauri/icons/icon.png'); img.save('src-tauri/icons/icon.ico', format='ICO', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
 
-      - name: Build Tauri app (default target)
-        if: matrix.target == '' && matrix.runner != 'macos-latest'
-        run: npm run tauri:build
+      - name: Build Tauri app (Linux)
+        if: matrix.runner == 'ubuntu-22.04'
+        env:
+          XIIC_BUNDLE_TARGET_TRIPLE: ${{ matrix.target }}
+        run: npm run tauri:build -- --bundles deb,appimage
 
       - name: Build Tauri app (macOS ${{ matrix.target }})
         if: matrix.runner == 'macos-latest'
+        env:
+          XIIC_BUNDLE_TARGET_TRIPLE: ${{ matrix.target }}
         run: npm run tauri:build -- --target ${{ matrix.target }} --bundles app,dmg
 
-      - name: Build Tauri app (${{ matrix.target }})
-        if: matrix.target != '' && matrix.runner != 'macos-latest'
-        run: npm run tauri:build -- --target ${{ matrix.target }}
+      - name: Build Tauri app (Windows)
+        if: matrix.runner == 'windows-latest'
+        env:
+          XIIC_BUNDLE_TARGET_TRIPLE: ${{ matrix.target }}
+        run: npm run tauri:build -- --bundles nsis
 
       - name: Collect release artifacts
         shell: bash
@@ -103,13 +109,27 @@ jobs:
           fi
 
           if [ ! -d "$SOURCE_DIR" ]; then
-            echo "Bundle output directory not found: $SOURCE_DIR" >&2
-            exit 1
+            echo "Primary bundle output directory not found: $SOURCE_DIR" >&2
+            echo "Scanning src-tauri/target for fallback bundle directories..." >&2
+            FALLBACK_SOURCE_DIR="$(find src-tauri/target -type d -path '*/release/bundle' | sort | head -n 1 || true)"
+            if [ -z "$FALLBACK_SOURCE_DIR" ]; then
+              echo "No fallback bundle directory found under src-tauri/target" >&2
+              find src-tauri/target -maxdepth 4 \( -type d -o -type f \) | sort | sed -n '1,240p' >&2
+              exit 1
+            fi
+            SOURCE_DIR="$FALLBACK_SOURCE_DIR"
+            APP_TARGET_DIR="$(dirname "$SOURCE_DIR")"
+            echo "Using fallback bundle directory: $SOURCE_DIR" >&2
           fi
 
           DIST_DIR="release-dist"
           rm -rf "$DIST_DIR"
           mkdir -p "$DIST_DIR"
+
+          echo "Resolved bundle directory: $SOURCE_DIR"
+          echo "Resolved app target directory: $APP_TARGET_DIR"
+          echo "Bundled helper directory: $BUNDLED_BIN_DIR"
+          find "$SOURCE_DIR" -maxdepth 3 \( -type f -o -type d \) | sort | sed -n '1,240p'
 
           find "$SOURCE_DIR" -type f \( \
             -name "*.dmg" -o \
