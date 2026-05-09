@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 use serde_json::json;
 
 pub const LOG_NOTIFICATION_PAYLOAD: &str = "log_updated";
+pub const NOTIFY_HEALTH_CHECK_KIND: &str = "notify_health_check";
+pub const NOTIFY_HEALTH_OK_KIND: &str = "notify_health_ok";
 pub const APPROVAL_HEALTH_CHECK_KIND: &str = "health_check";
 pub const APPROVAL_HEALTH_OK_KIND: &str = "health_ok";
 
@@ -89,8 +91,16 @@ pub fn send_request(endpoint: &str, payload: &str) -> Result<String> {
 }
 
 pub fn approval_server_healthy(endpoint: &str) -> bool {
+    endpoint_health_check(endpoint, APPROVAL_HEALTH_CHECK_KIND, APPROVAL_HEALTH_OK_KIND)
+}
+
+pub fn notify_server_healthy(endpoint: &str) -> bool {
+    endpoint_health_check(endpoint, NOTIFY_HEALTH_CHECK_KIND, NOTIFY_HEALTH_OK_KIND)
+}
+
+fn endpoint_health_check(endpoint: &str, check_kind: &str, ok_kind: &str) -> bool {
     let payload = json!({
-        "kind": APPROVAL_HEALTH_CHECK_KIND
+        "kind": check_kind
     });
 
     let Ok(response) = send_request(endpoint, &payload.to_string()) else {
@@ -104,7 +114,7 @@ pub fn approval_server_healthy(endpoint: &str) -> bool {
     value
         .get("kind")
         .and_then(|kind| kind.as_str())
-        == Some(APPROVAL_HEALTH_OK_KIND)
+        == Some(ok_kind)
 }
 
 fn with_stream<T, F>(endpoint: &str, op: F) -> Result<T>

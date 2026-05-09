@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::sync::mpsc::SyncSender;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,6 +15,22 @@ use crate::models::{
     ApprovalOperationMetadata, ApprovalRequest, ApprovalRequestedEvent, ApprovalResolvedEvent,
     ApprovalResponse,
 };
+
+const APP_LAUNCH_COOLDOWN: Duration = Duration::from_secs(3);
+
+#[derive(Debug)]
+struct ApprovalAppLaunchState {
+    last_attempt_at: Option<Instant>,
+}
+
+fn approval_app_launch_state() -> &'static Mutex<ApprovalAppLaunchState> {
+    static STATE: OnceLock<Mutex<ApprovalAppLaunchState>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        Mutex::new(ApprovalAppLaunchState {
+            last_attempt_at: None,
+        })
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct LocalApprovalClient {
@@ -34,7 +51,7 @@ impl LocalApprovalClient {
         };
 
         // 如果用户启用了系统弹窗审批，直接走原生对话框，不启动审批 App
-        if crate::settings::load_settings().use_system_approval {
+        if uses_system_approval() {
             eprintln!("[xiic-ssh-mcp] 使用系统弹窗进行审批（settings.use_system_approval）");
             return request_via_native_dialog(&request);
         }
@@ -45,7 +62,7 @@ impl LocalApprovalClient {
             }
 
             if !approval_server_healthy(endpoint) {
-                if let Err(e) = launch_desktop_app() {
+                if let Err(e) = launch_desktop_app_once(endpoint) {
                     eprintln!("[xiic-ssh-mcp] 启动审批 App 失败: {e:#}");
                 }
             }
@@ -74,6 +91,10 @@ impl LocalApprovalClient {
             None => return,
         };
 
+        if uses_system_approval() {
+            return;
+        }
+
         if approval_server_healthy(&endpoint) {
             eprintln!("[xiic-ssh-mcp] 审批 App 已在运行");
             return;
@@ -81,7 +102,7 @@ impl LocalApprovalClient {
 
         eprintln!("[xiic-ssh-mcp] 正在预启动审批 App...");
 
-        match launch_desktop_app() {
+        match launch_desktop_app_once(&endpoint) {
             Ok(_) => {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 let mut waited = 0u32;
@@ -102,6 +123,31 @@ impl LocalApprovalClient {
             }
         }
     }
+}
+
+fn uses_system_approval() -> bool {
+    crate::settings::load_settings().use_system_approval
+}
+
+fn launch_desktop_app_once(endpoint: &str) -> Result<()> {
+    let mut state = approval_app_launch_state()
+        .lock()
+        .map_err(|_| anyhow!("approval app launch state lock poisoned"))?;
+
+    if approval_server_healthy(endpoint) {
+        return Ok(());
+    }
+
+    if let Some(last_attempt_at) = state.last_attempt_at
+        && last_attempt_at.elapsed() < APP_LAUNCH_COOLDOWN
+    {
+        return Ok(());
+    }
+
+    state.last_attempt_at = Some(Instant::now());
+    drop(state);
+
+    launch_desktop_app()
 }
 
 pub fn approval_message(metadata: &ApprovalOperationMetadata) -> String {
