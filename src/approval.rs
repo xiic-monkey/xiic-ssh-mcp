@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::sync::mpsc::SyncSender;
 use std::thread;
@@ -397,6 +397,9 @@ fn request_via_native_dialog(request: &ApprovalRequest) -> Result<bool> {
     );
     let status = Command::new("osascript")
         .args(["-e", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .context("failed to show macOS approval dialog")?;
     Ok(status.success())
@@ -410,6 +413,9 @@ fn request_via_native_dialog(request: &ApprovalRequest) -> Result<bool> {
     );
     let status = Command::new("powershell")
         .args(["-NoProfile", "-Command", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .context("failed to show Windows approval dialog")?;
     Ok(status.success())
@@ -426,6 +432,9 @@ fn request_via_native_dialog(request: &ApprovalRequest) -> Result<bool> {
                 "--text",
                 &request.message,
             ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .context("failed to show zenity approval dialog")?;
         return Ok(status.success());
@@ -434,6 +443,9 @@ fn request_via_native_dialog(request: &ApprovalRequest) -> Result<bool> {
     if command_exists("kdialog") {
         let status = Command::new("kdialog")
             .args(["--title", "Xiic SSH 审批", "--yesno", &request.message])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .context("failed to show kdialog approval dialog")?;
         return Ok(status.success());
