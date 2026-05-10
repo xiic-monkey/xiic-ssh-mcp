@@ -162,8 +162,18 @@ pub fn approval_message(metadata: &ApprovalOperationMetadata) -> String {
             metadata.instance_id.as_deref().unwrap_or("-"),
             metadata.remote_path.as_deref().unwrap_or("-"),
         ),
+        "upload_local_file" => format!(
+            "是否允许从本地上传文件到连接 '{}'？\n\n{}",
+            metadata.instance_id.as_deref().unwrap_or("-"),
+            metadata.remote_path.as_deref().unwrap_or("-"),
+        ),
         "download_file" => format!(
             "是否允许从连接 '{}' 下载文件？\n\n{}",
+            metadata.instance_id.as_deref().unwrap_or("-"),
+            metadata.remote_path.as_deref().unwrap_or("-"),
+        ),
+        "download_to_local" => format!(
+            "是否允许从连接 '{}' 下载文件到本地？\n\n{}",
             metadata.instance_id.as_deref().unwrap_or("-"),
             metadata.remote_path.as_deref().unwrap_or("-"),
         ),

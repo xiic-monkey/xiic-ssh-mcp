@@ -154,6 +154,38 @@ pub struct DownloadFileResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadLocalFileArgs {
+    pub session_id: String,
+    pub local_path: String,
+    pub remote_path: String,
+    #[serde(default = "default_overwrite")]
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadLocalFileResult {
+    pub bytes_written: usize,
+    pub local_path: String,
+    pub remote_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadToLocalArgs {
+    pub session_id: String,
+    pub remote_path: String,
+    pub local_path: String,
+    #[serde(default = "default_overwrite")]
+    pub overwrite: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadToLocalResult {
+    pub local_path: String,
+    pub remote_path: String,
+    pub bytes_written: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UploadEncoding {
     Utf8,

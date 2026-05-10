@@ -10,8 +10,10 @@ use crate::app_core::DesktopCore;
 use crate::approval::LocalApprovalClient;
 use crate::models::{
     ApprovalMode, ApprovalOperationMetadata, CreateSessionResult, DownloadFileArgs,
-    DownloadFileResult, ExecuteCommandArgs, ExecuteCommandResult, OperationContext,
-    PendingToolCall, RuleDecision, ToolCall, UploadFileArgs, UploadFileResult, WhitelistMode,
+    DownloadFileResult, DownloadToLocalArgs, DownloadToLocalResult, ExecuteCommandArgs,
+    ExecuteCommandResult, OperationContext, PendingToolCall, RuleDecision, ToolCall,
+    UploadFileArgs, UploadFileResult, UploadLocalFileArgs, UploadLocalFileResult,
+    WhitelistMode,
 };
 use crate::whitelist::WhitelistChecker;
 
@@ -303,6 +305,36 @@ impl McpServer {
                         "required": ["session_id", "remote_path"],
                         "additionalProperties": false
                     }
+                },
+                {
+                    "name": "upload_local_file",
+                    "description": "Upload a local file to a remote path over SFTP.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": { "type": "string" },
+                            "local_path": { "type": "string" },
+                            "remote_path": { "type": "string" },
+                            "overwrite": { "type": "boolean" }
+                        },
+                        "required": ["session_id", "local_path", "remote_path"],
+                        "additionalProperties": false
+                    }
+                },
+                {
+                    "name": "download_to_local",
+                    "description": "Download a remote file over SFTP to a local file path.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": { "type": "string" },
+                            "remote_path": { "type": "string" },
+                            "local_path": { "type": "string" },
+                            "overwrite": { "type": "boolean" }
+                        },
+                        "required": ["session_id", "remote_path", "local_path"],
+                        "additionalProperties": false
+                    }
                 }
             ]
         })
@@ -475,6 +507,26 @@ impl McpServer {
                     instance_id: Some(instance_id),
                 })
             }
+            "upload_local_file" => {
+                let args: UploadLocalFileArgs = deserialize_args(tool_call.arguments.clone())?;
+                let instance_id = self.lookup_session_instance(&args.session_id)?;
+                Ok(OperationContext {
+                    tool_name: "upload_local_file".into(),
+                    command: None,
+                    remote_path: Some(args.remote_path),
+                    instance_id: Some(instance_id),
+                })
+            }
+            "download_to_local" => {
+                let args: DownloadToLocalArgs = deserialize_args(tool_call.arguments.clone())?;
+                let instance_id = self.lookup_session_instance(&args.session_id)?;
+                Ok(OperationContext {
+                    tool_name: "download_to_local".into(),
+                    command: None,
+                    remote_path: Some(args.remote_path),
+                    instance_id: Some(instance_id),
+                })
+            }
             _ => bail!("unknown tool '{}'", tool_call.name),
         }
     }
@@ -511,6 +563,16 @@ impl McpServer {
             "download_file" => {
                 let args: DownloadFileArgs = deserialize_args(tool_call.arguments.clone())?;
                 let result = self.core.download_file(args)?;
+                tool_success(result)
+            }
+            "upload_local_file" => {
+                let args: UploadLocalFileArgs = deserialize_args(tool_call.arguments.clone())?;
+                let result = self.core.upload_local_file(args)?;
+                tool_success(result)
+            }
+            "download_to_local" => {
+                let args: DownloadToLocalArgs = deserialize_args(tool_call.arguments.clone())?;
+                let result = self.core.download_to_local(args)?;
                 tool_success(result)
             }
             _ => bail!("unknown tool '{}'", tool_call.name),
@@ -709,8 +771,10 @@ fn _type_assertions(
     exec: ExecuteCommandResult,
     upload: UploadFileResult,
     download: DownloadFileResult,
+    upload_local: UploadLocalFileResult,
+    download_local: DownloadToLocalResult,
 ) {
-    let _ = (create, exec, upload, download);
+    let _ = (create, exec, upload, download, upload_local, download_local);
 }
 
 #[cfg(test)]
