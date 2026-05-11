@@ -6,15 +6,21 @@ use std::sync::Arc;
 
 use tauri::{Emitter, Manager, State};
 use xiic_ssh_mcp::app_core::{DEFAULT_KEYRING_SERVICE, DesktopCore};
-use xiic_ssh_mcp::local_ipc::{LOG_NOTIFICATION_PAYLOAD, default_approval_endpoint, default_notify_endpoint, remove_stale_endpoint};
+use xiic_ssh_mcp::local_ipc::{
+    LOG_NOTIFICATION_PAYLOAD, NOTIFY_HEALTH_CHECK_KIND, NOTIFY_HEALTH_OK_KIND,
+    default_approval_endpoint, default_notify_endpoint, notify_server_healthy,
+    remove_stale_endpoint,
+};
 use xiic_ssh_mcp::models::{
     InstanceDraft, InstanceSummary, McpConfigBundle, OperationLogEntry, TestConnectionResult,
 };
 use xiic_ssh_mcp::paths::shared_app_data_dir;
+use xiic_ssh_mcp::single_instance::SingleInstanceGuard;
 
 struct DesktopState {
     core: Arc<DesktopCore>,
     mcp_config: McpConfigBundle,
+    _instance_lock: SingleInstanceGuard,
 }
 
 #[tauri::command]
@@ -157,6 +163,17 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(move |app| {
+            let data_dir = shared_app_data_dir()?;
+            std::fs::create_dir_all(&data_dir)?;
+            let notify_endpoint = default_notify_endpoint(&data_dir);
+            let instance_lock = match SingleInstanceGuard::acquire(
+                &data_dir.join("manager.lock"),
+                || notify_server_healthy(&notify_endpoint),
+            )? {
+                Some(lock) => lock,
+                None => std::process::exit(0),
+            };
+
             let (core, db_path, notify_endpoint, approval_endpoint) = build_core()?;
             let current_exe = std::env::current_exe()?;
             let helper_resolution = resolve_stdio_helper_path(app.handle(), &current_exe);
@@ -172,7 +189,11 @@ fn main() {
 
             start_notify_listener(app.handle().clone(), notify_endpoint);
 
-            app.manage(DesktopState { core, mcp_config });
+            app.manage(DesktopState {
+                core,
+                mcp_config,
+                _instance_lock: instance_lock,
+            });
             show_main_window(app.handle());
             Ok(())
         })
@@ -282,13 +303,28 @@ fn start_notify_listener(app: tauri::AppHandle, endpoint: String) {
 #[cfg(not(target_os = "windows"))]
 fn handle_notify_stream<S>(app: tauri::AppHandle, stream: S) -> anyhow::Result<()>
 where
-    S: std::io::Read,
+    S: std::io::Read + std::io::Write,
 {
     let mut line = String::new();
     let mut reader = BufReader::new(stream);
     let _ = reader.read_line(&mut line)?;
-    if line.trim().is_empty() || line.trim() == LOG_NOTIFICATION_PAYLOAD {
+    let trimmed = line.trim();
+    if trimmed == LOG_NOTIFICATION_PAYLOAD || trimmed.is_empty() {
         let _ = app.emit("log-updated", ());
+        return Ok(());
+    }
+
+    if trimmed == NOTIFY_HEALTH_CHECK_KIND {
+        std::io::Write::write_all(
+            reader.get_mut(),
+            serde_json::json!({
+                "kind": NOTIFY_HEALTH_OK_KIND
+            })
+            .to_string()
+            .as_bytes(),
+        )?;
+        std::io::Write::write_all(reader.get_mut(), b"\n")?;
+        std::io::Write::flush(reader.get_mut())?;
     }
     Ok(())
 }
@@ -311,17 +347,30 @@ async fn run_windows_notify_listener(
         first_instance = false;
         server.connect().await?;
 
-        let app = app.clone();
-        tokio::spawn(async move {
-            let mut line = String::new();
-            let mut reader = BufReader::new(server);
-            if reader.read_line(&mut line).await.is_ok()
-                && (line.trim().is_empty() || line.trim() == LOG_NOTIFICATION_PAYLOAD)
-            {
-                let _ = app.emit("log-updated", ());
-            }
-        });
-    }
+            let app = app.clone();
+            tokio::spawn(async move {
+                let mut line = String::new();
+                let mut reader = BufReader::new(server);
+                if reader.read_line(&mut line).await.is_ok() {
+                    let trimmed = line.trim();
+                    if trimmed == LOG_NOTIFICATION_PAYLOAD || trimmed.is_empty() {
+                        let _ = app.emit("log-updated", ());
+                    } else if trimmed == NOTIFY_HEALTH_CHECK_KIND {
+                        use tokio::io::AsyncWriteExt;
+
+                        let payload = serde_json::json!({
+                            "kind": NOTIFY_HEALTH_OK_KIND
+                        })
+                        .to_string();
+                        let server = reader.into_inner();
+                        let mut server = server;
+                        let _ = server.write_all(payload.as_bytes()).await;
+                        let _ = server.write_all(b"\n").await;
+                        let _ = server.flush().await;
+                    }
+                }
+            });
+        }
 }
 
 struct HelperResolution {

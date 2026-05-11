@@ -1,7 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::sync::mpsc::SyncSender;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,6 +15,22 @@ use crate::models::{
     ApprovalOperationMetadata, ApprovalRequest, ApprovalRequestedEvent, ApprovalResolvedEvent,
     ApprovalResponse,
 };
+
+const APP_LAUNCH_COOLDOWN: Duration = Duration::from_secs(3);
+
+#[derive(Debug)]
+struct ApprovalAppLaunchState {
+    last_attempt_at: Option<Instant>,
+}
+
+fn approval_app_launch_state() -> &'static Mutex<ApprovalAppLaunchState> {
+    static STATE: OnceLock<Mutex<ApprovalAppLaunchState>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        Mutex::new(ApprovalAppLaunchState {
+            last_attempt_at: None,
+        })
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct LocalApprovalClient {
@@ -34,7 +51,7 @@ impl LocalApprovalClient {
         };
 
         // 如果用户启用了系统弹窗审批，直接走原生对话框，不启动审批 App
-        if crate::settings::load_settings().use_system_approval {
+        if uses_system_approval() {
             eprintln!("[xiic-ssh-mcp] 使用系统弹窗进行审批（settings.use_system_approval）");
             return request_via_native_dialog(&request);
         }
@@ -45,7 +62,7 @@ impl LocalApprovalClient {
             }
 
             if !approval_server_healthy(endpoint) {
-                if let Err(e) = launch_desktop_app() {
+                if let Err(e) = launch_desktop_app_once(endpoint) {
                     eprintln!("[xiic-ssh-mcp] 启动审批 App 失败: {e:#}");
                 }
             }
@@ -74,6 +91,10 @@ impl LocalApprovalClient {
             None => return,
         };
 
+        if uses_system_approval() {
+            return;
+        }
+
         if approval_server_healthy(&endpoint) {
             eprintln!("[xiic-ssh-mcp] 审批 App 已在运行");
             return;
@@ -81,7 +102,7 @@ impl LocalApprovalClient {
 
         eprintln!("[xiic-ssh-mcp] 正在预启动审批 App...");
 
-        match launch_desktop_app() {
+        match launch_desktop_app_once(&endpoint) {
             Ok(_) => {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 let mut waited = 0u32;
@@ -104,6 +125,31 @@ impl LocalApprovalClient {
     }
 }
 
+fn uses_system_approval() -> bool {
+    crate::settings::load_settings().use_system_approval
+}
+
+fn launch_desktop_app_once(endpoint: &str) -> Result<()> {
+    let mut state = approval_app_launch_state()
+        .lock()
+        .map_err(|_| anyhow!("approval app launch state lock poisoned"))?;
+
+    if approval_server_healthy(endpoint) {
+        return Ok(());
+    }
+
+    if let Some(last_attempt_at) = state.last_attempt_at
+        && last_attempt_at.elapsed() < APP_LAUNCH_COOLDOWN
+    {
+        return Ok(());
+    }
+
+    state.last_attempt_at = Some(Instant::now());
+    drop(state);
+
+    launch_desktop_app()
+}
+
 pub fn approval_message(metadata: &ApprovalOperationMetadata) -> String {
     match metadata.tool_name.as_str() {
         "execute_command" => format!(
@@ -117,11 +163,21 @@ pub fn approval_message(metadata: &ApprovalOperationMetadata) -> String {
             metadata.local_path.as_deref().unwrap_or("-"),
             metadata.remote_path.as_deref().unwrap_or("-"),
         ),
+        "upload_local_file" => format!(
+            "是否允许从本地上传文件到连接 '{}'？\n\n{}",
+            metadata.instance_id.as_deref().unwrap_or("-"),
+            metadata.remote_path.as_deref().unwrap_or("-"),
+        ),
         "download_file" => format!(
             "是否允许从连接 '{}' 下载文件？\n\n远端：{}\n本地：{}",
             metadata.instance_id.as_deref().unwrap_or("-"),
             metadata.remote_path.as_deref().unwrap_or("-"),
             metadata.local_path.as_deref().unwrap_or("默认 Downloads 目录"),
+        ),
+        "download_to_local" => format!(
+            "是否允许从连接 '{}' 下载文件到本地？\n\n{}",
+            metadata.instance_id.as_deref().unwrap_or("-"),
+            metadata.remote_path.as_deref().unwrap_or("-"),
         ),
         _ => format!("是否允许执行 SSH 操作 '{}'？", metadata.tool_name),
     }
@@ -353,6 +409,9 @@ fn request_via_native_dialog(request: &ApprovalRequest) -> Result<bool> {
     );
     let status = Command::new("osascript")
         .args(["-e", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .context("failed to show macOS approval dialog")?;
     Ok(status.success())
@@ -366,6 +425,9 @@ fn request_via_native_dialog(request: &ApprovalRequest) -> Result<bool> {
     );
     let status = Command::new("powershell")
         .args(["-NoProfile", "-Command", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .context("failed to show Windows approval dialog")?;
     Ok(status.success())
@@ -382,6 +444,9 @@ fn request_via_native_dialog(request: &ApprovalRequest) -> Result<bool> {
                 "--text",
                 &request.message,
             ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .context("failed to show zenity approval dialog")?;
         return Ok(status.success());
@@ -390,6 +455,9 @@ fn request_via_native_dialog(request: &ApprovalRequest) -> Result<bool> {
     if command_exists("kdialog") {
         let status = Command::new("kdialog")
             .args(["--title", "Xiic SSH 审批", "--yesno", &request.message])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .context("failed to show kdialog approval dialog")?;
         return Ok(status.success());

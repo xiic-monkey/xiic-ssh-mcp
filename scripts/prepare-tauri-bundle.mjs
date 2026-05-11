@@ -7,22 +7,57 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, "..");
 const isWindows = process.platform === "win32";
-const targetTriple = process.env.TAURI_ENV_TARGET_TRIPLE || process.env.TARGET || "";
+const targetTriple =
+  process.env.XIIC_BUNDLE_TARGET_TRIPLE ||
+  process.env.TAURI_ENV_TARGET_TRIPLE ||
+  process.env.TARGET ||
+  "";
 const binaryExt = isWindows ? ".exe" : "";
+const windowsShell = process.env.ComSpec || "cmd.exe";
 
 function commandName(name) {
-  return isWindows ? `${name}.cmd` : name;
+  if (!isWindows) {
+    return name;
+  }
+  if (name === "cargo") {
+    return "cargo.exe";
+  }
+  return `${name}.cmd`;
+}
+
+function log(message) {
+  console.log(`[bundle:prepare] ${message}`);
+}
+
+function resolveCommand(cmd, args) {
+  if (isWindows && cmd.endsWith(".cmd")) {
+    return {
+      cmd: windowsShell,
+      args: ["/d", "/s", "/c", cmd, ...args],
+    };
+  }
+
+  return { cmd, args };
 }
 
 function run(cmd, args, options = {}) {
-  const result = spawnSync(cmd, args, {
+  const resolved = resolveCommand(cmd, args);
+  log(`Running: ${resolved.cmd} ${resolved.args.join(" ")}`);
+  const result = spawnSync(resolved.cmd, resolved.args, {
     cwd: repoRoot,
     stdio: "inherit",
     env: process.env,
     ...options,
   });
 
+  if (result.error) {
+    console.error(`[bundle:prepare] Failed to start command: ${resolved.cmd}`);
+    console.error(result.error);
+    process.exit(1);
+  }
+
   if (result.status !== 0) {
+    console.error(`[bundle:prepare] Command exited with status ${result.status}: ${resolved.cmd}`);
     process.exit(result.status ?? 1);
   }
 }
@@ -42,8 +77,10 @@ function rootTargetDir() {
 }
 
 function copyExecutable(source, destination) {
+  log(`Copying ${source} -> ${destination}`);
   if (!existsSync(source)) {
-    throw new Error(`Expected binary not found: ${source}`);
+    console.error(`[bundle:prepare] Expected binary not found: ${source}`);
+    process.exit(1);
   }
   copyFileSync(source, destination);
   if (!isWindows) {
@@ -51,14 +88,17 @@ function copyExecutable(source, destination) {
   }
 }
 
+log(`Platform=${process.platform} arch=${process.arch} target=${targetTriple || "<host-default>"}`);
+
 run(commandName("npm"), ["run", "build"]);
 
+const cargoCmd = commandName("cargo");
 const cargoArgs = ["build", "--release"];
 if (targetTriple) {
   cargoArgs.push("--target", targetTriple);
 }
-run("cargo", cargoArgs);
-run("cargo", [
+run(cargoCmd, cargoArgs);
+run(cargoCmd, [
   "build",
   "--manifest-path",
   "approval-tauri/Cargo.toml",

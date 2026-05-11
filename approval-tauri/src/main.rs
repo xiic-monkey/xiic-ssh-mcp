@@ -12,11 +12,13 @@ use xiic_ssh_mcp::local_ipc::{
 };
 use xiic_ssh_mcp::models::{ApprovalRequest, ApprovalRequestedEvent};
 use xiic_ssh_mcp::paths::shared_app_data_dir;
+use xiic_ssh_mcp::single_instance::SingleInstanceGuard;
 
 type ApprovalState = Arc<Mutex<ApprovalQueue>>;
 
 struct AppState {
     approvals: ApprovalState,
+    _instance_lock: SingleInstanceGuard,
 }
 
 #[tauri::command]
@@ -72,10 +74,14 @@ fn main() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             let endpoint = approval_endpoint()?;
-
-            if approval_server_healthy(&endpoint) {
-                std::process::exit(0);
-            }
+            let data_dir = shared_app_data_dir()?;
+            let instance_lock = match SingleInstanceGuard::acquire(
+                &data_dir.join("approval.lock"),
+                || approval_server_healthy(&endpoint),
+            )? {
+                Some(lock) => lock,
+                None => std::process::exit(0),
+            };
 
             remove_stale_endpoint(&endpoint);
 
@@ -87,6 +93,7 @@ fn main() {
 
             app.manage(AppState {
                 approvals: approvals_for_setup.clone(),
+                _instance_lock: instance_lock,
             });
             Ok(())
         })

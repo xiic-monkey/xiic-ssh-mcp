@@ -6,5 +6,6 @@ pub mod mcp;
 pub mod models;
 pub mod paths;
 pub mod settings;
+pub mod single_instance;
 pub mod storage;
 pub mod whitelist;
