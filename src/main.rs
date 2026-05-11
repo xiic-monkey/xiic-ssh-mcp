@@ -4,12 +4,28 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use xiic_ssh_mcp::app_core::{DEFAULT_KEYRING_SERVICE, DesktopCore};
-use xiic_ssh_mcp::local_ipc::remove_stale_endpoint;
+use xiic_ssh_mcp::local_ipc::{notify_server_healthy, remove_stale_endpoint};
 use xiic_ssh_mcp::mcp::McpServer;
 use xiic_ssh_mcp::models::{ApprovalMode, WhitelistMode};
+use xiic_ssh_mcp::single_instance::SingleInstanceGuard;
 
 fn main() -> Result<()> {
     let options = CliOptions::parse(env::args().skip(1))?;
+    let lock_path = options
+        .db_path
+        .parent()
+        .map(|dir| dir.join("mcp.lock"))
+        .unwrap_or_else(|| PathBuf::from("mcp.lock"));
+    let _instance_lock = match SingleInstanceGuard::acquire(&lock_path, || {
+        options
+            .notify_socket
+            .as_deref()
+            .map(notify_server_healthy)
+            .unwrap_or(true)
+    })? {
+        Some(lock) => lock,
+        None => return Ok(()),
+    };
     let approval_endpoint = options.approval_endpoint.clone();
     let core = Arc::new(DesktopCore::new_with_socket(
         options.db_path,
