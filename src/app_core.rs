@@ -14,11 +14,11 @@ use uuid::Uuid;
 use crate::credentials::SecretStore;
 use crate::local_ipc::send_notification;
 use crate::models::{
-    AuthKind, CreateSessionResult, DownloadEncoding, DownloadFileArgs, DownloadFileResult,
-    DownloadToLocalArgs, DownloadToLocalResult, ExecuteCommandArgs, ExecuteCommandResult,
-    InstanceDraft, InstanceSummary, ListServersResult, McpConfigBundle, OperationLogEntry,
-    RuleAction, RuleType, SecretPayload, StoredInstance, TestConnectionResult, UploadEncoding,
-    UploadFileArgs, UploadFileResult, UploadLocalFileArgs, UploadLocalFileResult, WhitelistRule,
+    AuthKind, CreateSessionResult, DownloadFileArgs, DownloadFileResult, DownloadToLocalArgs,
+    DownloadToLocalResult, ExecuteCommandArgs, ExecuteCommandResult, InstanceDraft,
+    InstanceSummary, ListServersResult, McpConfigBundle, OperationLogEntry, RuleAction, RuleType,
+    SecretPayload, StoredInstance, TestConnectionResult, UploadFileArgs, UploadFileResult,
+    UploadLocalFileArgs, UploadLocalFileResult, WhitelistRule,
 };
 use crate::storage::InstanceStore;
 use crate::whitelist::WhitelistChecker;
@@ -413,15 +413,10 @@ impl DesktopCore {
     }
 
     pub fn upload_local_file(&self, args: UploadLocalFileArgs) -> Result<UploadLocalFileResult> {
-        let local_path = PathBuf::from(&args.local_path);
-        let bytes = std::fs::read(&local_path)
-            .with_context(|| format!("failed to read local path '{}'", local_path.display()))?;
-
         let result = self.upload_file(UploadFileArgs {
             session_id: args.session_id,
+            local_path: args.local_path.clone(),
             remote_path: args.remote_path.clone(),
-            content: BASE64.encode(&bytes),
-            encoding: UploadEncoding::Base64,
             overwrite: args.overwrite,
         })?;
 
@@ -480,6 +475,7 @@ impl DesktopCore {
                     local_path: resolved_local_path.display().to_string(),
                     remote_path: args.remote_path.clone(),
                     size: bytes.len(),
+                    encoding: "local_path".to_string(),
                 },
             )
         };
@@ -511,29 +507,13 @@ impl DesktopCore {
         let result = self.download_file(DownloadFileArgs {
             session_id: args.session_id,
             remote_path: args.remote_path.clone(),
-            encoding: DownloadEncoding::Base64,
+            local_path: Some(args.local_path.clone()),
         })?;
 
-        let bytes = BASE64
-            .decode(&result.content)
-            .context("failed to decode downloaded file content")?;
-        let local_path = PathBuf::from(&args.local_path);
-
-        if local_path.exists() && !args.overwrite {
-            bail!("local path '{}' already exists", local_path.display());
-        }
-        if let Some(parent) = local_path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create parent directory '{}'", parent.display())
-            })?;
-        }
-        std::fs::write(&local_path, &bytes)
-            .with_context(|| format!("failed to write local path '{}'", local_path.display()))?;
-
         Ok(DownloadToLocalResult {
-            local_path: args.local_path,
+            local_path: result.local_path,
             remote_path: args.remote_path,
-            bytes_written: bytes.len(),
+            bytes_written: result.size,
         })
     }
 

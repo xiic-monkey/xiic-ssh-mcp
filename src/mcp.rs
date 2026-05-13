@@ -518,6 +518,7 @@ impl McpServer {
                     tool_name: "upload_local_file".into(),
                     command: None,
                     remote_path: Some(args.remote_path),
+                    local_path: Some(args.local_path),
                     instance_id: Some(instance_id),
                 })
             }
@@ -528,6 +529,7 @@ impl McpServer {
                     tool_name: "download_to_local".into(),
                     command: None,
                     remote_path: Some(args.remote_path),
+                    local_path: Some(args.local_path),
                     instance_id: Some(instance_id),
                 })
             }
