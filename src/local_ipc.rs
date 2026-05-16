@@ -91,7 +91,11 @@ pub fn send_request(endpoint: &str, payload: &str) -> Result<String> {
 }
 
 pub fn approval_server_healthy(endpoint: &str) -> bool {
-    endpoint_health_check(endpoint, APPROVAL_HEALTH_CHECK_KIND, APPROVAL_HEALTH_OK_KIND)
+    endpoint_health_check(
+        endpoint,
+        APPROVAL_HEALTH_CHECK_KIND,
+        APPROVAL_HEALTH_OK_KIND,
+    )
 }
 
 pub fn notify_server_healthy(endpoint: &str) -> bool {
@@ -111,10 +115,7 @@ fn endpoint_health_check(endpoint: &str, check_kind: &str, ok_kind: &str) -> boo
         return false;
     };
 
-    value
-        .get("kind")
-        .and_then(|kind| kind.as_str())
-        == Some(ok_kind)
+    value.get("kind").and_then(|kind| kind.as_str()) == Some(ok_kind)
 }
 
 fn with_stream<T, F>(endpoint: &str, op: F) -> Result<T>
@@ -127,7 +128,7 @@ where
 
         let mut stream = UnixStream::connect(endpoint)
             .with_context(|| format!("failed to connect to IPC endpoint '{endpoint}'"))?;
-        return op(&mut stream);
+        op(&mut stream)
     }
 
     #[cfg(target_os = "windows")]
@@ -137,7 +138,7 @@ where
             .write(true)
             .open(endpoint)
             .with_context(|| format!("failed to connect to IPC endpoint '{endpoint}'"))?;
-        return op(&mut stream);
+        op(&mut stream)
     }
 }
 

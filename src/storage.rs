@@ -291,10 +291,10 @@ impl InstanceStore {
         let rows = statement.query_map([], |row| {
             Ok(WhitelistRule {
                 id: row.get(0)?,
-                rule_type: RuleType::from_str(row.get::<_, String>(1)?.as_str())
+                rule_type: RuleType::from_db_value(row.get::<_, String>(1)?.as_str())
                     .unwrap_or(RuleType::Tool),
                 pattern: row.get(2)?,
-                action: RuleAction::from_str(row.get::<_, String>(3)?.as_str())
+                action: RuleAction::from_db_value(row.get::<_, String>(3)?.as_str())
                     .unwrap_or(RuleAction::Deny),
                 enabled: row.get::<_, i64>(4)? != 0,
                 created_at: row.get(5)?,
@@ -317,10 +317,10 @@ impl InstanceStore {
         let rows = statement.query_map([type_str], |row| {
             Ok(WhitelistRule {
                 id: row.get(0)?,
-                rule_type: RuleType::from_str(row.get::<_, String>(1)?.as_str())
+                rule_type: RuleType::from_db_value(row.get::<_, String>(1)?.as_str())
                     .unwrap_or(RuleType::Tool),
                 pattern: row.get(2)?,
-                action: RuleAction::from_str(row.get::<_, String>(3)?.as_str())
+                action: RuleAction::from_db_value(row.get::<_, String>(3)?.as_str())
                     .unwrap_or(RuleAction::Deny),
                 enabled: true,
                 created_at: row.get(5)?,

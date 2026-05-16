@@ -6,6 +6,19 @@ use anyhow::Result;
 use crate::models::{OperationContext, RuleAction, RuleDecision, RuleType, WhitelistRule};
 use crate::storage::InstanceStore;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommandAnalysis {
+    Segments(Vec<String>),
+    NeedsReview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuoteState {
+    None,
+    Single,
+    Double,
+}
+
 #[derive(Clone)]
 pub struct WhitelistChecker {
     store: InstanceStore,
@@ -30,25 +43,14 @@ impl WhitelistChecker {
         ctx: &OperationContext,
         approvals: &HashMap<String, Instant>,
     ) -> RuleDecision {
-        let apply_rules = |act: RuleAction| {
-            rules
-                .iter()
-                .filter(move |r| r.enabled && r.action == act)
-                .filter_map(|r| {
-                    let value = match r.rule_type {
-                        RuleType::Tool => Some(ctx.tool_name.as_str()),
-                        RuleType::Command => ctx.command.as_deref(),
-                        RuleType::Path => ctx.remote_path.as_deref(),
-                        RuleType::Instance => ctx.instance_id.as_deref(),
-                    };
-
-                    value.map(|v| (v, r))
-                })
-                .filter(|(value, rule)| glob_match(&rule.pattern, value))
-        };
+        let command_analysis = ctx.command.as_deref().map(analyze_command);
 
         // deny rules have highest priority
-        if let Some((value, rule)) = apply_rules(RuleAction::Deny).next() {
+        if let Some((value, rule)) = rules
+            .iter()
+            .filter(|r| r.enabled && r.action == RuleAction::Deny)
+            .find_map(|rule| matching_deny_value(ctx, command_analysis.as_ref(), rule))
+        {
             return RuleDecision::Deny(format!(
                 "denied by rule #{}: {} '{}' matches deny pattern '{}'",
                 rule.id,
@@ -60,10 +62,26 @@ impl WhitelistChecker {
 
         // Collect which dimensions have allow rules
         let mut covered_dims: HashMap<&str, i64> = HashMap::new();
-        for (_, rule) in apply_rules(RuleAction::Allow) {
-            covered_dims
-                .entry(rule.rule_type.as_str())
-                .or_insert(rule.id);
+        for rule in rules
+            .iter()
+            .filter(|r| r.enabled && r.action == RuleAction::Allow)
+        {
+            match rule.rule_type {
+                RuleType::Command => {}
+                _ => {
+                    if let Some(value) = rule_value(ctx, &rule.rule_type)
+                        && glob_match(&rule.pattern, value)
+                    {
+                        covered_dims
+                            .entry(rule.rule_type.as_str())
+                            .or_insert(rule.id);
+                    }
+                }
+            }
+        }
+
+        if command_allow_covered(command_analysis.as_ref(), rules) {
+            covered_dims.entry("command").or_insert(0);
         }
 
         // All present dimensions must be covered by allow rules
@@ -103,6 +121,164 @@ impl WhitelistChecker {
         let key = approval_key(ctx);
         self.session_approvals.insert(key, Instant::now());
     }
+}
+
+fn rule_value<'a>(ctx: &'a OperationContext, rule_type: &RuleType) -> Option<&'a str> {
+    match rule_type {
+        RuleType::Tool => Some(ctx.tool_name.as_str()),
+        RuleType::Command => ctx.command.as_deref(),
+        RuleType::Path => ctx.remote_path.as_deref(),
+        RuleType::Instance => ctx.instance_id.as_deref(),
+    }
+}
+
+fn matching_deny_value<'a>(
+    ctx: &'a OperationContext,
+    command_analysis: Option<&'a CommandAnalysis>,
+    rule: &'a WhitelistRule,
+) -> Option<(&'a str, &'a WhitelistRule)> {
+    if rule.rule_type != RuleType::Command {
+        let value = rule_value(ctx, &rule.rule_type)?;
+        return glob_match(&rule.pattern, value).then_some((value, rule));
+    }
+
+    let command = ctx.command.as_deref()?;
+    if glob_match(&rule.pattern, command) {
+        return Some((command, rule));
+    }
+
+    let Some(CommandAnalysis::Segments(segments)) = command_analysis else {
+        return None;
+    };
+
+    segments
+        .iter()
+        .find(|segment| glob_match(&rule.pattern, segment))
+        .map(|segment| (segment.as_str(), rule))
+}
+
+fn command_allow_covered(analysis: Option<&CommandAnalysis>, rules: &[WhitelistRule]) -> bool {
+    let Some(CommandAnalysis::Segments(segments)) = analysis else {
+        return false;
+    };
+
+    !segments.is_empty()
+        && segments.iter().all(|segment| {
+            rules.iter().any(|rule| {
+                rule.enabled
+                    && rule.action == RuleAction::Allow
+                    && rule.rule_type == RuleType::Command
+                    && glob_match(&rule.pattern, segment)
+            })
+        })
+}
+
+fn analyze_command(command: &str) -> CommandAnalysis {
+    let command = command.trim();
+    if command.is_empty() {
+        return CommandAnalysis::NeedsReview;
+    }
+
+    let bytes = command.as_bytes();
+    let mut segments = Vec::new();
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let mut segment_start = 0;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+
+        match quote {
+            QuoteState::Single => {
+                if byte == b'\'' {
+                    quote = QuoteState::None;
+                }
+                index += 1;
+            }
+            QuoteState::Double => match byte {
+                b'\\' => {
+                    escaped = true;
+                    index += 1;
+                }
+                b'"' => {
+                    quote = QuoteState::None;
+                    index += 1;
+                }
+                b'`' => return CommandAnalysis::NeedsReview,
+                b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                    return CommandAnalysis::NeedsReview;
+                }
+                _ => index += 1,
+            },
+            QuoteState::None => match byte {
+                b'\\' => {
+                    escaped = true;
+                    index += 1;
+                }
+                b'\'' => {
+                    quote = QuoteState::Single;
+                    index += 1;
+                }
+                b'"' => {
+                    quote = QuoteState::Double;
+                    index += 1;
+                }
+                b'`' => return CommandAnalysis::NeedsReview,
+                b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                    return CommandAnalysis::NeedsReview;
+                }
+                b'(' | b')' | b'{' | b'}' | b'<' | b'>' => {
+                    return CommandAnalysis::NeedsReview;
+                }
+                b';' | b'\n' => {
+                    if !push_segment(command, segment_start, index, &mut segments) {
+                        return CommandAnalysis::NeedsReview;
+                    }
+                    index += 1;
+                    segment_start = index;
+                }
+                b'&' | b'|' => {
+                    if !push_segment(command, segment_start, index, &mut segments) {
+                        return CommandAnalysis::NeedsReview;
+                    }
+                    let operator_len = if bytes.get(index + 1) == Some(&byte) {
+                        2
+                    } else {
+                        1
+                    };
+                    index += operator_len;
+                    segment_start = index;
+                }
+                _ => index += 1,
+            },
+        }
+    }
+
+    if escaped || quote != QuoteState::None {
+        return CommandAnalysis::NeedsReview;
+    }
+
+    if !push_segment(command, segment_start, bytes.len(), &mut segments) {
+        return CommandAnalysis::NeedsReview;
+    }
+
+    CommandAnalysis::Segments(segments)
+}
+
+fn push_segment(command: &str, start: usize, end: usize, segments: &mut Vec<String>) -> bool {
+    let segment = command[start..end].trim();
+    if segment.is_empty() {
+        return false;
+    }
+    segments.push(segment.to_string());
+    true
 }
 
 pub fn approval_key(ctx: &OperationContext) -> String {
@@ -162,6 +338,36 @@ mod tests {
     use super::*;
     use crate::models::RuleAction;
 
+    fn rule(id: i64, rule_type: RuleType, pattern: &str, action: RuleAction) -> WhitelistRule {
+        WhitelistRule {
+            id,
+            rule_type,
+            pattern: pattern.into(),
+            action,
+            enabled: true,
+            created_at: String::new(),
+        }
+    }
+
+    fn execute_ctx(command: &str) -> OperationContext {
+        OperationContext {
+            tool_name: "execute_command".into(),
+            command: Some(command.into()),
+            remote_path: None,
+            local_path: None,
+            instance_id: Some("dev-server".into()),
+        }
+    }
+
+    fn base_rules(command_rules: Vec<WhitelistRule>) -> Vec<WhitelistRule> {
+        let mut rules = vec![
+            rule(1, RuleType::Tool, "execute_command", RuleAction::Allow),
+            rule(2, RuleType::Instance, "*", RuleAction::Allow),
+        ];
+        rules.extend(command_rules);
+        rules
+    }
+
     #[test]
     fn glob_star_matches_all() {
         assert!(glob_match("*", "anything"));
@@ -188,30 +394,9 @@ mod tests {
     #[test]
     fn evaluate_allow_all() {
         let rules = vec![
-            WhitelistRule {
-                id: 1,
-                rule_type: RuleType::Tool,
-                pattern: "*".into(),
-                action: RuleAction::Allow,
-                enabled: true,
-                created_at: String::new(),
-            },
-            WhitelistRule {
-                id: 2,
-                rule_type: RuleType::Command,
-                pattern: "*".into(),
-                action: RuleAction::Allow,
-                enabled: true,
-                created_at: String::new(),
-            },
-            WhitelistRule {
-                id: 3,
-                rule_type: RuleType::Instance,
-                pattern: "*".into(),
-                action: RuleAction::Allow,
-                enabled: true,
-                created_at: String::new(),
-            },
+            rule(1, RuleType::Tool, "*", RuleAction::Allow),
+            rule(2, RuleType::Command, "*", RuleAction::Allow),
+            rule(3, RuleType::Instance, "*", RuleAction::Allow),
         ];
 
         let ctx = OperationContext {
@@ -230,22 +415,8 @@ mod tests {
     #[test]
     fn evaluate_deny_wins() {
         let rules = vec![
-            WhitelistRule {
-                id: 1,
-                rule_type: RuleType::Tool,
-                pattern: "*".into(),
-                action: RuleAction::Allow,
-                enabled: true,
-                created_at: String::new(),
-            },
-            WhitelistRule {
-                id: 2,
-                rule_type: RuleType::Command,
-                pattern: "rm *".into(),
-                action: RuleAction::Deny,
-                enabled: true,
-                created_at: String::new(),
-            },
+            rule(1, RuleType::Tool, "*", RuleAction::Allow),
+            rule(2, RuleType::Command, "rm *", RuleAction::Deny),
         ];
 
         let ctx = OperationContext {
@@ -263,14 +434,7 @@ mod tests {
 
     #[test]
     fn evaluate_needs_elicitation() {
-        let rules = vec![WhitelistRule {
-            id: 1,
-            rule_type: RuleType::Tool,
-            pattern: "list_servers".into(),
-            action: RuleAction::Allow,
-            enabled: true,
-            created_at: String::new(),
-        }];
+        let rules = vec![rule(1, RuleType::Tool, "list_servers", RuleAction::Allow)];
 
         let ctx = OperationContext {
             tool_name: "execute_command".into(),
@@ -283,5 +447,140 @@ mod tests {
         let approvals = HashMap::new();
         let result = WhitelistChecker::evaluate(&rules, &ctx, &approvals);
         assert!(matches!(result, RuleDecision::NeedsElicitation));
+    }
+
+    #[test]
+    fn compound_command_allows_when_every_segment_is_allowed() {
+        let rules = base_rules(vec![
+            rule(3, RuleType::Command, "cd *", RuleAction::Allow),
+            rule(4, RuleType::Command, "ls *", RuleAction::Allow),
+        ]);
+        let ctx = execute_ctx("cd /app && ls -la");
+
+        let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
+
+        assert!(matches!(result, RuleDecision::Allow));
+    }
+
+    #[test]
+    fn compound_command_needs_elicitation_when_any_segment_is_not_allowed() {
+        let rules = base_rules(vec![rule(3, RuleType::Command, "cd *", RuleAction::Allow)]);
+        let ctx = execute_ctx("cd xx & rm -rf /");
+
+        let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
+
+        assert!(matches!(result, RuleDecision::NeedsElicitation));
+    }
+
+    #[test]
+    fn compound_command_deny_matches_any_segment() {
+        let rules = base_rules(vec![
+            rule(3, RuleType::Command, "cd *", RuleAction::Allow),
+            rule(4, RuleType::Command, "rm *", RuleAction::Deny),
+        ]);
+        let ctx = execute_ctx("cd xx & rm -rf /");
+
+        let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
+
+        assert!(matches!(result, RuleDecision::Deny(_)));
+    }
+
+    #[test]
+    fn quoted_connectors_do_not_split_segments() {
+        let rules = base_rules(vec![
+            rule(3, RuleType::Command, "echo *", RuleAction::Allow),
+            rule(4, RuleType::Command, "printf *", RuleAction::Allow),
+        ]);
+        let ctx = execute_ctx("echo 'a;b' && printf \"x|y\"");
+
+        let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
+
+        assert!(matches!(result, RuleDecision::Allow));
+    }
+
+    #[test]
+    fn escaped_connectors_do_not_split_segments() {
+        let rules = base_rules(vec![rule(
+            3,
+            RuleType::Command,
+            r"echo a\;b",
+            RuleAction::Allow,
+        )]);
+        let ctx = execute_ctx(r"echo a\;b");
+
+        let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
+
+        assert!(matches!(result, RuleDecision::Allow));
+    }
+
+    #[test]
+    fn pipe_requires_each_side_to_be_allowed() {
+        let rules = base_rules(vec![
+            rule(3, RuleType::Command, "cat *", RuleAction::Allow),
+            rule(4, RuleType::Command, "grep *", RuleAction::Allow),
+        ]);
+        let ctx = execute_ctx("cat /tmp/a | grep foo");
+
+        let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
+
+        assert!(matches!(result, RuleDecision::Allow));
+    }
+
+    #[test]
+    fn complex_command_substitution_needs_elicitation() {
+        let rules = base_rules(vec![rule(
+            3,
+            RuleType::Command,
+            "echo *",
+            RuleAction::Allow,
+        )]);
+        let ctx = execute_ctx("echo $(rm -rf /)");
+
+        let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
+
+        assert!(matches!(result, RuleDecision::NeedsElicitation));
+    }
+
+    #[test]
+    fn complex_backticks_need_elicitation() {
+        let rules = base_rules(vec![rule(
+            3,
+            RuleType::Command,
+            "echo *",
+            RuleAction::Allow,
+        )]);
+        let ctx = execute_ctx("echo `whoami`");
+
+        let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
+
+        assert!(matches!(result, RuleDecision::NeedsElicitation));
+    }
+
+    #[test]
+    fn redirection_needs_elicitation() {
+        let rules = base_rules(vec![rule(
+            3,
+            RuleType::Command,
+            "echo *",
+            RuleAction::Allow,
+        )]);
+        let ctx = execute_ctx("echo ok > /tmp/x");
+
+        let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
+
+        assert!(matches!(result, RuleDecision::NeedsElicitation));
+    }
+
+    #[test]
+    fn malformed_commands_need_elicitation() {
+        let rules = base_rules(vec![rule(3, RuleType::Command, "ls *", RuleAction::Allow)]);
+
+        let unclosed_quote =
+            WhitelistChecker::evaluate(&rules, &execute_ctx("ls 'tmp"), &HashMap::new());
+        let empty_segment =
+            WhitelistChecker::evaluate(&rules, &execute_ctx("ls &&"), &HashMap::new());
+
+        assert!(matches!(unclosed_quote, RuleDecision::NeedsElicitation));
+        assert!(matches!(empty_segment, RuleDecision::NeedsElicitation));
     }
 }

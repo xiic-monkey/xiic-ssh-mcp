@@ -12,7 +12,8 @@ use xiic_ssh_mcp::local_ipc::{
     remove_stale_endpoint,
 };
 use xiic_ssh_mcp::models::{
-    InstanceDraft, InstanceSummary, McpConfigBundle, OperationLogEntry, TestConnectionResult,
+    InstanceDraft, InstanceSummary, McpConfigBundle, McpConfigRequest, OperationLogEntry,
+    TestConnectionResult,
 };
 use xiic_ssh_mcp::paths::shared_app_data_dir;
 use xiic_ssh_mcp::single_instance::SingleInstanceGuard;
@@ -33,7 +34,10 @@ fn save_instance(
     state: State<'_, DesktopState>,
     draft: InstanceDraft,
 ) -> Result<InstanceSummary, String> {
-    state.core.save_instance(draft).map_err(|err| err.to_string())
+    state
+        .core
+        .save_instance(draft)
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -166,26 +170,28 @@ fn main() {
             let data_dir = shared_app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             let notify_endpoint = default_notify_endpoint(&data_dir);
-            let instance_lock = match SingleInstanceGuard::acquire(
-                &data_dir.join("manager.lock"),
-                || notify_server_healthy(&notify_endpoint),
-            )? {
-                Some(lock) => lock,
-                None => std::process::exit(0),
-            };
+            let instance_lock =
+                match SingleInstanceGuard::acquire(&data_dir.join("manager.lock"), || {
+                    notify_server_healthy(&notify_endpoint)
+                })? {
+                    Some(lock) => lock,
+                    None => std::process::exit(0),
+                };
 
             let (core, db_path, notify_endpoint, approval_endpoint) = build_core()?;
             let current_exe = std::env::current_exe()?;
             let helper_resolution = resolve_stdio_helper_path(app.handle(), &current_exe);
-            let mcp_config = core.mcp_config_bundle(
-                &helper_resolution.path.to_string_lossy(),
-                &db_path.to_string_lossy(),
-                DEFAULT_KEYRING_SERVICE,
-                Some(&notify_endpoint),
-                Some(&approval_endpoint),
-                helper_resolution.found,
-                helper_resolution.warning,
-            )?;
+            let command_path = helper_resolution.path.to_string_lossy();
+            let db_path = db_path.to_string_lossy();
+            let mcp_config = core.mcp_config_bundle(McpConfigRequest {
+                command_path: &command_path,
+                db_path: &db_path,
+                keyring_service: DEFAULT_KEYRING_SERVICE,
+                notify_endpoint: Some(&notify_endpoint),
+                approval_endpoint: Some(&approval_endpoint),
+                helper_found: helper_resolution.found,
+                helper_warning: helper_resolution.warning,
+            })?;
 
             start_notify_listener(app.handle().clone(), notify_endpoint);
 
@@ -347,30 +353,30 @@ async fn run_windows_notify_listener(
         first_instance = false;
         server.connect().await?;
 
-            let app = app.clone();
-            tokio::spawn(async move {
-                let mut line = String::new();
-                let mut reader = BufReader::new(server);
-                if reader.read_line(&mut line).await.is_ok() {
-                    let trimmed = line.trim();
-                    if trimmed == LOG_NOTIFICATION_PAYLOAD || trimmed.is_empty() {
-                        let _ = app.emit("log-updated", ());
-                    } else if trimmed == NOTIFY_HEALTH_CHECK_KIND {
-                        use tokio::io::AsyncWriteExt;
+        let app = app.clone();
+        tokio::spawn(async move {
+            let mut line = String::new();
+            let mut reader = BufReader::new(server);
+            if reader.read_line(&mut line).await.is_ok() {
+                let trimmed = line.trim();
+                if trimmed == LOG_NOTIFICATION_PAYLOAD || trimmed.is_empty() {
+                    let _ = app.emit("log-updated", ());
+                } else if trimmed == NOTIFY_HEALTH_CHECK_KIND {
+                    use tokio::io::AsyncWriteExt;
 
-                        let payload = serde_json::json!({
-                            "kind": NOTIFY_HEALTH_OK_KIND
-                        })
-                        .to_string();
-                        let server = reader.into_inner();
-                        let mut server = server;
-                        let _ = server.write_all(payload.as_bytes()).await;
-                        let _ = server.write_all(b"\n").await;
-                        let _ = server.flush().await;
-                    }
+                    let payload = serde_json::json!({
+                        "kind": NOTIFY_HEALTH_OK_KIND
+                    })
+                    .to_string();
+                    let server = reader.into_inner();
+                    let mut server = server;
+                    let _ = server.write_all(payload.as_bytes()).await;
+                    let _ = server.write_all(b"\n").await;
+                    let _ = server.flush().await;
                 }
-            });
-        }
+            }
+        });
+    }
 }
 
 struct HelperResolution {
@@ -403,7 +409,11 @@ fn resolve_stdio_helper_path(app: &tauri::AppHandle, current_exe: &Path) -> Help
     }
 }
 
-fn find_helper_path(app: &tauri::AppHandle, current_exe: &Path, helper_name: &str) -> Option<PathBuf> {
+fn find_helper_path(
+    app: &tauri::AppHandle,
+    current_exe: &Path,
+    helper_name: &str,
+) -> Option<PathBuf> {
     if let Some(parent) = current_exe.parent() {
         let sibling = parent.join(helper_name);
         if sibling.exists() {

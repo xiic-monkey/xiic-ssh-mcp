@@ -12,8 +12,7 @@ use crate::models::{
     ApprovalMode, ApprovalOperationMetadata, CreateSessionResult, DownloadFileArgs,
     DownloadFileResult, DownloadToLocalArgs, DownloadToLocalResult, ExecuteCommandArgs,
     ExecuteCommandResult, OperationContext, PendingToolCall, RuleDecision, ToolCall,
-    UploadFileArgs, UploadFileResult, UploadLocalFileArgs, UploadLocalFileResult,
-    WhitelistMode,
+    UploadFileArgs, UploadFileResult, UploadLocalFileArgs, UploadLocalFileResult, WhitelistMode,
 };
 use crate::whitelist::WhitelistChecker;
 
@@ -38,7 +37,7 @@ enum DispatchResult {
     NoResponse,
     NeedsApproval {
         flow: ApprovalFlow,
-        pending: PendingToolCall,
+        pending: Box<PendingToolCall>,
     },
 }
 
@@ -351,15 +350,6 @@ impl McpServer {
         let ctx = self.build_context(&tool_call)?;
 
         let check_result = self.checker.check(&ctx)?;
-        let _ = std::fs::write(
-            "/tmp/xiic-ssh-debug.log",
-            format!(
-                "[pid={}] DEBUG whitelist check for '{}': {:?} (ctx: instance_id={:?}, use_system={})\n",
-                std::process::id(),
-                ctx.tool_name, check_result, ctx.instance_id,
-                crate::settings::load_settings().use_system_approval,
-            ),
-        );
         match check_result {
             RuleDecision::Allow => {
                 eprintln!(
@@ -400,12 +390,12 @@ impl McpServer {
                 });
 
                 let approval = ApprovalOperationMetadata::from(&ctx);
-                let pending = PendingToolCall {
+                let pending = Box::new(PendingToolCall {
                     id,
                     tool_call,
                     operation: ctx,
                     approval,
-                };
+                });
 
                 // 如果用户启用了系统弹窗审批，则强制使用本地审批流，
                 // 这样 local_approval.request() 会读取设置并弹出原生对话框。

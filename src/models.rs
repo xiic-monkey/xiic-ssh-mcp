@@ -112,6 +112,17 @@ pub struct McpConfigBundle {
     pub helper_warning: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct McpConfigRequest<'a> {
+    pub command_path: &'a str,
+    pub db_path: &'a str,
+    pub keyring_service: &'a str,
+    pub notify_endpoint: Option<&'a str>,
+    pub approval_endpoint: Option<&'a str>,
+    pub helper_found: bool,
+    pub helper_warning: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListServersResult {
     pub servers: Vec<InstanceSummary>,
@@ -188,30 +199,20 @@ pub struct DownloadToLocalResult {
     pub bytes_written: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UploadEncoding {
+    #[default]
     Utf8,
     Base64,
 }
 
-impl Default for UploadEncoding {
-    fn default() -> Self {
-        Self::Utf8
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DownloadEncoding {
     Utf8,
+    #[default]
     Base64,
-}
-
-impl Default for DownloadEncoding {
-    fn default() -> Self {
-        Self::Base64
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,7 +253,7 @@ pub enum RuleType {
 }
 
 impl RuleType {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_db_value(s: &str) -> Option<Self> {
         match s {
             "tool" => Some(Self::Tool),
             "command" => Some(Self::Command),
@@ -280,7 +281,7 @@ pub enum RuleAction {
 }
 
 impl RuleAction {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_db_value(s: &str) -> Option<Self> {
         match s {
             "allow" => Some(Self::Allow),
             "deny" => Some(Self::Deny),

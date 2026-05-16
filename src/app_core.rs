@@ -16,9 +16,9 @@ use crate::local_ipc::send_notification;
 use crate::models::{
     AuthKind, CreateSessionResult, DownloadFileArgs, DownloadFileResult, DownloadToLocalArgs,
     DownloadToLocalResult, ExecuteCommandArgs, ExecuteCommandResult, InstanceDraft,
-    InstanceSummary, ListServersResult, McpConfigBundle, OperationLogEntry, RuleAction, RuleType,
-    SecretPayload, StoredInstance, TestConnectionResult, UploadFileArgs, UploadFileResult,
-    UploadLocalFileArgs, UploadLocalFileResult, WhitelistRule,
+    InstanceSummary, ListServersResult, McpConfigBundle, McpConfigRequest, OperationLogEntry,
+    RuleAction, RuleType, SecretPayload, StoredInstance, TestConnectionResult, UploadFileArgs,
+    UploadFileResult, UploadLocalFileArgs, UploadLocalFileResult, WhitelistRule,
 };
 use crate::storage::InstanceStore;
 use crate::whitelist::WhitelistChecker;
@@ -170,29 +170,20 @@ impl DesktopCore {
         }
     }
 
-    pub fn mcp_config_bundle(
-        &self,
-        command_path: &str,
-        db_path: &str,
-        keyring_service: &str,
-        notify_endpoint: Option<&str>,
-        approval_endpoint: Option<&str>,
-        helper_found: bool,
-        helper_warning: Option<String>,
-    ) -> Result<McpConfigBundle> {
+    pub fn mcp_config_bundle(&self, request: McpConfigRequest<'_>) -> Result<McpConfigBundle> {
         let mut args = vec![
             "--db-path".to_string(),
-            db_path.to_string(),
+            request.db_path.to_string(),
             "--keyring-service".to_string(),
-            keyring_service.to_string(),
+            request.keyring_service.to_string(),
         ];
-        if let Some(endpoint) = notify_endpoint {
+        if let Some(endpoint) = request.notify_endpoint {
             args.push("--notify-socket".to_string());
             args.push(endpoint.to_string());
         }
         args.push("--approval-mode".to_string());
         args.push("auto".to_string());
-        if let Some(endpoint) = approval_endpoint {
+        if let Some(endpoint) = request.approval_endpoint {
             args.push("--approval-endpoint".to_string());
             args.push(endpoint.to_string());
         }
@@ -200,7 +191,7 @@ impl DesktopCore {
         let stdio_json = serde_json::to_string_pretty(&serde_json::json!({
             "mcpServers": {
                 "xiic-ssh": {
-                    "command": command_path,
+                    "command": request.command_path,
                     "args": args,
                     "env": {
                         "HOME": env::var("HOME").unwrap_or_else(|_| "/home".to_string()),
@@ -211,11 +202,11 @@ impl DesktopCore {
         }))?;
 
         Ok(McpConfigBundle {
-            command: command_path.to_string(),
+            command: request.command_path.to_string(),
             args,
             stdio_json,
-            helper_found,
-            helper_warning,
+            helper_found: request.helper_found,
+            helper_warning: request.helper_warning,
         })
     }
 
@@ -428,10 +419,8 @@ impl DesktopCore {
     }
 
     pub fn download_file(&self, args: DownloadFileArgs) -> Result<DownloadFileResult> {
-        let resolved_local_path = resolve_download_path(
-            &args.remote_path,
-            args.local_path.as_deref(),
-        )?;
+        let resolved_local_path =
+            resolve_download_path(&args.remote_path, args.local_path.as_deref())?;
         let (instance_id, session_id, remote_path, result) = {
             let mut sessions = self
                 .sessions
@@ -464,7 +453,10 @@ impl DesktopCore {
                 })?;
             }
             std::fs::write(&resolved_local_path, &bytes).with_context(|| {
-                format!("failed to write local path '{}'", resolved_local_path.display())
+                format!(
+                    "failed to write local path '{}'",
+                    resolved_local_path.display()
+                )
             })?;
 
             (
@@ -504,6 +496,10 @@ impl DesktopCore {
     }
 
     pub fn download_to_local(&self, args: DownloadToLocalArgs) -> Result<DownloadToLocalResult> {
+        if !args.overwrite && Path::new(&args.local_path).exists() {
+            bail!("local path '{}' already exists", args.local_path);
+        }
+
         let result = self.download_file(DownloadFileArgs {
             session_id: args.session_id,
             remote_path: args.remote_path.clone(),
@@ -791,4 +787,37 @@ fn verify_host_key(session: &Session, instance: &ResolvedInstance) -> Result<()>
 fn known_hosts_path() -> Result<PathBuf> {
     let home = env::var("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home).join(".ssh").join("known_hosts"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_to_local_rejects_existing_file_when_overwrite_disabled() {
+        let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).expect("test dir should be created");
+        let db_path = test_dir.join("instances.sqlite3");
+        let local_path = test_dir.join("existing.txt");
+        std::fs::write(&local_path, "keep me").expect("existing file should be written");
+
+        let core = DesktopCore::new(db_path, "com.xiic.ssh-manager.test")
+            .expect("test core should initialize");
+        let err = core
+            .download_to_local(DownloadToLocalArgs {
+                session_id: "missing-session".to_string(),
+                remote_path: "/tmp/remote.txt".to_string(),
+                local_path: local_path.display().to_string(),
+                overwrite: false,
+            })
+            .expect_err("existing local file should not be overwritten");
+
+        assert!(err.to_string().contains("already exists"));
+        assert_eq!(
+            std::fs::read_to_string(&local_path).expect("existing file should still be readable"),
+            "keep me"
+        );
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
 }

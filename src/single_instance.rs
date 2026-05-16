@@ -52,7 +52,10 @@ impl SingleInstanceGuard {
             }
         }
 
-        bail!("failed to acquire single-instance lock '{}'", path.display())
+        bail!(
+            "failed to acquire single-instance lock '{}'",
+            path.display()
+        )
     }
 }
 

@@ -75,21 +75,17 @@ fn main() {
 
             let endpoint = approval_endpoint()?;
             let data_dir = shared_app_data_dir()?;
-            let instance_lock = match SingleInstanceGuard::acquire(
-                &data_dir.join("approval.lock"),
-                || approval_server_healthy(&endpoint),
-            )? {
-                Some(lock) => lock,
-                None => std::process::exit(0),
-            };
+            let instance_lock =
+                match SingleInstanceGuard::acquire(&data_dir.join("approval.lock"), || {
+                    approval_server_healthy(&endpoint)
+                })? {
+                    Some(lock) => lock,
+                    None => std::process::exit(0),
+                };
 
             remove_stale_endpoint(&endpoint);
 
-            start_approval_listener(
-                app.handle().clone(),
-                approvals_for_setup.clone(),
-                endpoint,
-            );
+            start_approval_listener(app.handle().clone(), approvals_for_setup.clone(), endpoint);
 
             app.manage(AppState {
                 approvals: approvals_for_setup.clone(),
@@ -104,8 +100,10 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(move |_app, event| {
-            if matches!(event, tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. })
-                && let Ok(mut approvals) = approvals_for_exit.lock()
+            if matches!(
+                event,
+                tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
+            ) && let Ok(mut approvals) = approvals_for_exit.lock()
             {
                 approvals.reject_all();
             }
@@ -221,11 +219,10 @@ where
     let raw = read_raw_request(&mut stream)?;
 
     // 先检查 kind 字段，避免将非 ApprovalRequest 格式的消息强制转换失败
-    let kind: String =
-        serde_json::from_str::<serde_json::Value>(&raw)
-            .ok()
-            .and_then(|v| v.get("kind").and_then(|k| k.as_str().map(String::from)))
-            .unwrap_or_default();
+    let kind: String = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("kind").and_then(|k| k.as_str().map(String::from)))
+        .unwrap_or_default();
 
     if kind == APPROVAL_HEALTH_CHECK_KIND {
         stream.write_all(
@@ -315,11 +312,10 @@ async fn handle_windows_approval_pipe(
         line.trim().to_string()
     };
 
-    let kind: String =
-        serde_json::from_str::<serde_json::Value>(&raw)
-            .ok()
-            .and_then(|v| v.get("kind").and_then(|k| k.as_str().map(String::from)))
-            .unwrap_or_default();
+    let kind: String = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| v.get("kind").and_then(|k| k.as_str().map(String::from)))
+        .unwrap_or_default();
 
     if kind == APPROVAL_HEALTH_CHECK_KIND {
         let payload = serde_json::json!({

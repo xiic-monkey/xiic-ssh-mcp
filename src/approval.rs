@@ -2,8 +2,8 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
 use std::sync::mpsc::SyncSender;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -61,10 +61,10 @@ impl LocalApprovalClient {
                 return Ok(accepted);
             }
 
-            if !approval_server_healthy(endpoint) {
-                if let Err(e) = launch_desktop_app_once(endpoint) {
-                    eprintln!("[xiic-ssh-mcp] 启动审批 App 失败: {e:#}");
-                }
+            if !approval_server_healthy(endpoint)
+                && let Err(e) = launch_desktop_app_once(endpoint)
+            {
+                eprintln!("[xiic-ssh-mcp] 启动审批 App 失败: {e:#}");
             }
 
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -114,9 +114,7 @@ impl LocalApprovalClient {
                     thread::sleep(Duration::from_millis(200));
                     waited += 1;
                 }
-                eprintln!(
-                    "[xiic-ssh-mcp] 预启动完成但审批 App 未在 10 秒内就绪，后续将自动重试"
-                );
+                eprintln!("[xiic-ssh-mcp] 预启动完成但审批 App 未在 10 秒内就绪，后续将自动重试");
             }
             Err(e) => {
                 eprintln!("[xiic-ssh-mcp] 预启动审批 App 失败: {e:#}");
@@ -172,7 +170,10 @@ pub fn approval_message(metadata: &ApprovalOperationMetadata) -> String {
             "是否允许从连接 '{}' 下载文件？\n\n远端：{}\n本地：{}",
             metadata.instance_id.as_deref().unwrap_or("-"),
             metadata.remote_path.as_deref().unwrap_or("-"),
-            metadata.local_path.as_deref().unwrap_or("默认 Downloads 目录"),
+            metadata
+                .local_path
+                .as_deref()
+                .unwrap_or("默认 Downloads 目录"),
         ),
         "download_to_local" => format!(
             "是否允许从连接 '{}' 下载文件到本地？\n\n{}",
@@ -307,6 +308,12 @@ impl ApprovalQueue {
     }
 }
 
+impl Default for ApprovalQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn launch_desktop_app() -> Result<()> {
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
     let approval_app = resolve_approval_binary(&current_exe)
@@ -322,7 +329,7 @@ fn launch_desktop_app() -> Result<()> {
 
         let _vite_child = Command::new("npx")
             .args(["vite", "--port", "1430"])
-            .current_dir(&repo_root)
+            .current_dir(repo_root)
             .spawn()
             .context("failed to launch Vite dev server")?;
 
@@ -340,7 +347,9 @@ fn launch_desktop_app() -> Result<()> {
         if ready {
             eprintln!("[xiic-ssh-mcp] Vite 开发服务器已就绪");
         } else {
-            eprintln!("[xiic-ssh-mcp] 警告: Vite 开发服务器未能在 15 秒内就绪，审批窗口可能无法正常显示");
+            eprintln!(
+                "[xiic-ssh-mcp] 警告: Vite 开发服务器未能在 15 秒内就绪，审批窗口可能无法正常显示"
+            );
         }
     }
 
@@ -388,7 +397,9 @@ fn approval_binary_name() -> &'static str {
 
 fn binary_requires_dev_server(path: &Path) -> bool {
     matches!(
-        path.parent().and_then(|dir| dir.file_name()).and_then(|name| name.to_str()),
+        path.parent()
+            .and_then(|dir| dir.file_name())
+            .and_then(|name| name.to_str()),
         Some("debug")
     )
 }
@@ -544,14 +555,14 @@ mod tests {
         assert_eq!(resolved.request_id, "req-1");
         assert!(resolved.accepted);
         assert_eq!(resolved.pending_count, 1);
-        assert_eq!(rx1.recv().unwrap(), true);
+        assert!(rx1.recv().unwrap());
 
         let next = next.expect("next request should become active");
         assert_eq!(next.request.request_id, "req-2");
         assert_eq!(next.pending_count, 0);
 
         queue.reject_all();
-        assert_eq!(rx2.recv().unwrap(), false);
+        assert!(!rx2.recv().unwrap());
         assert_eq!(queue.pending_count(), 0);
     }
 

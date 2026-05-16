@@ -50,6 +50,8 @@ Xiic SSH MCP 是一个本地 MCP 服务器，为 Cursor、Claude Desktop 等 AI 
 - 命中 Deny 规则 → 直接拒绝
 - 部分维度未覆盖 → 进入审批流程
 
+`execute_command` 的命令白名单会先按未引用、未转义的 shell 连接符（`;`、`&`、`&&`、`||`、`|`、换行）分段，再匹配 command 规则。每一段都命中 Allow 时才会自动放行；任一段命中 Deny 则直接拒绝；任一段未命中 Allow 则进入审批。引号和反斜杠转义内的连接符不会触发分段。命令替换、反引号、子 shell/group、重定向、here-doc 等复杂 shell 语法默认进入审批。
+
 ### 审批
 
 当操作未被白名单放行时，进入审批流程。支持两种审批方式：
