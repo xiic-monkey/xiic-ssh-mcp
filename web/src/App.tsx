@@ -31,6 +31,7 @@ type InstanceDraft = {
   notes: string;
   password: string;
   private_key: string;
+  private_key_path: string;
   passphrase: string;
   keep_existing_secret: boolean;
 };
@@ -80,6 +81,7 @@ const emptyDraft = (): InstanceDraft => ({
   notes: "",
   password: "",
   private_key: "",
+  private_key_path: "",
   passphrase: "",
   keep_existing_secret: false,
 });
@@ -96,6 +98,7 @@ function fromSummary(instance: InstanceSummary): InstanceDraft {
     notes: instance.notes ?? "",
     password: "",
     private_key: "",
+    private_key_path: "",
     passphrase: "",
     keep_existing_secret: instance.has_secret,
   };
@@ -134,6 +137,26 @@ export default function App() {
     void loadData();
   }, []);
 
+  async function hydrateDraft(instance: InstanceSummary) {
+    const baseDraft = fromSummary(instance);
+    if (instance.auth_kind !== "private_key") {
+      setDraft(baseDraft);
+      return;
+    }
+
+    try {
+      const privateKeyPath = await invoke<string | null>("get_private_key_path", {
+        instanceId: instance.instance_id,
+      });
+      setDraft({
+        ...baseDraft,
+        private_key_path: privateKeyPath ?? "",
+      });
+    } catch {
+      setDraft(baseDraft);
+    }
+  }
+
   async function loadData() {
     try {
       const [loadedInstances, loadedConfigs] = await Promise.all([
@@ -147,19 +170,21 @@ export default function App() {
       if (selectedId) {
         const selected = loadedInstances.find((item) => item.instance_id === selectedId);
         if (selected) {
-          setDraft(fromSummary(selected));
+          await hydrateDraft(selected);
+          setTargetInput(formatTarget(selected.username, selected.host, selected.port));
           setIsCreating(false);
           return;
         }
       }
 
       if (loadedInstances.length > 0) {
-        setSelectedId(loadedInstances[0].instance_id);
-        setDraft(fromSummary(loadedInstances[0]));
+        const first = loadedInstances[0];
+        setSelectedId(first.instance_id);
+        await hydrateDraft(first);
         setTargetInput(formatTarget(
-          loadedInstances[0].username,
-          loadedInstances[0].host,
-          loadedInstances[0].port,
+          first.username,
+          first.host,
+          first.port,
         ));
         setIsCreating(false);
       } else {
@@ -254,7 +279,7 @@ export default function App() {
 
   function selectInstance(instance: InstanceSummary) {
     setSelectedId(instance.instance_id);
-    setDraft(fromSummary(instance));
+    void hydrateDraft(instance);
     setTargetInput(formatTarget(instance.username, instance.host, instance.port));
     setIsCreating(false);
     setStatus(`正在编辑 ${instance.name}。`);
@@ -262,12 +287,20 @@ export default function App() {
   }
 
   async function handleSave() {
+    if (draft.auth_kind === "private_key" && draft.private_key && draft.private_key_path) {
+      setStatus("私钥内容和私钥文件路径不能同时填写。请二选一。");
+      setStatusTone("danger");
+      return;
+    }
     setSaving(true);
     try {
       const saved = await invoke<InstanceSummary>("save_instance", { draft });
       await loadData();
       setSelectedId(saved.instance_id);
-      setDraft(fromSummary(saved));
+      setDraft({
+        ...fromSummary(saved),
+        private_key_path: draft.private_key_path,
+      });
       setTargetInput(formatTarget(saved.username, saved.host, saved.port));
       setIsCreating(false);
       setStatus(`已保存 ${saved.name}。`);
@@ -281,6 +314,11 @@ export default function App() {
   }
 
   async function handleTest() {
+    if (draft.auth_kind === "private_key" && draft.private_key && draft.private_key_path) {
+      setStatus("私钥内容和私钥文件路径不能同时填写。请二选一。");
+      setStatusTone("danger");
+      return;
+    }
     setTesting(true);
     try {
       const result = await invoke<TestConnectionResult>("test_connection", { draft });
@@ -383,6 +421,26 @@ export default function App() {
 
   const requiresPassword = draft.auth_kind === "password";
   const requiresKey = draft.auth_kind === "private_key";
+  const hasPrivateKeyConflict =
+    requiresKey && draft.private_key.length > 0 && draft.private_key_path.length > 0;
+
+  async function handlePickPrivateKeyFile() {
+    try {
+      const selectedPath = await invoke<string | null>("pick_private_key_file");
+      if (!selectedPath) {
+        return;
+      }
+      setDraft((current) => ({
+        ...current,
+        private_key_path: selectedPath,
+      }));
+      setStatus("已选择私钥文件。");
+      setStatusTone("success");
+    } catch (error) {
+      setStatus(asMessage(error));
+      setStatusTone("danger");
+    }
+  }
 
   function applyTargetInput() {
     const parsed = parseSshTarget(targetInput);
@@ -402,8 +460,11 @@ export default function App() {
     setStatusTone("success");
   }
 
-  async function handleDragMouseDown(event: React.MouseEvent<HTMLDivElement>) {
+  async function handleDragMouseDown(event: React.MouseEvent<HTMLElement>) {
     if (event.button !== 0) {
+      return;
+    }
+    if (event.target !== event.currentTarget) {
       return;
     }
 
@@ -416,14 +477,8 @@ export default function App() {
 
   return (
     <div className="shell">
-      <div
-        aria-hidden="true"
-        className="drag-strip"
-        onMouseDown={(event) => void handleDragMouseDown(event)}
-      />
-
       <aside className="sidebar">
-        <div className="sidebar-top">
+        <div className="sidebar-top" onMouseDown={(event) => void handleDragMouseDown(event)}>
           <div className="brand">
             <div className="brand-mark" aria-hidden="true">
               <svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
@@ -496,10 +551,11 @@ export default function App() {
             onToggleSystemApproval={handleToggleSystemApproval}
             onRestartMcp={handleRestartMcp}
             onClose={closeSettings}
+            onDragMouseDown={(event) => void handleDragMouseDown(event)}
           />
         ) : (
         <section className="panel-main">
-          <div className="panel-header">
+          <div className="panel-header" onMouseDown={(event) => void handleDragMouseDown(event)}>
             <div>
               <h2>{isCreating ? "新的 SSH 配置" : draft.name || draft.instance_id}</h2>
             </div>
@@ -658,7 +714,38 @@ export default function App() {
               {requiresKey ? (
                 <>
                   <label className="field-block">
-                    <span>SSH 私钥</span>
+                    <span>私钥文件</span>
+                    <div className="target-row">
+                      <input
+                        placeholder={
+                          isCreating
+                            ? "选择本地私钥文件"
+                            : "留空则保留已保存的私钥文件路径"
+                        }
+                        readOnly
+                        value={draft.private_key_path}
+                      />
+                      <div className="inline-actions">
+                        <button
+                          className="secondary-button"
+                          onClick={() => void handlePickPrivateKeyFile()}
+                          type="button"
+                        >
+                          选择文件
+                        </button>
+                        <button
+                          className="ghost-button"
+                          disabled={!draft.private_key_path}
+                          onClick={() => setDraft({ ...draft, private_key_path: "" })}
+                          type="button"
+                        >
+                          清空
+                        </button>
+                      </div>
+                    </div>
+                  </label>
+                  <label className="field-block">
+                    <span>直接粘贴私钥内容</span>
                     <textarea
                       onChange={(event) => setDraft({ ...draft, private_key: event.target.value })}
                       placeholder={
@@ -670,6 +757,9 @@ export default function App() {
                       value={draft.private_key}
                     />
                   </label>
+                  {hasPrivateKeyConflict ? (
+                    <div className="inline-error">私钥内容和私钥文件路径不能同时填写，请保留其中一种。</div>
+                  ) : null}
                   <label className="field-block">
                     <span>私钥口令</span>
                     <input
@@ -864,6 +954,7 @@ function SettingsPanel({
   onToggleSystemApproval,
   onRestartMcp,
   onClose,
+  onDragMouseDown,
 }: {
   appSettings: AppSettings | null;
   saving: boolean;
@@ -872,6 +963,7 @@ function SettingsPanel({
   onToggleSystemApproval: (useSystem: boolean) => void;
   onRestartMcp: () => Promise<void>;
   onClose: () => void;
+  onDragMouseDown: (event: React.MouseEvent<HTMLElement>) => void;
 }) {
   function restartButtonContent() {
     if (restartingMcp) {
@@ -897,7 +989,7 @@ function SettingsPanel({
 
   return (
     <section className="panel-main">
-      <div className="panel-header">
+      <div className="panel-header" onMouseDown={onDragMouseDown}>
         <div>
           <h2>软件设置</h2>
         </div>

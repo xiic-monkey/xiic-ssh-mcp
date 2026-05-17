@@ -68,6 +68,7 @@ pub struct InstanceDraft {
     pub notes: Option<String>,
     pub password: Option<String>,
     pub private_key: Option<String>,
+    pub private_key_path: Option<String>,
     pub passphrase: Option<String>,
     #[serde(default)]
     pub keep_existing_secret: bool,
@@ -82,6 +83,7 @@ impl InstanceDraft {
         self.notes = trim_to_none(self.notes);
         self.password = trim_to_none(self.password);
         self.private_key = trim_to_none(self.private_key);
+        self.private_key_path = trim_to_none(self.private_key_path);
         self.passphrase = trim_to_none(self.passphrase);
         if self.port == 0 {
             self.port = 22;
@@ -90,10 +92,11 @@ impl InstanceDraft {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SecretPayload {
     pub password: Option<String>,
     pub private_key: Option<String>,
+    pub private_key_path: Option<String>,
     pub passphrase: Option<String>,
 }
 
@@ -409,4 +412,34 @@ fn trim_to_none(value: Option<String>) -> Option<String> {
             Some(trimmed)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuthKind, InstanceDraft};
+
+    #[test]
+    fn normalize_trims_private_key_path() {
+        let draft = InstanceDraft {
+            instance_id: " prod ".to_string(),
+            name: " Production ".to_string(),
+            host: " example.com ".to_string(),
+            port: 22,
+            username: " root ".to_string(),
+            auth_kind: AuthKind::PrivateKey,
+            host_key_check: false,
+            notes: None,
+            password: None,
+            private_key: None,
+            private_key_path: Some("  /Users/test/.ssh/id_ed25519  ".to_string()),
+            passphrase: None,
+            keep_existing_secret: false,
+        }
+        .normalize();
+
+        assert_eq!(
+            draft.private_key_path.as_deref(),
+            Some("/Users/test/.ssh/id_ed25519")
+        );
+    }
 }

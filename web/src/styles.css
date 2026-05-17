@@ -45,14 +45,6 @@ button {
   background: #ffffff;
 }
 
-.drag-strip {
-  position: absolute;
-  inset: 0 0 auto 0;
-  height: 24px;
-  z-index: 5;
-  background: transparent;
-}
-
 .sidebar {
   display: flex;
   flex-direction: column;
@@ -67,6 +59,7 @@ button {
   padding-top: 16px;
   padding-left: 60px;
   min-height: 54px;
+  cursor: grab;
 }
 
 .brand,
@@ -213,6 +206,13 @@ button {
   margin-bottom: 12px;
   padding: 0 0 10px;
   border-bottom: 1px solid #e5e8ee;
+  cursor: grab;
+}
+
+.brand,
+.panel-header > *,
+.header-actions {
+  cursor: default;
 }
 
 .header-actions {
@@ -310,6 +310,16 @@ select {
   gap: 8px;
 }
 
+.inline-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.inline-actions .ghost-button,
+.inline-actions .secondary-button {
+  white-space: nowrap;
+}
+
 textarea {
   resize: none;
 }
@@ -340,6 +350,12 @@ input:disabled {
 
 .field-block {
   margin-bottom: 6px;
+}
+
+.inline-error {
+  margin: 4px 0 8px;
+  color: #9e4538;
+  font-size: 0.78rem;
 }
 
 .action-row {

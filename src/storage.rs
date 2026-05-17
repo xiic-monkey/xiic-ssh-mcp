@@ -417,3 +417,56 @@ fn auth_kind_from_str(value: &str) -> AuthKind {
 
 #[allow(dead_code)]
 fn _ensure_send_sync(_: &Path) {}
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+
+    use super::InstanceStore;
+    use crate::models::{AuthKind, InstanceDraft, SecretPayload};
+    use uuid::Uuid;
+
+    #[test]
+    fn secret_round_trip_preserves_private_key_path() {
+        let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-storage-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).expect("test dir should be created");
+        let db_path = test_dir.join("instances.sqlite3");
+
+        let store = InstanceStore::new(db_path).expect("store should initialize");
+        store
+            .save_instance(&InstanceDraft {
+                instance_id: "prod".to_string(),
+                name: "Production".to_string(),
+                host: "example.com".to_string(),
+                port: 22,
+                username: "root".to_string(),
+                auth_kind: AuthKind::PrivateKey,
+                host_key_check: false,
+                notes: None,
+                password: None,
+                private_key: None,
+                private_key_path: None,
+                passphrase: None,
+                keep_existing_secret: false,
+            })
+            .expect("instance should be saved");
+        let secret = SecretPayload {
+            password: None,
+            private_key: None,
+            private_key_path: Some("/Users/test/.ssh/id_ed25519".to_string()),
+            passphrase: Some("hunter2".to_string()),
+        };
+
+        store
+            .save_secret("prod", &secret)
+            .expect("secret should be saved");
+        let loaded = store
+            .load_secret("prod")
+            .expect("secret should load")
+            .expect("secret should exist");
+
+        assert_eq!(loaded, secret);
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+}

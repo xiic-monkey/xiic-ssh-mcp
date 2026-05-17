@@ -60,6 +60,25 @@ fn test_connection(
 }
 
 #[tauri::command]
+fn get_private_key_path(
+    state: State<'_, DesktopState>,
+    instance_id: String,
+) -> Result<Option<String>, String> {
+    state
+        .core
+        .get_private_key_path(&instance_id)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn pick_private_key_file() -> Result<Option<String>, String> {
+    let path = rfd::FileDialog::new()
+        .set_title("选择 SSH 私钥文件")
+        .pick_file();
+    Ok(path.map(|path| path.to_string_lossy().to_string()))
+}
+
+#[tauri::command]
 fn get_operation_logs(
     state: State<'_, DesktopState>,
     limit: Option<u64>,
@@ -208,6 +227,8 @@ fn main() {
             save_instance,
             delete_instance,
             test_connection,
+            get_private_key_path,
+            pick_private_key_file,
             get_operation_logs,
             get_operation_logs_since,
             get_mcp_configs,

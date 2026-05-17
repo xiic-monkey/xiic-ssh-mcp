@@ -129,8 +129,10 @@ impl DesktopCore {
     pub fn test_connection(&self, draft: InstanceDraft) -> Result<TestConnectionResult> {
         let draft = draft.normalize();
         self.validate_metadata(&draft)?;
-        let has_inline_secret =
-            draft.password.is_some() || draft.private_key.is_some() || draft.passphrase.is_some();
+        let has_inline_secret = draft.password.is_some()
+            || draft.private_key.is_some()
+            || draft.private_key_path.is_some()
+            || draft.passphrase.is_some();
         let has_saved_instance =
             !draft.instance_id.is_empty() && self.store.get_instance(&draft.instance_id)?.is_some();
         let should_try_saved_secret =
@@ -590,6 +592,12 @@ impl DesktopCore {
         self.store.has_secret(instance_id)
     }
 
+    pub fn get_private_key_path(&self, instance_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .load_secret(instance_id)?
+            .and_then(|secret| secret.private_key_path))
+    }
+
     fn secret_for_draft(
         &self,
         draft: &InstanceDraft,
@@ -598,16 +606,19 @@ impl DesktopCore {
     ) -> Result<SecretPayload> {
         let password = draft.password.clone();
         let private_key = draft.private_key.clone();
+        let private_key_path = draft.private_key_path.clone();
         let passphrase = draft.passphrase.clone();
 
         let provided_secret = SecretPayload {
             password: password.clone(),
             private_key: private_key.clone(),
+            private_key_path: private_key_path.clone(),
             passphrase: passphrase.clone(),
         };
 
         let has_provided_secret = provided_secret.password.is_some()
             || provided_secret.private_key.is_some()
+            || provided_secret.private_key_path.is_some()
             || provided_secret.passphrase.is_some();
 
         let resolved = if has_provided_secret {
@@ -618,6 +629,7 @@ impl DesktopCore {
             existing_secret.cloned().unwrap_or(SecretPayload {
                 password: None,
                 private_key: None,
+                private_key_path: None,
                 passphrase: None,
             })
         } else {
@@ -631,8 +643,13 @@ impl DesktopCore {
                 }
             }
             AuthKind::PrivateKey => {
-                if resolved.private_key.is_none() {
-                    bail!("private key authentication requires a private_key");
+                if resolved.private_key.is_some() && resolved.private_key_path.is_some() {
+                    bail!(
+                        "private key authentication requires either private_key or private_key_path, not both"
+                    );
+                }
+                if resolved.private_key.is_none() && resolved.private_key_path.is_none() {
+                    bail!("private key authentication requires a private_key or private_key_path");
                 }
             }
         }
@@ -705,23 +722,48 @@ fn connect(instance: &ResolvedInstance) -> Result<Session> {
     }
 
     match instance.metadata.auth_kind {
-        AuthKind::PrivateKey => session
-            .userauth_pubkey_memory(
-                &instance.metadata.username,
-                None,
-                instance
-                    .secret
-                    .private_key
-                    .as_deref()
-                    .ok_or_else(|| anyhow!("missing private_key"))?,
-                instance.secret.passphrase.as_deref(),
-            )
-            .with_context(|| {
-                format!(
-                    "private key authentication failed for '{}@{}'",
-                    instance.metadata.username, instance.metadata.host
-                )
-            })?,
+        AuthKind::PrivateKey => {
+            let private_key = instance.secret.private_key.as_deref();
+            let private_key_path = instance.secret.private_key_path.as_deref();
+
+            if private_key.is_some() && private_key_path.is_some() {
+                bail!(
+                    "private key authentication requires either private_key or private_key_path, not both"
+                );
+            }
+
+            if let Some(private_key_path) = private_key_path {
+                session
+                    .userauth_pubkey_file(
+                        &instance.metadata.username,
+                        None,
+                        Path::new(private_key_path),
+                        instance.secret.passphrase.as_deref(),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "private key authentication failed for '{}@{}'",
+                            instance.metadata.username, instance.metadata.host
+                        )
+                    })?;
+            } else if let Some(private_key) = private_key {
+                session
+                    .userauth_pubkey_memory(
+                        &instance.metadata.username,
+                        None,
+                        private_key,
+                        instance.secret.passphrase.as_deref(),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "private key authentication failed for '{}@{}'",
+                            instance.metadata.username, instance.metadata.host
+                        )
+                    })?;
+            } else {
+                bail!("private key authentication requires a private_key or private_key_path");
+            }
+        }
         AuthKind::Password => session
             .userauth_password(
                 &instance.metadata.username,
@@ -793,16 +835,24 @@ fn known_hosts_path() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn download_to_local_rejects_existing_file_when_overwrite_disabled() {
+    fn make_test_core() -> (DesktopCore, PathBuf) {
         let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&test_dir).expect("test dir should be created");
         let db_path = test_dir.join("instances.sqlite3");
+        let core = DesktopCore::new(
+            db_path,
+            format!("com.xiic.ssh-manager.test.{}", Uuid::new_v4()),
+        )
+        .expect("test core should initialize");
+        (core, test_dir)
+    }
+
+    #[test]
+    fn download_to_local_rejects_existing_file_when_overwrite_disabled() {
+        let (core, test_dir) = make_test_core();
         let local_path = test_dir.join("existing.txt");
         std::fs::write(&local_path, "keep me").expect("existing file should be written");
 
-        let core = DesktopCore::new(db_path, "com.xiic.ssh-manager.test")
-            .expect("test core should initialize");
         let err = core
             .download_to_local(DownloadToLocalArgs {
                 session_id: "missing-session".to_string(),
@@ -817,6 +867,103 @@ mod tests {
             std::fs::read_to_string(&local_path).expect("existing file should still be readable"),
             "keep me"
         );
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn secret_for_draft_accepts_private_key_path() {
+        let (core, test_dir) = make_test_core();
+        let draft = InstanceDraft {
+            instance_id: "prod".to_string(),
+            name: "Production".to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            username: "root".to_string(),
+            auth_kind: AuthKind::PrivateKey,
+            host_key_check: false,
+            notes: None,
+            password: None,
+            private_key: None,
+            private_key_path: Some("/Users/test/.ssh/id_ed25519".to_string()),
+            passphrase: Some("hunter2".to_string()),
+            keep_existing_secret: false,
+        };
+
+        let resolved = core
+            .secret_for_draft(&draft, None, false)
+            .expect("private key path should be accepted");
+
+        assert_eq!(
+            resolved.private_key_path.as_deref(),
+            Some("/Users/test/.ssh/id_ed25519")
+        );
+        assert_eq!(resolved.passphrase.as_deref(), Some("hunter2"));
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn secret_for_draft_rejects_both_private_key_sources() {
+        let (core, test_dir) = make_test_core();
+        let draft = InstanceDraft {
+            instance_id: "prod".to_string(),
+            name: "Production".to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            username: "root".to_string(),
+            auth_kind: AuthKind::PrivateKey,
+            host_key_check: false,
+            notes: None,
+            password: None,
+            private_key: Some("-----BEGIN OPENSSH PRIVATE KEY-----".to_string()),
+            private_key_path: Some("/Users/test/.ssh/id_ed25519".to_string()),
+            passphrase: None,
+            keep_existing_secret: false,
+        };
+
+        let err = core
+            .secret_for_draft(&draft, None, false)
+            .expect_err("simultaneous private key sources should fail");
+
+        assert!(
+            err.to_string()
+                .contains("either private_key or private_key_path")
+        );
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn secret_for_draft_keeps_existing_private_key_path() {
+        let (core, test_dir) = make_test_core();
+        let draft = InstanceDraft {
+            instance_id: "prod".to_string(),
+            name: "Production".to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            username: "root".to_string(),
+            auth_kind: AuthKind::PrivateKey,
+            host_key_check: false,
+            notes: None,
+            password: None,
+            private_key: None,
+            private_key_path: None,
+            passphrase: None,
+            keep_existing_secret: true,
+        };
+        let existing_secret = SecretPayload {
+            password: None,
+            private_key: None,
+            private_key_path: Some("/Users/test/.ssh/id_ed25519".to_string()),
+            passphrase: Some("hunter2".to_string()),
+        };
+
+        let resolved = core
+            .secret_for_draft(&draft, Some(&existing_secret), false)
+            .expect("existing private key path should be preserved");
+
+        assert_eq!(resolved, existing_secret);
 
         std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
     }
