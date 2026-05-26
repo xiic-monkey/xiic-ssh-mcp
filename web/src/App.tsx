@@ -1008,7 +1008,7 @@ function SettingsPanel({
           <div className="settings-item">
             <div className="settings-item-info">
               <strong>使用系统弹窗进行审核</strong>
-              <p>开启后，所有需审批的 SSH 操作将直接使用系统原生对话框，不再弹出独立的审批窗口。</p>
+              <p>开启后使用系统原生对话框；关闭后使用独立审批窗口。</p>
             </div>
             <label className="toggle-switch settings-toggle">
               <input

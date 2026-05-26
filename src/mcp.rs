@@ -397,22 +397,16 @@ impl McpServer {
                     approval,
                 });
 
-                // 如果用户启用了系统弹窗审批，则强制使用本地审批流，
-                // 这样 local_approval.request() 会读取设置并弹出原生对话框。
                 let use_system = crate::settings::load_settings().use_system_approval;
-                let flow = if !use_system && self.should_use_elicitation() {
-                    ApprovalFlow::Elicitation(elicitation)
-                } else {
+                let flow = if should_use_local_approval_flow(use_system, self.approval_mode) {
                     ApprovalFlow::Local
+                } else {
+                    ApprovalFlow::Elicitation(elicitation)
                 };
 
                 Ok(DispatchResult::NeedsApproval { flow, pending })
             }
         }
-    }
-
-    fn should_use_elicitation(&self) -> bool {
-        should_use_elicitation_mode(self.approval_mode, self.client_supports_elicitation)
     }
 
     fn request_elicitation_approval<R, W>(
@@ -582,11 +576,23 @@ fn has_elicitation_capability(capabilities: Option<&Value>) -> bool {
         .is_some()
 }
 
+#[cfg(test)]
 fn should_use_elicitation_mode(mode: ApprovalMode, client_supports_elicitation: bool) -> bool {
     match mode {
         ApprovalMode::Elicitation => true,
         ApprovalMode::Local => false,
         ApprovalMode::Auto => client_supports_elicitation,
+    }
+}
+
+fn should_use_local_approval_flow(use_system_approval: bool, approval_mode: ApprovalMode) -> bool {
+    if use_system_approval {
+        return true;
+    }
+
+    match approval_mode {
+        ApprovalMode::Elicitation => false,
+        ApprovalMode::Local | ApprovalMode::Auto => true,
     }
 }
 
@@ -786,7 +792,7 @@ mod tests {
 
     use super::{
         McpServer, MessageFraming, deserialize_args, has_elicitation_capability, read_message,
-        should_use_elicitation_mode, write_message,
+        should_use_elicitation_mode, should_use_local_approval_flow, write_message,
     };
 
     fn initialize_payload() -> serde_json::Value {
@@ -892,6 +898,18 @@ mod tests {
             false
         ));
         assert!(!should_use_elicitation_mode(ApprovalMode::Local, true));
+    }
+
+    #[test]
+    fn local_approval_flow_respects_system_toggle_and_mode() {
+        assert!(should_use_local_approval_flow(true, ApprovalMode::Auto));
+        assert!(should_use_local_approval_flow(true, ApprovalMode::Elicitation));
+        assert!(should_use_local_approval_flow(false, ApprovalMode::Local));
+        assert!(should_use_local_approval_flow(false, ApprovalMode::Auto));
+        assert!(!should_use_local_approval_flow(
+            false,
+            ApprovalMode::Elicitation
+        ));
     }
 
     #[test]

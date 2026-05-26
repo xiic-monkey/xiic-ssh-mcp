@@ -10,3 +10,4 @@
 /approval-tauri/gen
 /approval-tauri/Cargo.lock
 .codebuddy
+.idea
