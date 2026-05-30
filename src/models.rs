@@ -226,6 +226,25 @@ pub struct ExecuteCommandArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloseSessionArgs {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloseSessionResult {
+    pub session_id: String,
+    pub instance_id: String,
+    pub disconnected_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SudoCommandArgs {
+    pub session_id: String,
+    pub command: String,
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadFileArgs {
     pub session_id: String,
     pub local_path: String,

@@ -11,14 +11,16 @@ use chrono::Utc;
 use ssh2::{CheckResult, KnownHostFileKind, Session};
 use uuid::Uuid;
 
+use crate::approval::prompt_sudo_password;
 use crate::credentials::SecretStore;
 use crate::local_ipc::send_notification;
 use crate::models::{
-    AuthKind, CreateSessionResult, DownloadFileArgs, DownloadFileResult, DownloadToLocalArgs,
-    DownloadToLocalResult, ExecuteCommandArgs, ExecuteCommandResult, InstanceDraft,
-    InstanceSummary, ListServersResult, McpConfigBundle, McpConfigRequest, OperationLogEntry,
-    RuleAction, RuleType, SecretPayload, StoredInstance, TestConnectionResult, UploadFileArgs,
-    UploadFileResult, UploadLocalFileArgs, UploadLocalFileResult, WhitelistRule,
+    AuthKind, CloseSessionResult, CreateSessionResult, DownloadFileArgs, DownloadFileResult,
+    DownloadToLocalArgs, DownloadToLocalResult, ExecuteCommandArgs, ExecuteCommandResult,
+    InstanceDraft, InstanceSummary, ListServersResult, McpConfigBundle, McpConfigRequest,
+    OperationLogEntry, RuleAction, RuleType, SecretPayload, StoredInstance, SudoCommandArgs,
+    TestConnectionResult, UploadFileArgs, UploadFileResult, UploadLocalFileArgs,
+    UploadLocalFileResult, WhitelistRule,
 };
 use crate::storage::InstanceStore;
 use crate::whitelist::WhitelistChecker;
@@ -515,6 +517,148 @@ impl DesktopCore {
         })
     }
 
+    pub fn close_session(&self, session_id: &str) -> Result<CloseSessionResult> {
+        let instance_id = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| anyhow!("session manager lock poisoned"))?;
+            sessions
+                .remove(session_id)
+                .map(|s| s.instance_id)
+                .with_context(|| format!("unknown session_id '{}'", session_id))?
+        };
+        // ManagedSession dropped here → ssh2 Session disconnected automatically
+
+        let result = CloseSessionResult {
+            session_id: session_id.to_string(),
+            instance_id: instance_id.clone(),
+            disconnected_at: Utc::now(),
+        };
+
+        let instance_name = self
+            .store
+            .get_instance(&instance_id)?
+            .map(|i| i.name)
+            .unwrap_or_else(|| instance_id.clone());
+
+        let details = serde_json::json!({
+            "instance_name": instance_name,
+            "instance_id": instance_id,
+        });
+        self.store.insert_log(
+            session_id,
+            &instance_id,
+            "close_session",
+            &serde_json::to_string(&details).unwrap_or_default(),
+        )?;
+        self.notify_ui();
+
+        Ok(result)
+    }
+
+    pub fn sudo_command(&self, args: SudoCommandArgs) -> Result<ExecuteCommandResult> {
+        if args.command.trim().is_empty() {
+            bail!("command cannot be empty");
+        }
+
+        // 弹出系统原生密码输入框获取 sudo 密码
+        let password = prompt_sudo_password().context("failed to get sudo password")?;
+
+        let timeout_ms = args
+            .timeout_secs
+            .and_then(|s| s.checked_mul(1_000))
+            .map(|ms| u32::try_from(ms).unwrap_or(u32::MAX))
+            .unwrap_or(30_000);
+
+        let sudo_cmd = format!("sudo -S {}", args.command);
+
+        let (instance_id, session_id, command, result) = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| anyhow!("session manager lock poisoned"))?;
+            let managed = sessions
+                .get_mut(&args.session_id)
+                .with_context(|| format!("unknown session_id '{}'", args.session_id))?;
+            let instance_id = managed.instance_id.clone();
+
+            managed.session.set_timeout(timeout_ms);
+
+            let mut channel = managed
+                .session
+                .channel_session()
+                .context("failed to open SSH channel")?;
+
+            channel
+                .exec(&sudo_cmd)
+                .with_context(|| format!("failed to execute sudo command"))?;
+
+            // 将密码写入 stdin，然后关闭写入端以发送 EOF
+            let pw_with_newline = format!("{}\n", password);
+            channel
+                .write_all(pw_with_newline.as_bytes())
+                .context("failed to write sudo password to stdin")?;
+            // 尽早清除内存中的密码明文
+            drop(pw_with_newline);
+            drop(password);
+            channel
+                .send_eof()
+                .context("failed to send EOF after sudo password")?;
+
+            let mut stdout = String::new();
+            channel
+                .read_to_string(&mut stdout)
+                .context("failed to read sudo command stdout")?;
+
+            let mut stderr = String::new();
+            channel
+                .stderr()
+                .read_to_string(&mut stderr)
+                .context("failed to read sudo command stderr")?;
+
+            channel
+                .wait_close()
+                .context("failed waiting for sudo command exit")?;
+            let exit_code = channel.exit_status().context("failed to read sudo exit code")?;
+
+            (
+                instance_id,
+                args.session_id.clone(),
+                args.command.clone(),
+                ExecuteCommandResult {
+                    stdout,
+                    stderr,
+                    exit_code,
+                },
+            )
+        };
+
+        let instance_name = self
+            .store
+            .get_instance(&instance_id)?
+            .map(|i| i.name)
+            .unwrap_or_else(|| instance_id.clone());
+
+        // 日志不包含密码信息
+        let details = serde_json::json!({
+            "instance_name": instance_name,
+            "command": format!("sudo {}", command),
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "exit_code": result.exit_code,
+        });
+        self.store.insert_log(
+            &session_id,
+            &instance_id,
+            "sudo",
+            &serde_json::to_string(&details).unwrap_or_default(),
+        )?;
+        self.notify_ui();
+
+        Ok(result)
+    }
+
     pub fn create_whitelist_checker(&self) -> WhitelistChecker {
         WhitelistChecker::new(self.store.clone())
     }
@@ -965,6 +1109,33 @@ mod tests {
 
         assert_eq!(resolved, existing_secret);
 
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn close_session_unknown_id_returns_error() {
+        let (core, test_dir) = make_test_core();
+        let err = core
+            .close_session("nonexistent-session-id")
+            .expect_err("unknown session_id should fail");
+
+        assert!(err.to_string().contains("unknown session_id"));
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn sudo_command_empty_command_bails() {
+        let (core, test_dir) = make_test_core();
+        // 空命令校验在 prompt_sudo_password 之前，不需要 GUI
+        let err = core
+            .sudo_command(SudoCommandArgs {
+                session_id: "any".to_string(),
+                command: "   ".to_string(),
+                timeout_secs: None,
+            })
+            .expect_err("empty command should fail");
+
+        assert!(err.to_string().contains("command cannot be empty"));
         std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
     }
 }

@@ -180,7 +180,215 @@ pub fn approval_message(metadata: &ApprovalOperationMetadata) -> String {
             metadata.instance_id.as_deref().unwrap_or("-"),
             metadata.remote_path.as_deref().unwrap_or("-"),
         ),
+        "close_session" => format!(
+            "是否关闭连接 '{}' 的 SSH 会话？",
+            metadata.instance_id.as_deref().unwrap_or("-"),
+        ),
+        "sudo" => format!(
+            "是否允许在连接 '{}' 上以 sudo 执行命令？\n\n命令：\nsudo {}",
+            metadata.instance_id.as_deref().unwrap_or("-"),
+            metadata.command.as_deref().unwrap_or("-"),
+        ),
         _ => format!("是否允许执行 SSH 操作 '{}'？", metadata.tool_name),
+    }
+}
+
+/// 弹出系统原生密码输入框，返回用户输入的密码。
+/// 跨平台实现：macOS osascript / Windows PowerShell / Linux zenity/kdialog
+pub fn prompt_sudo_password() -> Result<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let script = "display dialog \"请输入 sudo 密码：\" with title \"Xiic SSH - sudo 密码\" default answer \"\" with hidden answer buttons {\"取消\", \"确认\"} default button \"确认\" cancel button \"取消\" with icon caution";
+        let output = Command::new("osascript")
+            .args(["-e", script])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .context("failed to show macOS sudo password dialog")?;
+
+        if !output.status.success() {
+            bail!("用户取消了 sudo 密码输入");
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let password = stdout
+            .strip_prefix("button returned:确认, text returned:")
+            .unwrap_or(&stdout)
+            .trim()
+            .to_string();
+
+        if password.is_empty() {
+            bail!("sudo 密码不能为空");
+        }
+
+        Ok(password)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let script = r#"
+            Add-Type -AssemblyName System.Windows.Forms
+            $form = New-Object System.Windows.Forms.Form
+            $form.Text = 'Xiic SSH - sudo 密码'
+            $form.Size = New-Object System.Drawing.Size(400, 150)
+            $form.StartPosition = 'CenterScreen'
+            $label = New-Object System.Windows.Forms.Label
+            $label.Text = '请输入 sudo 密码：'
+            $label.Location = New-Object System.Drawing.Point(10, 10)
+            $label.Size = New-Object System.Drawing.Size(370, 20)
+            $textBox = New-Object System.Windows.Forms.TextBox
+            $textBox.Location = New-Object System.Drawing.Point(10, 35)
+            $textBox.Size = New-Object System.Drawing.Size(370, 20)
+            $textBox.PasswordChar = '*'
+            $button = New-Object System.Windows.Forms.Button
+            $button.Text = '确认'
+            $button.Location = New-Object System.Drawing.Point(150, 70)
+            $button.DialogResult = [System.Windows.Forms.DialogResult]::OK
+            $form.Controls.Add($label)
+            $form.Controls.Add($textBox)
+            $form.Controls.Add($button)
+            $form.AcceptButton = $button
+            $result = $form.ShowDialog()
+            if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+                Write-Output $textBox.Text
+            } else {
+                exit 1
+            }
+        "#;
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-Command", script])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .context("failed to show Windows sudo password dialog")?;
+
+        if !output.status.success() {
+            bail!("用户取消了 sudo 密码输入");
+        }
+
+        let password = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if password.is_empty() {
+            bail!("sudo 密码不能为空");
+        }
+
+        Ok(password)
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if command_exists("zenity") {
+            let output = Command::new("zenity")
+                .args([
+                    "--password",
+                    "--title",
+                    "Xiic SSH - sudo 密码",
+                    "--text",
+                    "请输入 sudo 密码：",
+                ])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .context("failed to show zenity password dialog")?;
+
+            if !output.status.success() {
+                bail!("用户取消了 sudo 密码输入");
+            }
+
+            let password = String::from_utf8(output.stdout)
+                .context("failed to decode zenity password output")?
+                .trim()
+                .to_string();
+
+            if password.is_empty() {
+                bail!("sudo 密码不能为空");
+            }
+
+            return Ok(password);
+        }
+
+        if command_exists("kdialog") {
+            let output = Command::new("kdialog")
+                .args([
+                    "--title",
+                    "Xiic SSH - sudo 密码",
+                    "--password",
+                    "请输入 sudo 密码：",
+                ])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .context("failed to show kdialog password dialog")?;
+
+            if !output.status.success() {
+                bail!("用户取消了 sudo 密码输入");
+            }
+
+            let password = String::from_utf8(output.stdout)
+                .context("failed to decode kdialog password output")?
+                .trim()
+                .to_string();
+
+            if password.is_empty() {
+                bail!("sudo 密码不能为空");
+            }
+
+            return Ok(password);
+        }
+
+        // 最后尝试 SSH_ASKPASS 方式（支持终端内的文本输入）
+        let temp_script = std::env::temp_dir().join(format!(
+            "xiic-ssh-query-{}.sh",
+            uuid::Uuid::new_v4()
+        ));
+        let script_content = r#"#!/bin/sh
+stty -echo
+printf "请输入 sudo 密码："
+read password
+stty echo
+echo ""
+echo "$password"
+"#;
+        std::fs::write(&temp_script, script_content)
+            .context("failed to create temporary password script")?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&temp_script)
+                .context("failed to get script metadata")?
+                .permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&temp_script, perms)
+                .context("failed to set script permissions")?;
+        }
+
+        let output = Command::new("setsid")
+            .args(["sh", "-c", &format!("exec {}", temp_script.display())])
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .output()
+            .context("failed to run password script")?;
+
+        let _ = std::fs::remove_file(&temp_script);
+
+        if !output.status.success() {
+            bail!("用户取消了 sudo 密码输入");
+        }
+
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let password = raw.lines().last().unwrap_or("").trim().to_string();
+
+        if password.is_empty() {
+            bail!("sudo 密码不能为空");
+        }
+
+        Ok(password)
+    }
+
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        bail!("当前平台不支持 sudo 密码输入")
     }
 }
 
@@ -524,6 +732,38 @@ mod tests {
 
         assert!(message.contains("dev"));
         assert!(message.contains("rm -rf /tmp/demo"));
+    }
+
+    #[test]
+    fn close_session_approval_message_contains_instance_id() {
+        let metadata = ApprovalOperationMetadata {
+            tool_name: "close_session".into(),
+            command: None,
+            remote_path: None,
+            local_path: None,
+            instance_id: Some("production".into()),
+        };
+
+        let message = approval_message(&metadata);
+
+        assert!(message.contains("production"));
+        assert!(message.contains("SSH 会话"));
+    }
+
+    #[test]
+    fn sudo_approval_message_contains_command() {
+        let metadata = ApprovalOperationMetadata {
+            tool_name: "sudo".into(),
+            command: Some("apt update".into()),
+            remote_path: None,
+            local_path: None,
+            instance_id: Some("dev".into()),
+        };
+
+        let message = approval_message(&metadata);
+
+        assert!(message.contains("dev"));
+        assert!(message.contains("sudo apt update"));
     }
 
     #[test]

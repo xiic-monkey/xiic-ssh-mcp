@@ -9,10 +9,11 @@ use uuid::Uuid;
 use crate::app_core::DesktopCore;
 use crate::approval::LocalApprovalClient;
 use crate::models::{
-    ApprovalMode, ApprovalOperationMetadata, CreateSessionResult, DownloadFileArgs,
-    DownloadFileResult, DownloadToLocalArgs, DownloadToLocalResult, ExecuteCommandArgs,
-    ExecuteCommandResult, OperationContext, PendingToolCall, RuleDecision, ToolCall,
-    UploadFileArgs, UploadFileResult, UploadLocalFileArgs, UploadLocalFileResult, WhitelistMode,
+    ApprovalMode, ApprovalOperationMetadata, CloseSessionArgs, CreateSessionResult,
+    DownloadFileArgs, DownloadFileResult, DownloadToLocalArgs, DownloadToLocalResult,
+    ExecuteCommandArgs, ExecuteCommandResult, OperationContext, PendingToolCall, RuleDecision,
+    SudoCommandArgs, ToolCall, UploadFileArgs, UploadFileResult, UploadLocalFileArgs,
+    UploadLocalFileResult, WhitelistMode,
 };
 use crate::whitelist::WhitelistChecker;
 
@@ -333,6 +334,32 @@ impl McpServer {
                         "required": ["session_id", "remote_path", "local_path"],
                         "additionalProperties": false
                     }
+                },
+                {
+                    "name": "close_session",
+                    "description": "Close an active SSH session.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": { "type": "string" }
+                        },
+                        "required": ["session_id"],
+                        "additionalProperties": false
+                    }
+                },
+                {
+                    "name": "sudo",
+                    "description": "Execute a command with sudo privileges using a system password dialog.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": { "type": "string" },
+                            "command": { "type": "string" },
+                            "timeout_secs": { "type": "integer", "minimum": 1 }
+                        },
+                        "required": ["session_id", "command"],
+                        "additionalProperties": false
+                    }
                 }
             ]
         })
@@ -517,6 +544,28 @@ impl McpServer {
                     instance_id: Some(instance_id),
                 })
             }
+            "close_session" => {
+                let args: CloseSessionArgs = deserialize_args(tool_call.arguments.clone())?;
+                let instance_id = self.lookup_session_instance(&args.session_id)?;
+                Ok(OperationContext {
+                    tool_name: "close_session".into(),
+                    command: None,
+                    remote_path: None,
+                    local_path: None,
+                    instance_id: Some(instance_id),
+                })
+            }
+            "sudo" => {
+                let args: SudoCommandArgs = deserialize_args(tool_call.arguments.clone())?;
+                let instance_id = self.lookup_session_instance(&args.session_id)?;
+                Ok(OperationContext {
+                    tool_name: "sudo".into(),
+                    command: Some(format!("sudo {}", args.command)),
+                    remote_path: None,
+                    local_path: None,
+                    instance_id: Some(instance_id),
+                })
+            }
             _ => bail!("unknown tool '{}'", tool_call.name),
         }
     }
@@ -563,6 +612,16 @@ impl McpServer {
             "download_to_local" => {
                 let args: DownloadToLocalArgs = deserialize_args(tool_call.arguments.clone())?;
                 let result = self.core.download_to_local(args)?;
+                tool_success(result)
+            }
+            "close_session" => {
+                let args: CloseSessionArgs = deserialize_args(tool_call.arguments.clone())?;
+                let result = self.core.close_session(&args.session_id)?;
+                tool_success(result)
+            }
+            "sudo" => {
+                let args: SudoCommandArgs = deserialize_args(tool_call.arguments.clone())?;
+                let result = self.core.sudo_command(args)?;
                 tool_success(result)
             }
             _ => bail!("unknown tool '{}'", tool_call.name),
@@ -775,8 +834,9 @@ fn _type_assertions(
     download: DownloadFileResult,
     upload_local: UploadLocalFileResult,
     download_local: DownloadToLocalResult,
+    close: crate::models::CloseSessionResult,
 ) {
-    let _ = (create, exec, upload, download, upload_local, download_local);
+    let _ = (create, exec, upload, download, upload_local, download_local, close);
 }
 
 #[cfg(test)]
