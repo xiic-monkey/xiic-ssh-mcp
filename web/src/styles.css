@@ -665,6 +665,7 @@ pre {
   display: flex;
   gap: 10px;
   align-items: baseline;
+  flex-wrap: wrap;
   margin-bottom: 2px;
 }
 
@@ -679,6 +680,24 @@ pre {
   font-weight: 600;
   padding: 1px 6px;
   border-radius: 3px;
+}
+
+.log-client-badge,
+.log-session-badge {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.62rem;
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+
+.log-client-badge {
+  color: #d8f3dc;
+  background: rgba(82, 183, 136, 0.14);
+}
+
+.log-session-badge {
+  color: #ffd6a5;
+  background: rgba(255, 183, 3, 0.12);
 }
 
 .log-op-create_session {

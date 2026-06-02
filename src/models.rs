@@ -122,6 +122,7 @@ pub struct McpConfigRequest<'a> {
     pub keyring_service: &'a str,
     pub notify_endpoint: Option<&'a str>,
     pub approval_endpoint: Option<&'a str>,
+    pub client_id: &'a str,
     pub helper_found: bool,
     pub helper_warning: Option<String>,
 }
@@ -134,11 +135,19 @@ pub struct ListServersResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationLogEntry {
     pub id: i64,
+    pub client_id: String,
+    pub client_session_id: String,
     pub session_id: String,
     pub instance_id: String,
     pub operation: String,
     pub details: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestContext {
+    pub client_id: String,
+    pub client_session_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -358,6 +367,22 @@ pub struct PendingToolCall {
     pub tool_call: ToolCall,
     pub operation: OperationContext,
     pub approval: ApprovalOperationMetadata,
+    pub context: RequestContext,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerHello {
+    pub kind: String,
+    pub client_id: String,
+    pub protocol_version: String,
+    pub pid: u32,
+    pub started_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerWelcome {
+    pub kind: String,
+    pub client_session_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -9,11 +9,15 @@ pub const NOTIFY_HEALTH_CHECK_KIND: &str = "notify_health_check";
 pub const NOTIFY_HEALTH_OK_KIND: &str = "notify_health_ok";
 pub const APPROVAL_HEALTH_CHECK_KIND: &str = "health_check";
 pub const APPROVAL_HEALTH_OK_KIND: &str = "health_ok";
+pub const BROKER_HEALTH_CHECK_KIND: &str = "broker_health_check";
+pub const BROKER_HEALTH_OK_KIND: &str = "broker_health_ok";
 
 #[cfg(target_os = "windows")]
 pub const WINDOWS_NOTIFY_PIPE: &str = r"\\.\pipe\com.xiic.sshmanager.notify";
 #[cfg(target_os = "windows")]
 pub const WINDOWS_APPROVAL_PIPE: &str = r"\\.\pipe\com.xiic.sshmanager.approval";
+#[cfg(target_os = "windows")]
+pub const WINDOWS_BROKER_PIPE: &str = r"\\.\pipe\com.xiic.sshmanager.mcp-broker";
 
 pub fn default_notify_endpoint(data_dir: &Path) -> String {
     #[cfg(target_os = "windows")]
@@ -39,6 +43,22 @@ pub fn default_approval_endpoint(data_dir: &Path) -> String {
     {
         data_dir
             .join("approval.sock")
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+pub fn default_broker_endpoint(data_dir: &Path) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = data_dir;
+        WINDOWS_BROKER_PIPE.to_string()
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        data_dir
+            .join("mcp-broker.sock")
             .to_string_lossy()
             .into_owned()
     }
@@ -102,6 +122,10 @@ pub fn notify_server_healthy(endpoint: &str) -> bool {
     endpoint_health_check(endpoint, NOTIFY_HEALTH_CHECK_KIND, NOTIFY_HEALTH_OK_KIND)
 }
 
+pub fn broker_server_healthy(endpoint: &str) -> bool {
+    endpoint_health_check(endpoint, BROKER_HEALTH_CHECK_KIND, BROKER_HEALTH_OK_KIND)
+}
+
 fn endpoint_health_check(endpoint: &str, check_kind: &str, ok_kind: &str) -> bool {
     let payload = json!({
         "kind": check_kind
@@ -161,6 +185,7 @@ mod tests {
         let root = std::path::Path::new("/tmp/xiic-ssh");
         assert!(super::default_notify_endpoint(root).ends_with("notify.sock"));
         assert!(super::default_approval_endpoint(root).ends_with("approval.sock"));
+        assert!(super::default_broker_endpoint(root).ends_with("mcp-broker.sock"));
     }
 
     #[cfg(unix)]

@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -12,30 +12,18 @@ use crate::models::{
     ApprovalMode, ApprovalOperationMetadata, CloseSessionArgs, CreateSessionResult,
     DownloadFileArgs, DownloadFileResult, DownloadToLocalArgs, DownloadToLocalResult,
     ExecuteCommandArgs, ExecuteCommandResult, OperationContext, PendingToolCall, RuleDecision,
-    SudoCommandArgs, ToolCall, UploadFileArgs, UploadFileResult, UploadLocalFileArgs,
-    UploadLocalFileResult, WhitelistMode,
+    RequestContext, SudoCommandArgs, ToolCall, UploadFileArgs, UploadFileResult,
+    UploadLocalFileArgs, UploadLocalFileResult, WhitelistMode,
 };
+use crate::mcp_protocol::{MessageFraming, read_message, write_message};
 use crate::whitelist::WhitelistChecker;
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "xiic-ssh-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MessageFraming {
-    Newline,
-    ContentLength,
-}
-
-#[derive(Debug)]
-struct IncomingMessage {
-    payload: Value,
-    framing: MessageFraming,
-}
-
 enum DispatchResult {
     Respond(Value),
-    NoResponse,
     NeedsApproval {
         flow: ApprovalFlow,
         pending: Box<PendingToolCall>,
@@ -79,7 +67,7 @@ impl McpServer {
         self.local_approval.pre_launch();
     }
 
-    pub fn run(&mut self) -> Result<()> {
+    pub fn run(&mut self, request_context: RequestContext) -> Result<()> {
         let stdin = io::stdin();
         let stdout = io::stdout();
         let mut reader = BufReader::new(stdin.lock());
@@ -108,66 +96,35 @@ impl McpServer {
                 .unwrap_or_else(|| "notification".to_string());
             eprintln!("[xiic-ssh-mcp] Received: method={}, id={}", method, id_str);
 
-            match self.dispatch(message.payload)? {
-                DispatchResult::Respond(response) => {
-                    write_message(&mut writer, &response, framing)?;
-                    eprintln!(
-                        "[xiic-ssh-mcp] Sent response for method={}, id={}",
-                        method, id_str
-                    );
-                }
-                DispatchResult::NoResponse => {
-                    eprintln!("[xiic-ssh-mcp] No response needed for method={}", method);
-                }
-                DispatchResult::NeedsApproval { flow, pending } => {
-                    let accepted = match flow {
-                        ApprovalFlow::Elicitation(elicitation) => self
-                            .request_elicitation_approval(
-                                &mut reader,
-                                &mut writer,
-                                framing,
-                                &pending,
-                                elicitation,
-                            )?,
-                        ApprovalFlow::Local => {
-                            eprintln!(
-                                "[xiic-ssh-mcp] Requesting local approval for tool='{}'",
-                                pending.tool_call.name
-                            );
-                            self.local_approval.request(&pending.approval)?
-                        }
-                    };
-
-                    if accepted {
-                        eprintln!(
-                            "[xiic-ssh-mcp] Approval accepted for tool='{}'",
-                            pending.tool_call.name
-                        );
-                        self.checker.cache_approval(&pending.operation);
-                        let exec_result = self.execute_tool(&pending.tool_call)?;
-                        let response = success_response(pending.id, exec_result);
-                        write_message(&mut writer, &response, framing)?;
-                    } else {
-                        eprintln!(
-                            "[xiic-ssh-mcp] Approval declined for tool='{}'",
-                            pending.tool_call.name
-                        );
-                        let response = error_response(
-                            pending.id,
-                            -32000,
-                            "operation declined by user".to_string(),
-                        );
-                        write_message(&mut writer, &response, framing)?;
-                    }
-                }
-            }
+            self.dispatch_with_context(
+                request_context.clone(),
+                message.payload,
+                framing,
+                &mut reader,
+                &mut writer,
+            )?;
+            eprintln!(
+                "[xiic-ssh-mcp] Sent/handled response for method={}, id={}",
+                method, id_str
+            );
         }
 
         eprintln!("[xiic-ssh-mcp] MCP server shutting down (stdin closed)");
         Ok(())
     }
 
-    fn dispatch(&mut self, message: Value) -> Result<DispatchResult> {
+    pub fn dispatch_with_context<R, W>(
+        &mut self,
+        request_context: RequestContext,
+        message: Value,
+        framing: MessageFraming,
+        reader: &mut BufReader<R>,
+        writer: &mut W,
+    ) -> Result<()>
+    where
+        R: Read,
+        W: Write,
+    {
         let method = message
             .get("method")
             .and_then(Value::as_str)
@@ -178,27 +135,56 @@ impl McpServer {
 
         if id.is_none() {
             self.handle_notification(method, params)?;
-            return Ok(DispatchResult::NoResponse);
+            return Ok(());
         }
 
         let id = id.expect("checked is_some");
-        let response = match method {
+        let result = match method {
             "initialize" => match self.handle_initialize(params) {
-                Ok(result) => success_response(id, result),
-                Err(err) => error_response(id, -32602, err.to_string()),
+                Ok(result) => DispatchResult::Respond(success_response(id, result)),
+                Err(err) => DispatchResult::Respond(error_response(id, -32602, err.to_string())),
             },
-            "ping" => success_response(id, json!({})),
-            "tools/list" => success_response(id, self.handle_tools_list()),
-            "tools/call" => match self.handle_tool_call(params, id.clone()) {
+            "ping" => DispatchResult::Respond(success_response(id, json!({}))),
+            "resources/list" => DispatchResult::Respond(success_response(id, json!({
+                "resources": []
+            }))),
+            "tools/list" => DispatchResult::Respond(success_response(id, self.handle_tools_list())),
+            "tools/call" => match self.handle_tool_call(request_context.clone(), params, id.clone()) {
                 Ok(result) => {
-                    return Ok(result);
+                    result
                 }
-                Err(err) => success_response(id, tool_error(err.to_string())),
+                Err(err) => DispatchResult::Respond(success_response(id, tool_error(err.to_string()))),
             },
-            _ => error_response(id, -32601, format!("method '{}' not found", method)),
+            _ => DispatchResult::Respond(error_response(id, -32601, format!("method '{}' not found", method))),
         };
 
-        Ok(DispatchResult::Respond(response))
+        match result {
+            DispatchResult::Respond(response) => {
+                write_message(writer, &response, framing)?;
+            }
+            DispatchResult::NeedsApproval { flow, pending } => {
+                let accepted = match flow {
+                    ApprovalFlow::Elicitation(elicitation) => self
+                        .request_elicitation_approval(reader, writer, framing, &pending, elicitation)?,
+                    ApprovalFlow::Local => self.local_approval.request(&pending.approval)?,
+                };
+
+                if accepted {
+                    self.checker.cache_approval(&pending.operation);
+                    let exec_result = self.execute_tool(&pending.context, &pending.tool_call)?;
+                    let response = success_response(pending.id, exec_result);
+                    write_message(writer, &response, framing)?;
+                } else {
+                    let response = error_response(
+                        pending.id,
+                        -32000,
+                        "operation declined by user".to_string(),
+                    );
+                    write_message(writer, &response, framing)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn handle_notification(&self, method: &str, _params: Value) -> Result<()> {
@@ -365,12 +351,17 @@ impl McpServer {
         })
     }
 
-    fn handle_tool_call(&self, params: Value, id: Value) -> Result<DispatchResult> {
+    fn handle_tool_call(
+        &self,
+        request_context: RequestContext,
+        params: Value,
+        id: Value,
+    ) -> Result<DispatchResult> {
         let tool_call: ToolCall =
             serde_json::from_value(params).context("invalid tools/call params")?;
 
         if self.whitelist_mode == WhitelistMode::Off {
-            let result = self.execute_tool(&tool_call)?;
+            let result = self.execute_tool(&request_context, &tool_call)?;
             return Ok(DispatchResult::Respond(success_response(id, result)));
         }
 
@@ -384,7 +375,7 @@ impl McpServer {
                     ctx.tool_name,
                     ctx.command.as_deref().unwrap_or("-"),
                 );
-                let result = self.execute_tool(&tool_call)?;
+                let result = self.execute_tool(&request_context, &tool_call)?;
                 Ok(DispatchResult::Respond(success_response(id, result)))
             }
             RuleDecision::Deny(reason) => {
@@ -422,6 +413,7 @@ impl McpServer {
                     tool_call,
                     operation: ctx,
                     approval,
+                    context: request_context,
                 });
 
                 let use_system = crate::settings::load_settings().use_system_approval;
@@ -574,7 +566,11 @@ impl McpServer {
         self.core.get_session_instance_id(session_id)
     }
 
-    fn execute_tool(&self, tool_call: &ToolCall) -> Result<Value> {
+    fn execute_tool(
+        &self,
+        request_context: &RequestContext,
+        tool_call: &ToolCall,
+    ) -> Result<Value> {
         match tool_call.name.as_str() {
             "list_servers" => {
                 let result = self.core.list_servers()?;
@@ -586,42 +582,42 @@ impl McpServer {
                     instance_id: String,
                 }
                 let args: Args = deserialize_args(tool_call.arguments.clone())?;
-                let result = self.core.create_session(&args.instance_id)?;
+                let result = self.core.create_session(request_context, &args.instance_id)?;
                 tool_success(result)
             }
             "execute_command" => {
                 let args: ExecuteCommandArgs = deserialize_args(tool_call.arguments.clone())?;
-                let result = self.core.execute_command(args)?;
+                let result = self.core.execute_command(request_context, args)?;
                 tool_success(result)
             }
             "upload_file" => {
                 let args: UploadFileArgs = deserialize_args(tool_call.arguments.clone())?;
-                let result = self.core.upload_file(args)?;
+                let result = self.core.upload_file(request_context, args)?;
                 tool_success(result)
             }
             "download_file" => {
                 let args: DownloadFileArgs = deserialize_args(tool_call.arguments.clone())?;
-                let result = self.core.download_file(args)?;
+                let result = self.core.download_file(request_context, args)?;
                 tool_success(result)
             }
             "upload_local_file" => {
                 let args: UploadLocalFileArgs = deserialize_args(tool_call.arguments.clone())?;
-                let result = self.core.upload_local_file(args)?;
+                let result = self.core.upload_local_file(request_context, args)?;
                 tool_success(result)
             }
             "download_to_local" => {
                 let args: DownloadToLocalArgs = deserialize_args(tool_call.arguments.clone())?;
-                let result = self.core.download_to_local(args)?;
+                let result = self.core.download_to_local(request_context, args)?;
                 tool_success(result)
             }
             "close_session" => {
                 let args: CloseSessionArgs = deserialize_args(tool_call.arguments.clone())?;
-                let result = self.core.close_session(&args.session_id)?;
+                let result = self.core.close_session(request_context, &args.session_id)?;
                 tool_success(result)
             }
             "sudo" => {
                 let args: SudoCommandArgs = deserialize_args(tool_call.arguments.clone())?;
-                let result = self.core.sudo_command(args)?;
+                let result = self.core.sudo_command(request_context, args)?;
                 tool_success(result)
             }
             _ => bail!("unknown tool '{}'", tool_call.name),
@@ -660,119 +656,6 @@ where
     T: for<'de> Deserialize<'de>,
 {
     serde_json::from_value(value).context("invalid tool arguments")
-}
-
-fn read_message<R>(reader: &mut BufReader<R>) -> Result<Option<IncomingMessage>>
-where
-    R: Read,
-{
-    let mut content_length = None;
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .context("failed to read MCP message")?;
-        if bytes_read == 0 {
-            return Ok(None);
-        }
-
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if trimmed.starts_with('{') || trimmed.starts_with('[') {
-            let value = serde_json::from_str(trimmed)
-                .context("failed to parse newline-delimited MCP JSON-RPC message")?;
-            return Ok(Some(IncomingMessage {
-                payload: value,
-                framing: MessageFraming::Newline,
-            }));
-        }
-
-        if let Some((name, value)) = trimmed.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            let parsed = value
-                .trim()
-                .parse::<usize>()
-                .context("invalid Content-Length header")?;
-            content_length = Some(parsed);
-            break;
-        }
-
-        if trimmed.split_once(':').is_some() {
-            break;
-        }
-
-        bail!("invalid MCP message start");
-    }
-
-    loop {
-        line.clear();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .context("failed to read MCP header")?;
-        if bytes_read == 0 {
-            bail!("unexpected EOF while reading MCP headers");
-        }
-
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
-        }
-
-        if let Some((name, value)) = trimmed.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            let parsed = value
-                .trim()
-                .parse::<usize>()
-                .context("invalid Content-Length header")?;
-            content_length = Some(parsed);
-        }
-    }
-
-    let content_length = content_length.ok_or_else(|| anyhow!("missing Content-Length header"))?;
-    let mut body = vec![0; content_length];
-    reader
-        .read_exact(&mut body)
-        .context("failed to read MCP message body")?;
-
-    let value =
-        serde_json::from_slice(&body).context("failed to parse MCP JSON-RPC message body")?;
-    Ok(Some(IncomingMessage {
-        payload: value,
-        framing: MessageFraming::ContentLength,
-    }))
-}
-
-fn write_message<W>(writer: &mut W, payload: &Value, framing: MessageFraming) -> Result<()>
-where
-    W: Write,
-{
-    let body = serde_json::to_vec(payload).context("failed to serialize MCP response")?;
-    match framing {
-        MessageFraming::Newline => {
-            writer
-                .write_all(&body)
-                .context("failed to write MCP response body")?;
-            writer
-                .write_all(b"\n")
-                .context("failed to write MCP response newline")?;
-        }
-        MessageFraming::ContentLength => {
-            write!(writer, "Content-Length: {}\r\n\r\n", body.len())
-                .context("failed to write MCP response header")?;
-            writer
-                .write_all(&body)
-                .context("failed to write MCP response body")?;
-        }
-    }
-    writer.flush().context("failed to flush MCP response")?;
-    Ok(())
 }
 
 fn success_response(id: Value, result: Value) -> Value {
@@ -848,7 +731,7 @@ mod tests {
     use serde_json::json;
 
     use crate::app_core::{DEFAULT_KEYRING_SERVICE, DesktopCore};
-    use crate::models::{ApprovalMode, WhitelistMode};
+    use crate::models::{ApprovalMode, RequestContext, WhitelistMode};
 
     use super::{
         McpServer, MessageFraming, deserialize_args, has_elicitation_capability, read_message,
@@ -973,6 +856,32 @@ mod tests {
     }
 
     #[test]
+    fn resources_list_returns_empty_resources() {
+        let mut server = test_server();
+        let mut reader = BufReader::new(Cursor::new(Vec::<u8>::new()));
+        let mut output = Vec::new();
+        server
+            .dispatch_with_context(
+                test_context(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "resources/list",
+                    "params": {}
+                }),
+                MessageFraming::Newline,
+                &mut reader,
+                &mut output,
+            )
+            .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(output.strip_suffix(b"\n").unwrap()).unwrap();
+        assert_eq!(parsed["id"], 7);
+        assert_eq!(parsed["result"]["resources"], json!([]));
+    }
+
+    #[test]
     fn execute_command_schema_does_not_require_command_description() {
         let server = test_server();
         let tools = server.handle_tools_list();
@@ -1014,5 +923,12 @@ mod tests {
         let server = McpServer::new(core, WhitelistMode::Strict, ApprovalMode::Auto, None);
         let _ = std::fs::remove_file(db_path);
         server
+    }
+
+    fn test_context() -> RequestContext {
+        RequestContext {
+            client_id: "test-client".to_string(),
+            client_session_id: uuid::Uuid::new_v4().to_string(),
+        }
     }
 }

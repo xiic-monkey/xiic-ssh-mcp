@@ -18,14 +18,15 @@ use crate::models::{
     AuthKind, CloseSessionResult, CreateSessionResult, DownloadFileArgs, DownloadFileResult,
     DownloadToLocalArgs, DownloadToLocalResult, ExecuteCommandArgs, ExecuteCommandResult,
     InstanceDraft, InstanceSummary, ListServersResult, McpConfigBundle, McpConfigRequest,
-    OperationLogEntry, RuleAction, RuleType, SecretPayload, StoredInstance, SudoCommandArgs,
-    TestConnectionResult, UploadFileArgs, UploadFileResult, UploadLocalFileArgs,
+    OperationLogEntry, RequestContext, RuleAction, RuleType, SecretPayload, StoredInstance,
+    SudoCommandArgs, TestConnectionResult, UploadFileArgs, UploadFileResult, UploadLocalFileArgs,
     UploadLocalFileResult, WhitelistRule,
 };
 use crate::storage::InstanceStore;
 use crate::whitelist::WhitelistChecker;
 
 pub const DEFAULT_KEYRING_SERVICE: &str = "com.xiic.ssh-manager";
+pub const DEFAULT_CLIENT_ID: &str = "xiic-ssh-default";
 
 #[derive(Clone)]
 pub struct DesktopCore {
@@ -89,6 +90,23 @@ impl DesktopCore {
         limit: u64,
     ) -> Result<Vec<OperationLogEntry>> {
         self.store.get_operation_logs_since(since_id, limit)
+    }
+
+    pub fn log_client_connection(&self, ctx: &RequestContext, operation: &str) -> Result<()> {
+        let details = serde_json::json!({
+            "client_id": ctx.client_id,
+            "client_session_id": ctx.client_session_id,
+        });
+        self.store.insert_log(
+            &ctx.client_id,
+            &ctx.client_session_id,
+            "",
+            "",
+            operation,
+            &serde_json::to_string(&details).unwrap_or_default(),
+        )?;
+        self.notify_ui();
+        Ok(())
     }
 
     fn notify_ui(&self) {
@@ -191,6 +209,8 @@ impl DesktopCore {
             args.push("--approval-endpoint".to_string());
             args.push(endpoint.to_string());
         }
+        args.push("--client-id".to_string());
+        args.push(request.client_id.to_string());
 
         let stdio_json = serde_json::to_string_pretty(&serde_json::json!({
             "mcpServers": {
@@ -214,7 +234,11 @@ impl DesktopCore {
         })
     }
 
-    pub fn create_session(&self, instance_id: &str) -> Result<CreateSessionResult> {
+    pub fn create_session(
+        &self,
+        ctx: &RequestContext,
+        instance_id: &str,
+    ) -> Result<CreateSessionResult> {
         let resolved = self.resolve_instance(instance_id)?;
         let session = connect(&resolved)
             .with_context(|| format!("failed to connect to instance '{}'", instance_id))?;
@@ -235,12 +259,16 @@ impl DesktopCore {
         drop(sessions);
 
         let details = serde_json::json!({
+            "client_id": ctx.client_id,
+            "client_session_id": ctx.client_session_id,
             "instance_id": instance_id,
             "name": resolved.metadata.name,
             "host": resolved.metadata.host,
             "port": resolved.metadata.port,
         });
         self.store.insert_log(
+            &ctx.client_id,
+            &ctx.client_session_id,
             &session_id,
             instance_id,
             "create_session",
@@ -255,7 +283,11 @@ impl DesktopCore {
         })
     }
 
-    pub fn execute_command(&self, args: ExecuteCommandArgs) -> Result<ExecuteCommandResult> {
+    pub fn execute_command(
+        &self,
+        ctx: &RequestContext,
+        args: ExecuteCommandArgs,
+    ) -> Result<ExecuteCommandResult> {
         if args.command.trim().is_empty() {
             bail!("command cannot be empty");
         }
@@ -321,6 +353,8 @@ impl DesktopCore {
             .unwrap_or_else(|| instance_id.clone());
 
         let details = serde_json::json!({
+            "client_id": ctx.client_id,
+            "client_session_id": ctx.client_session_id,
             "instance_name": instance_name,
             "command": command,
             "stdout": result.stdout,
@@ -328,6 +362,8 @@ impl DesktopCore {
             "exit_code": result.exit_code,
         });
         self.store.insert_log(
+            &ctx.client_id,
+            &ctx.client_session_id,
             &session_id,
             &instance_id,
             "execute_command",
@@ -338,7 +374,11 @@ impl DesktopCore {
         Ok(result)
     }
 
-    pub fn upload_file(&self, args: UploadFileArgs) -> Result<UploadFileResult> {
+    pub fn upload_file(
+        &self,
+        ctx: &RequestContext,
+        args: UploadFileArgs,
+    ) -> Result<UploadFileResult> {
         let local_path = args.local_path.clone();
         let bytes = std::fs::read(&local_path)
             .with_context(|| format!("failed to read local path '{}'", local_path))?;
@@ -387,12 +427,16 @@ impl DesktopCore {
             .unwrap_or_else(|| instance_id.clone());
 
         let details = serde_json::json!({
+            "client_id": ctx.client_id,
+            "client_session_id": ctx.client_session_id,
             "instance_name": instance_name,
             "local_path": local_path.clone(),
             "remote_path": remote_path.clone(),
             "bytes_written": bytes_written,
         });
         self.store.insert_log(
+            &ctx.client_id,
+            &ctx.client_session_id,
             &session_id,
             &instance_id,
             "upload_file",
@@ -407,8 +451,12 @@ impl DesktopCore {
         })
     }
 
-    pub fn upload_local_file(&self, args: UploadLocalFileArgs) -> Result<UploadLocalFileResult> {
-        let result = self.upload_file(UploadFileArgs {
+    pub fn upload_local_file(
+        &self,
+        ctx: &RequestContext,
+        args: UploadLocalFileArgs,
+    ) -> Result<UploadLocalFileResult> {
+        let result = self.upload_file(ctx, UploadFileArgs {
             session_id: args.session_id,
             local_path: args.local_path.clone(),
             remote_path: args.remote_path.clone(),
@@ -422,7 +470,11 @@ impl DesktopCore {
         })
     }
 
-    pub fn download_file(&self, args: DownloadFileArgs) -> Result<DownloadFileResult> {
+    pub fn download_file(
+        &self,
+        ctx: &RequestContext,
+        args: DownloadFileArgs,
+    ) -> Result<DownloadFileResult> {
         let resolved_local_path =
             resolve_download_path(&args.remote_path, args.local_path.as_deref())?;
         let (instance_id, session_id, remote_path, result) = {
@@ -483,12 +535,16 @@ impl DesktopCore {
             .unwrap_or_else(|| instance_id.clone());
 
         let details = serde_json::json!({
+            "client_id": ctx.client_id,
+            "client_session_id": ctx.client_session_id,
             "instance_name": instance_name,
             "local_path": result.local_path.clone(),
             "remote_path": remote_path,
             "size": result.size,
         });
         self.store.insert_log(
+            &ctx.client_id,
+            &ctx.client_session_id,
             &session_id,
             &instance_id,
             "download_file",
@@ -499,12 +555,16 @@ impl DesktopCore {
         Ok(result)
     }
 
-    pub fn download_to_local(&self, args: DownloadToLocalArgs) -> Result<DownloadToLocalResult> {
+    pub fn download_to_local(
+        &self,
+        ctx: &RequestContext,
+        args: DownloadToLocalArgs,
+    ) -> Result<DownloadToLocalResult> {
         if !args.overwrite && Path::new(&args.local_path).exists() {
             bail!("local path '{}' already exists", args.local_path);
         }
 
-        let result = self.download_file(DownloadFileArgs {
+        let result = self.download_file(ctx, DownloadFileArgs {
             session_id: args.session_id,
             remote_path: args.remote_path.clone(),
             local_path: Some(args.local_path.clone()),
@@ -517,7 +577,11 @@ impl DesktopCore {
         })
     }
 
-    pub fn close_session(&self, session_id: &str) -> Result<CloseSessionResult> {
+    pub fn close_session(
+        &self,
+        ctx: &RequestContext,
+        session_id: &str,
+    ) -> Result<CloseSessionResult> {
         let instance_id = {
             let mut sessions = self
                 .sessions
@@ -543,10 +607,14 @@ impl DesktopCore {
             .unwrap_or_else(|| instance_id.clone());
 
         let details = serde_json::json!({
+            "client_id": ctx.client_id,
+            "client_session_id": ctx.client_session_id,
             "instance_name": instance_name,
             "instance_id": instance_id,
         });
         self.store.insert_log(
+            &ctx.client_id,
+            &ctx.client_session_id,
             session_id,
             &instance_id,
             "close_session",
@@ -557,7 +625,11 @@ impl DesktopCore {
         Ok(result)
     }
 
-    pub fn sudo_command(&self, args: SudoCommandArgs) -> Result<ExecuteCommandResult> {
+    pub fn sudo_command(
+        &self,
+        ctx: &RequestContext,
+        args: SudoCommandArgs,
+    ) -> Result<ExecuteCommandResult> {
         if args.command.trim().is_empty() {
             bail!("command cannot be empty");
         }
@@ -642,6 +714,8 @@ impl DesktopCore {
 
         // 日志不包含密码信息
         let details = serde_json::json!({
+            "client_id": ctx.client_id,
+            "client_session_id": ctx.client_session_id,
             "instance_name": instance_name,
             "command": format!("sudo {}", command),
             "stdout": result.stdout,
@@ -649,6 +723,8 @@ impl DesktopCore {
             "exit_code": result.exit_code,
         });
         self.store.insert_log(
+            &ctx.client_id,
+            &ctx.client_session_id,
             &session_id,
             &instance_id,
             "sudo",
@@ -991,6 +1067,13 @@ mod tests {
         (core, test_dir)
     }
 
+    fn test_context() -> RequestContext {
+        RequestContext {
+            client_id: "test-client".to_string(),
+            client_session_id: Uuid::new_v4().to_string(),
+        }
+    }
+
     #[test]
     fn download_to_local_rejects_existing_file_when_overwrite_disabled() {
         let (core, test_dir) = make_test_core();
@@ -998,7 +1081,7 @@ mod tests {
         std::fs::write(&local_path, "keep me").expect("existing file should be written");
 
         let err = core
-            .download_to_local(DownloadToLocalArgs {
+            .download_to_local(&test_context(), DownloadToLocalArgs {
                 session_id: "missing-session".to_string(),
                 remote_path: "/tmp/remote.txt".to_string(),
                 local_path: local_path.display().to_string(),
@@ -1116,7 +1199,7 @@ mod tests {
     fn close_session_unknown_id_returns_error() {
         let (core, test_dir) = make_test_core();
         let err = core
-            .close_session("nonexistent-session-id")
+            .close_session(&test_context(), "nonexistent-session-id")
             .expect_err("unknown session_id should fail");
 
         assert!(err.to_string().contains("unknown session_id"));
@@ -1128,7 +1211,7 @@ mod tests {
         let (core, test_dir) = make_test_core();
         // 空命令校验在 prompt_sudo_password 之前，不需要 GUI
         let err = core
-            .sudo_command(SudoCommandArgs {
+            .sudo_command(&test_context(), SudoCommandArgs {
                 session_id: "any".to_string(),
                 command: "   ".to_string(),
                 timeout_secs: None,

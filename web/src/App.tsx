@@ -51,6 +51,8 @@ type McpConfigBundle = {
 
 type OperationLogEntry = {
   id: number;
+  client_id: string;
+  client_session_id: string;
   session_id: string;
   instance_id: string;
   operation: string;
@@ -856,7 +858,9 @@ export default function App() {
               <div className="log-list" ref={logListRef}>
                 {logs.map((entry, index) => {
                   const prev = index > 0 ? logs[index - 1] : null;
-                  const sessionChange = !prev || prev.session_id !== entry.session_id;
+                  const sessionChange = !prev
+                    || prev.client_session_id !== entry.client_session_id
+                    || prev.session_id !== entry.session_id;
                   const shouldOpen = expandedStdout > 0
                     && entry.operation === "execute_command"
                     && index >= latestNExecIndex(logs, expandedStdout)
@@ -867,13 +871,21 @@ export default function App() {
                       {sessionChange ? (
                         <div className="log-separator">
                           <span className="log-separator-label">
-                            {parseLogInstanceName(entry)}
+                            {formatLogSeparator(entry)}
                           </span>
                         </div>
                       ) : null}
                       <div className="log-entry">
                         <div className="log-entry-meta">
                           <span className="log-time">{formatLogTime(entry.created_at)}</span>
+                          <span className="log-client-badge" title={entry.client_session_id || "client session"}>
+                            {formatClientLabel(entry)}
+                          </span>
+                          {entry.session_id ? (
+                            <span className="log-session-badge" title={entry.session_id}>
+                              ssh:{shortId(entry.session_id)}
+                            </span>
+                          ) : null}
                           <span className={`log-op-badge log-op-${entry.operation}`}>
                             {entry.operation}
                           </span>
@@ -1073,6 +1085,23 @@ function parseLogInstanceName(entry: OperationLogEntry): string {
   }
 }
 
+function shortId(value: string): string {
+  return value ? value.slice(0, 8) : "-";
+}
+
+function formatClientLabel(entry: OperationLogEntry): string {
+  const client = entry.client_id || "legacy";
+  const session = entry.client_session_id ? `:${shortId(entry.client_session_id)}` : "";
+  return `${client}${session}`;
+}
+
+function formatLogSeparator(entry: OperationLogEntry): string {
+  const client = formatClientLabel(entry);
+  const ssh = entry.session_id ? `ssh ${shortId(entry.session_id)}` : "no ssh session";
+  const target = parseLogInstanceName(entry);
+  return `${client} · ${ssh} · ${target}`;
+}
+
 function latestNExecIndex(logs: OperationLogEntry[], n: number): number {
   if (n === 0) return logs.length;
   let count = 0;
@@ -1125,6 +1154,14 @@ function LogEntryBody({ entry, autoOpenStdout }: { entry: OperationLogEntry; aut
     return (
       <div className="log-body">
         <span>session: {entry.session_id.slice(0, 8)}...{hostInfo}</span>
+      </div>
+    );
+  }
+
+  if (entry.operation === "client_connected" || entry.operation === "client_disconnected") {
+    return (
+      <div className="log-body">
+        <span>{formatClientLabel(entry)}</span>
       </div>
     );
   }

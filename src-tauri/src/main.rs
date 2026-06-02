@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tauri::{Emitter, Manager, State};
-use xiic_ssh_mcp::app_core::{DEFAULT_KEYRING_SERVICE, DesktopCore};
+use xiic_ssh_mcp::app_core::{DEFAULT_CLIENT_ID, DEFAULT_KEYRING_SERVICE, DesktopCore};
 use xiic_ssh_mcp::local_ipc::{
     LOG_NOTIFICATION_PAYLOAD, NOTIFY_HEALTH_CHECK_KIND, NOTIFY_HEALTH_OK_KIND,
     default_approval_endpoint, default_notify_endpoint, notify_server_healthy,
@@ -208,6 +208,7 @@ fn main() {
                 keyring_service: DEFAULT_KEYRING_SERVICE,
                 notify_endpoint: Some(&notify_endpoint),
                 approval_endpoint: Some(&approval_endpoint),
+                client_id: DEFAULT_CLIENT_ID,
                 helper_found: helper_resolution.found,
                 helper_warning: helper_resolution.warning,
             })?;

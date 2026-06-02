@@ -131,6 +131,8 @@ impl InstanceStore {
 
             CREATE TABLE IF NOT EXISTS operation_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id TEXT NOT NULL DEFAULT '',
+                client_session_id TEXT NOT NULL DEFAULT '',
                 session_id TEXT NOT NULL,
                 instance_id TEXT NOT NULL,
                 operation TEXT NOT NULL,
@@ -139,6 +141,8 @@ impl InstanceStore {
             );
 
             CREATE INDEX IF NOT EXISTS idx_operation_logs_created_at ON operation_logs(created_at);
+            CREATE INDEX IF NOT EXISTS idx_operation_logs_client_session_id ON operation_logs(client_session_id);
+            CREATE INDEX IF NOT EXISTS idx_operation_logs_session_id ON operation_logs(session_id);
 
             CREATE TABLE IF NOT EXISTS whitelist_rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,6 +156,14 @@ impl InstanceStore {
             INSERT OR IGNORE INTO whitelist_rules (rule_type, pattern, action, created_at)
             VALUES ('tool', 'list_servers', 'allow', datetime('now'));",
         )?;
+        let _ = connection.execute(
+            "ALTER TABLE operation_logs ADD COLUMN client_id TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = connection.execute(
+            "ALTER TABLE operation_logs ADD COLUMN client_session_id TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         Ok(())
     }
 
@@ -210,6 +222,8 @@ impl InstanceStore {
 
     pub fn insert_log(
         &self,
+        client_id: &str,
+        client_session_id: &str,
         session_id: &str,
         instance_id: &str,
         operation: &str,
@@ -222,9 +236,9 @@ impl InstanceStore {
         )?;
         let now = Utc::now().to_rfc3339();
         connection.execute(
-            "INSERT INTO operation_logs (session_id, instance_id, operation, details, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![session_id, instance_id, operation, details, now],
+            "INSERT INTO operation_logs (client_id, client_session_id, session_id, instance_id, operation, details, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![client_id, client_session_id, session_id, instance_id, operation, details, now],
         )?;
         Ok(())
     }
@@ -233,7 +247,7 @@ impl InstanceStore {
         let connection = self.open()?;
         let limit = limit.unwrap_or(200) as i64;
         let mut statement = connection.prepare(
-            "SELECT id, session_id, instance_id, operation, details, created_at
+            "SELECT id, client_id, client_session_id, session_id, instance_id, operation, details, created_at
              FROM operation_logs
              ORDER BY id DESC
              LIMIT ?1",
@@ -241,11 +255,13 @@ impl InstanceStore {
         let rows = statement.query_map([limit], |row| {
             Ok(OperationLogEntry {
                 id: row.get(0)?,
-                session_id: row.get(1)?,
-                instance_id: row.get(2)?,
-                operation: row.get(3)?,
-                details: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                created_at: row.get(5)?,
+                client_id: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                client_session_id: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                session_id: row.get(3)?,
+                instance_id: row.get(4)?,
+                operation: row.get(5)?,
+                details: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                created_at: row.get(7)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -260,7 +276,7 @@ impl InstanceStore {
         let connection = self.open()?;
         let limit = limit as i64;
         let mut statement = connection.prepare(
-            "SELECT id, session_id, instance_id, operation, details, created_at
+            "SELECT id, client_id, client_session_id, session_id, instance_id, operation, details, created_at
              FROM operation_logs
              WHERE id > ?1
              ORDER BY id ASC
@@ -269,11 +285,13 @@ impl InstanceStore {
         let rows = statement.query_map(params![since_id, limit], |row| {
             Ok(OperationLogEntry {
                 id: row.get(0)?,
-                session_id: row.get(1)?,
-                instance_id: row.get(2)?,
-                operation: row.get(3)?,
-                details: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                created_at: row.get(5)?,
+                client_id: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                client_session_id: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                session_id: row.get(3)?,
+                instance_id: row.get(4)?,
+                operation: row.get(5)?,
+                details: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                created_at: row.get(7)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()

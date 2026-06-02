@@ -1,8 +1,10 @@
 pub mod app_core;
 pub mod approval;
+pub mod broker;
 pub mod credentials;
 pub mod local_ipc;
 pub mod mcp;
+pub mod mcp_protocol;
 pub mod models;
 pub mod paths;
 pub mod settings;

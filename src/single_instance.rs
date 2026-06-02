@@ -28,24 +28,40 @@ impl SingleInstanceGuard {
                     }));
                 }
                 Err(err) if err.kind() == ErrorKind::AlreadyExists => {
-                    let deadline = Instant::now() + Duration::from_secs(2);
-                    while Instant::now() < deadline {
-                        if existing_owner_alive(path)? || is_healthy() {
-                            return Ok(None);
-                        }
-                        thread::sleep(Duration::from_millis(100));
-                    }
-
-                    if attempt < 2 {
-                        let _ = std::fs::remove_file(path);
-                        continue;
-                    }
-
-                    if existing_owner_alive(path)? || is_healthy() {
+                    if should_yield_to_existing_instance(path, &is_healthy)? {
                         return Ok(None);
                     }
 
-                    bail!("another instance lock exists at '{}'", path.display());
+                    remove_stale_lock(path)?;
+                    if attempt < 2 {
+                        continue;
+                    }
+
+                    match OpenOptions::new().write(true).create(true).truncate(true).open(path) {
+                        Ok(mut file) => {
+                            write_lock_owner_pid(&mut file).with_context(|| {
+                                format!(
+                                    "failed to write single-instance owner to '{}'",
+                                    path.display()
+                                )
+                            })?;
+                            return Ok(Some(Self {
+                                path: path.to_path_buf(),
+                                _file: file,
+                            }));
+                        }
+                        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                            if should_yield_to_existing_instance(path, &is_healthy)? {
+                                return Ok(None);
+                            }
+                            bail!("another instance lock exists at '{}'", path.display());
+                        }
+                        Err(err) => {
+                            return Err(err).with_context(|| {
+                                format!("failed to recover single-instance lock '{}'", path.display())
+                            });
+                        }
+                    }
                 }
                 Err(err) => {
                     return Err(err).with_context(|| {
@@ -59,6 +75,30 @@ impl SingleInstanceGuard {
             "failed to acquire single-instance lock '{}'",
             path.display()
         )
+    }
+}
+
+fn should_yield_to_existing_instance<F>(path: &Path, is_healthy: &F) -> Result<bool>
+where
+    F: Fn() -> bool,
+{
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if existing_owner_alive(path)? || is_healthy() {
+            return Ok(true);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    Ok(existing_owner_alive(path)? || is_healthy())
+}
+
+fn remove_stale_lock(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to remove stale single-instance lock '{}'", path.display())),
     }
 }
 
@@ -120,5 +160,37 @@ fn process_alive(pid: u32) -> bool {
 impl Drop for SingleInstanceGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    use super::SingleInstanceGuard;
+
+    #[test]
+    fn acquires_lock_after_stale_pid_file() {
+        let lock_path = std::env::temp_dir().join(format!(
+            "xiic-ssh-mcp-lock-{}.lock",
+            uuid::Uuid::new_v4()
+        ));
+
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+                .expect("should create stale lock");
+            writeln!(file, "999999").expect("should write fake pid");
+        }
+
+        let guard = SingleInstanceGuard::acquire(&lock_path, || false)
+            .expect("stale lock should be recoverable")
+            .expect("should acquire recovered lock");
+
+        drop(guard);
+        assert!(!lock_path.exists(), "lock should be cleaned up on drop");
     }
 }
