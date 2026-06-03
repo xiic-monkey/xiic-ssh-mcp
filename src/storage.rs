@@ -141,7 +141,6 @@ impl InstanceStore {
             );
 
             CREATE INDEX IF NOT EXISTS idx_operation_logs_created_at ON operation_logs(created_at);
-            CREATE INDEX IF NOT EXISTS idx_operation_logs_client_session_id ON operation_logs(client_session_id);
             CREATE INDEX IF NOT EXISTS idx_operation_logs_session_id ON operation_logs(session_id);
 
             CREATE TABLE IF NOT EXISTS whitelist_rules (
@@ -156,14 +155,12 @@ impl InstanceStore {
             INSERT OR IGNORE INTO whitelist_rules (rule_type, pattern, action, created_at)
             VALUES ('tool', 'list_servers', 'allow', datetime('now'));",
         )?;
-        let _ = connection.execute(
-            "ALTER TABLE operation_logs ADD COLUMN client_id TEXT NOT NULL DEFAULT ''",
+        ensure_operation_logs_column(&connection, "client_id")?;
+        ensure_operation_logs_column(&connection, "client_session_id")?;
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_operation_logs_client_session_id ON operation_logs(client_session_id)",
             [],
-        );
-        let _ = connection.execute(
-            "ALTER TABLE operation_logs ADD COLUMN client_session_id TEXT NOT NULL DEFAULT ''",
-            [],
-        );
+        )?;
         Ok(())
     }
 
@@ -433,12 +430,40 @@ fn auth_kind_from_str(value: &str) -> AuthKind {
     }
 }
 
+fn ensure_operation_logs_column(connection: &Connection, column_name: &str) -> Result<()> {
+    if operation_logs_column_exists(connection, column_name)? {
+        return Ok(());
+    }
+
+    let sql = format!(
+        "ALTER TABLE operation_logs ADD COLUMN {column_name} TEXT NOT NULL DEFAULT ''"
+    );
+    connection.execute(&sql, []).with_context(|| {
+        format!("failed to add '{column_name}' column to operation_logs")
+    })?;
+    Ok(())
+}
+
+fn operation_logs_column_exists(connection: &Connection, column_name: &str) -> Result<bool> {
+    let mut statement = connection.prepare("PRAGMA table_info(operation_logs)")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for column in rows {
+        if column? == column_name {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 #[allow(dead_code)]
 fn _ensure_send_sync(_: &Path) {}
 
 #[cfg(test)]
 mod tests {
     use std::env;
+
+    use rusqlite::Connection;
 
     use super::InstanceStore;
     use crate::models::{AuthKind, InstanceDraft, SecretPayload};
@@ -484,6 +509,49 @@ mod tests {
             .expect("secret should exist");
 
         assert_eq!(loaded, secret);
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn init_schema_migrates_operation_logs_from_old_schema() {
+        let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-storage-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).expect("test dir should be created");
+        let db_path = test_dir.join("instances.sqlite3");
+
+        let connection = Connection::open(&db_path).expect("legacy db should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE operation_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    instance_id TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    details TEXT,
+                    created_at TEXT NOT NULL
+                );",
+            )
+            .expect("legacy operation_logs table should be created");
+        drop(connection);
+
+        let store = InstanceStore::new(db_path.clone()).expect("store should migrate old schema");
+        let logs = store
+            .get_operation_logs(Some(10))
+            .expect("logs query should succeed after migration");
+        assert!(logs.is_empty(), "legacy db should still be readable");
+
+        let connection = Connection::open(&db_path).expect("migrated db should open");
+        let mut statement = connection
+            .prepare("PRAGMA table_info(operation_logs)")
+            .expect("pragma should prepare");
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("pragma should query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("columns should collect");
+
+        assert!(columns.contains(&"client_id".to_string()));
+        assert!(columns.contains(&"client_session_id".to_string()));
 
         std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
     }

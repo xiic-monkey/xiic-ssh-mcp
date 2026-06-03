@@ -1,6 +1,6 @@
 [package]
 name = "xiic-ssh-approval"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 
 [build-dependencies]
@@ -13,3 +13,6 @@ serde_json = "1.0.145"
 tauri = { version = "2.11.0", features = [] }
 tokio = { version = "1", features = ["net", "io-util", "rt", "rt-multi-thread", "time"] }
 xiic-ssh-mcp = { path = ".." }
+
+[patch.crates-io]
+tao = { path = "../vendor/tao" }
