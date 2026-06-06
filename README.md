@@ -68,7 +68,7 @@ Xiic SSH MCP 是一个本地 MCP 服务器，为 Cursor、Claude Desktop 等 AI 
 
 ### 凭据存储
 
-SSH 密码和私钥通过操作系统 Keychain 安全存储，私钥仅驻留内存、不落盘。
+SSH 密码和私钥通过操作系统 Keychain 安全存储。
 
 ## 安装
 
