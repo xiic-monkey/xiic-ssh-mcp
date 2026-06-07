@@ -336,10 +336,8 @@ pub fn prompt_sudo_password() -> Result<String> {
         }
 
         // 最后尝试 SSH_ASKPASS 方式（支持终端内的文本输入）
-        let temp_script = std::env::temp_dir().join(format!(
-            "xiic-ssh-query-{}.sh",
-            uuid::Uuid::new_v4()
-        ));
+        let temp_script =
+            std::env::temp_dir().join(format!("xiic-ssh-query-{}.sh", uuid::Uuid::new_v4()));
         let script_content = r#"#!/bin/sh
 stty -echo
 printf "请输入 sudo 密码："

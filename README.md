@@ -60,15 +60,13 @@ Xiic SSH MCP 是一个本地 MCP 服务器，为 Cursor、Claude Desktop 等 AI 
 - **Local 模式**：弹出独立的审批窗口（Tauri 应用），或使用系统原生弹窗
 
 审批模式由 `--approval-mode` 参数控制：
-- `auto`（默认）：使用 local 审批，设置中的「使用系统弹窗进行审核」开关决定使用系统原生对话框还是独立审批窗口
-- `elicitation`：强制 elicitation
+- `auto`（默认）：客户端声明支持 elicitation 时使用 elicitation，否则使用 local；设置中的「使用系统弹窗进行审核」开启时始终使用 local
+- `elicitation`：强制 elicitation；如果客户端未声明支持 elicitation 能力，会直接拒绝该操作
 - `local`：强制本地审批
 
 设置中的「使用系统弹窗进行审核」开启时，local 审批会直接调用系统原生对话框（macOS AppleScript / Windows PowerShell / Linux zenity），跳过审批 App；关闭时则使用独立审批窗口。
 
 ### 凭据存储
-
-SSH 密码和私钥通过操作系统 Keychain 安全存储。
 
 ## 安装
 

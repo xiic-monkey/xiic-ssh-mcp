@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{self, BufReader, Read, Write};
 use std::sync::Arc;
 
@@ -8,14 +9,14 @@ use uuid::Uuid;
 
 use crate::app_core::DesktopCore;
 use crate::approval::LocalApprovalClient;
+use crate::mcp_protocol::{IncomingMessage, MessageFraming, read_message, write_message};
 use crate::models::{
     ApprovalMode, ApprovalOperationMetadata, CloseSessionArgs, CreateSessionResult,
     DownloadFileArgs, DownloadFileResult, DownloadToLocalArgs, DownloadToLocalResult,
-    ExecuteCommandArgs, ExecuteCommandResult, OperationContext, PendingToolCall, RuleDecision,
-    RequestContext, SudoCommandArgs, ToolCall, UploadFileArgs, UploadFileResult,
-    UploadLocalFileArgs, UploadLocalFileResult, WhitelistMode,
+    ExecuteCommandArgs, ExecuteCommandResult, OperationContext, PendingToolCall, RequestContext,
+    RuleDecision, SudoCommandArgs, ToolCall, UploadFileArgs, UploadFileResult, UploadLocalFileArgs,
+    UploadLocalFileResult, WhitelistMode,
 };
-use crate::mcp_protocol::{MessageFraming, read_message, write_message};
 use crate::whitelist::WhitelistChecker;
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -30,8 +31,9 @@ enum DispatchResult {
     },
 }
 
+#[derive(Debug)]
 enum ApprovalFlow {
-    Elicitation(Value),
+    Elicitation { request_id: Value, request: Value },
     Local,
 }
 
@@ -40,6 +42,7 @@ pub struct McpServer {
     whitelist_mode: WhitelistMode,
     approval_mode: ApprovalMode,
     client_supports_elicitation: bool,
+    pending_messages: VecDeque<IncomingMessage>,
     checker: WhitelistChecker,
     local_approval: LocalApprovalClient,
 }
@@ -57,6 +60,7 @@ impl McpServer {
             whitelist_mode,
             approval_mode,
             client_supports_elicitation: false,
+            pending_messages: VecDeque::new(),
             checker,
             local_approval: LocalApprovalClient::new(approval_endpoint),
         }
@@ -77,7 +81,7 @@ impl McpServer {
         eprintln!("[xiic-ssh-mcp] MCP server starting, waiting for messages...");
 
         loop {
-            let message = match read_message(&mut reader)? {
+            let message = match self.next_message(&mut reader)? {
                 Some(msg) => msg,
                 None => break,
             };
@@ -145,17 +149,26 @@ impl McpServer {
                 Err(err) => DispatchResult::Respond(error_response(id, -32602, err.to_string())),
             },
             "ping" => DispatchResult::Respond(success_response(id, json!({}))),
-            "resources/list" => DispatchResult::Respond(success_response(id, json!({
-                "resources": []
-            }))),
+            "resources/list" => DispatchResult::Respond(success_response(
+                id,
+                json!({
+                    "resources": []
+                }),
+            )),
             "tools/list" => DispatchResult::Respond(success_response(id, self.handle_tools_list())),
-            "tools/call" => match self.handle_tool_call(request_context.clone(), params, id.clone()) {
-                Ok(result) => {
-                    result
+            "tools/call" => {
+                match self.handle_tool_call(request_context.clone(), params, id.clone()) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        DispatchResult::Respond(success_response(id, tool_error(err.to_string())))
+                    }
                 }
-                Err(err) => DispatchResult::Respond(success_response(id, tool_error(err.to_string()))),
-            },
-            _ => DispatchResult::Respond(error_response(id, -32601, format!("method '{}' not found", method))),
+            }
+            _ => DispatchResult::Respond(error_response(
+                id,
+                -32601,
+                format!("method '{}' not found", method),
+            )),
         };
 
         match result {
@@ -164,8 +177,12 @@ impl McpServer {
             }
             DispatchResult::NeedsApproval { flow, pending } => {
                 let accepted = match flow {
-                    ApprovalFlow::Elicitation(elicitation) => self
-                        .request_elicitation_approval(reader, writer, framing, &pending, elicitation)?,
+                    ApprovalFlow::Elicitation {
+                        request_id,
+                        request,
+                    } => self.request_elicitation_approval(
+                        reader, writer, framing, &pending, request_id, request,
+                    )?,
                     ApprovalFlow::Local => self.local_approval.request(&pending.approval)?,
                 };
 
@@ -185,6 +202,20 @@ impl McpServer {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn next_message<R>(
+        &mut self,
+        reader: &mut BufReader<R>,
+    ) -> Result<Option<IncomingMessage>>
+    where
+        R: Read,
+    {
+        if let Some(message) = self.pending_messages.pop_front() {
+            return Ok(Some(message));
+        }
+
+        read_message(reader)
     }
 
     fn handle_notification(&self, method: &str, _params: Value) -> Result<()> {
@@ -385,28 +416,17 @@ impl McpServer {
                 );
                 Ok(DispatchResult::Respond(error_response(id, -32001, reason)))
             }
-            RuleDecision::NeedsElicitation => {
-                let elicitation_id = Uuid::new_v4().to_string();
-                let details = json!({
-                    "tool_name": ctx.tool_name,
-                    "command": ctx.command,
-                    "remote_path": ctx.remote_path,
-                    "instance_id": ctx.instance_id,
-                });
-                let elicitation = json!({
-                    "jsonrpc": "2.0",
-                    "id": elicitation_id,
-                    "method": "elicitation/create",
-                    "params": {
-                        "message": format!(
-                            "SSH operation '{}' requires approval.",
-                            ctx.tool_name
-                        ),
-                        "requestId": Uuid::new_v4().to_string(),
-                        "details": details,
+            RuleDecision::NeedsApproval => {
+                let flow = match self.approval_flow_for(&ctx) {
+                    Ok(flow) => flow,
+                    Err(err) => {
+                        return Ok(DispatchResult::Respond(error_response(
+                            id,
+                            -32002,
+                            err.to_string(),
+                        )));
                     }
-                });
-
+                };
                 let approval = ApprovalOperationMetadata::from(&ctx);
                 let pending = Box::new(PendingToolCall {
                     id,
@@ -416,25 +436,72 @@ impl McpServer {
                     context: request_context,
                 });
 
-                let use_system = crate::settings::load_settings().use_system_approval;
-                let flow = if should_use_local_approval_flow(use_system, self.approval_mode) {
-                    ApprovalFlow::Local
-                } else {
-                    ApprovalFlow::Elicitation(elicitation)
-                };
-
                 Ok(DispatchResult::NeedsApproval { flow, pending })
             }
         }
     }
 
+    fn approval_flow_for(&self, ctx: &OperationContext) -> Result<ApprovalFlow> {
+        match self.approval_mode {
+            ApprovalMode::Local => Ok(ApprovalFlow::Local),
+            ApprovalMode::Auto => {
+                if crate::settings::load_settings().use_system_approval
+                    || !self.client_supports_elicitation
+                {
+                    Ok(ApprovalFlow::Local)
+                } else {
+                    Ok(self.build_elicitation_flow(ctx))
+                }
+            }
+            ApprovalMode::Elicitation => {
+                if self.client_supports_elicitation {
+                    Ok(self.build_elicitation_flow(ctx))
+                } else {
+                    bail!(
+                        "approval mode 'elicitation' requires a client that advertises the MCP elicitation capability"
+                    )
+                }
+            }
+        }
+    }
+
+    fn build_elicitation_flow(&self, ctx: &OperationContext) -> ApprovalFlow {
+        let request_id = Value::String(Uuid::new_v4().to_string());
+        let details = json!({
+            "tool_name": ctx.tool_name,
+            "command": ctx.command,
+            "remote_path": ctx.remote_path,
+            "local_path": ctx.local_path,
+            "instance_id": ctx.instance_id,
+        });
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "elicitation/create",
+            "params": {
+                "message": format!(
+                    "SSH operation '{}' requires approval.",
+                    ctx.tool_name
+                ),
+                "requestId": Uuid::new_v4().to_string(),
+                "details": details,
+            }
+        });
+
+        ApprovalFlow::Elicitation {
+            request_id,
+            request,
+        }
+    }
+
     fn request_elicitation_approval<R, W>(
-        &self,
+        &mut self,
         reader: &mut BufReader<R>,
         writer: &mut W,
         framing: MessageFraming,
         pending: &PendingToolCall,
-        elicitation: Value,
+        request_id: Value,
+        request: Value,
     ) -> Result<bool>
     where
         R: Read,
@@ -444,18 +511,46 @@ impl McpServer {
             "[xiic-ssh-mcp] Sending elicitation for tool='{}'",
             pending.tool_call.name
         );
-        write_message(writer, &elicitation, framing)?;
+        write_message(writer, &request, framing)?;
 
-        let elicitation_response = read_message(reader)?
-            .ok_or_else(|| anyhow!("stdin closed while waiting for elicitation response"))?;
+        loop {
+            let message = read_message(reader)?
+                .ok_or_else(|| anyhow!("stdin closed while waiting for elicitation response"))?;
 
-        let result = elicitation_response
-            .payload
-            .get("result")
-            .and_then(|r| r.get("action"))
-            .and_then(|a| a.as_str());
+            if message.payload.get("id") == Some(&request_id) {
+                if message.payload.get("error").is_some() {
+                    return Ok(false);
+                }
 
-        Ok(matches!(result, Some("accept")))
+                let result = message
+                    .payload
+                    .get("result")
+                    .and_then(|result| result.get("action"))
+                    .and_then(Value::as_str);
+                return Ok(matches!(result, Some("accept")));
+            }
+
+            if let Some(method) = message.payload.get("method").and_then(Value::as_str) {
+                if message.payload.get("id").is_none() {
+                    let params = message
+                        .payload
+                        .get("params")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    self.handle_notification(method, params)?;
+                    continue;
+                }
+
+                if method == "ping" {
+                    if let Some(id) = message.payload.get("id").cloned() {
+                        write_message(writer, &success_response(id, json!({})), message.framing)?;
+                    }
+                    continue;
+                }
+            }
+
+            self.pending_messages.push_back(message);
+        }
     }
 
     fn build_context(&self, tool_call: &ToolCall) -> Result<OperationContext> {
@@ -582,7 +677,9 @@ impl McpServer {
                     instance_id: String,
                 }
                 let args: Args = deserialize_args(tool_call.arguments.clone())?;
-                let result = self.core.create_session(request_context, &args.instance_id)?;
+                let result = self
+                    .core
+                    .create_session(request_context, &args.instance_id)?;
                 tool_success(result)
             }
             "execute_command" => {
@@ -625,37 +722,17 @@ impl McpServer {
     }
 }
 
-fn has_elicitation_capability(capabilities: Option<&Value>) -> bool {
-    capabilities
-        .and_then(|capabilities| capabilities.get("elicitation"))
-        .is_some()
-}
-
-#[cfg(test)]
-fn should_use_elicitation_mode(mode: ApprovalMode, client_supports_elicitation: bool) -> bool {
-    match mode {
-        ApprovalMode::Elicitation => true,
-        ApprovalMode::Local => false,
-        ApprovalMode::Auto => client_supports_elicitation,
-    }
-}
-
-fn should_use_local_approval_flow(use_system_approval: bool, approval_mode: ApprovalMode) -> bool {
-    if use_system_approval {
-        return true;
-    }
-
-    match approval_mode {
-        ApprovalMode::Elicitation => false,
-        ApprovalMode::Local | ApprovalMode::Auto => true,
-    }
-}
-
 fn deserialize_args<T>(value: Value) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
     serde_json::from_value(value).context("invalid tool arguments")
+}
+
+fn has_elicitation_capability(capabilities: Option<&Value>) -> bool {
+    capabilities
+        .and_then(|capabilities| capabilities.get("elicitation"))
+        .is_some()
 }
 
 fn success_response(id: Value, result: Value) -> Value {
@@ -719,7 +796,15 @@ fn _type_assertions(
     download_local: DownloadToLocalResult,
     close: crate::models::CloseSessionResult,
 ) {
-    let _ = (create, exec, upload, download, upload_local, download_local, close);
+    let _ = (
+        create,
+        exec,
+        upload,
+        download,
+        upload_local,
+        download_local,
+        close,
+    );
 }
 
 #[cfg(test)]
@@ -733,10 +818,7 @@ mod tests {
     use crate::app_core::{DEFAULT_KEYRING_SERVICE, DesktopCore};
     use crate::models::{ApprovalMode, RequestContext, WhitelistMode};
 
-    use super::{
-        McpServer, MessageFraming, deserialize_args, has_elicitation_capability, read_message,
-        should_use_elicitation_mode, should_use_local_approval_flow, write_message,
-    };
+    use super::{McpServer, MessageFraming, deserialize_args, read_message, write_message};
 
     fn initialize_payload() -> serde_json::Value {
         json!({
@@ -821,41 +903,6 @@ mod tests {
     }
 
     #[test]
-    fn detects_elicitation_capability() {
-        let capabilities = json!({
-            "roots": {},
-            "elicitation": {}
-        });
-
-        assert!(has_elicitation_capability(Some(&capabilities)));
-        assert!(!has_elicitation_capability(Some(&json!({ "roots": {} }))));
-        assert!(!has_elicitation_capability(None));
-    }
-
-    #[test]
-    fn approval_mode_selects_expected_flow() {
-        assert!(should_use_elicitation_mode(ApprovalMode::Auto, true));
-        assert!(!should_use_elicitation_mode(ApprovalMode::Auto, false));
-        assert!(should_use_elicitation_mode(
-            ApprovalMode::Elicitation,
-            false
-        ));
-        assert!(!should_use_elicitation_mode(ApprovalMode::Local, true));
-    }
-
-    #[test]
-    fn local_approval_flow_respects_system_toggle_and_mode() {
-        assert!(should_use_local_approval_flow(true, ApprovalMode::Auto));
-        assert!(should_use_local_approval_flow(true, ApprovalMode::Elicitation));
-        assert!(should_use_local_approval_flow(false, ApprovalMode::Local));
-        assert!(should_use_local_approval_flow(false, ApprovalMode::Auto));
-        assert!(!should_use_local_approval_flow(
-            false,
-            ApprovalMode::Elicitation
-        ));
-    }
-
-    #[test]
     fn resources_list_returns_empty_resources() {
         let mut server = test_server();
         let mut reader = BufReader::new(Cursor::new(Vec::<u8>::new()));
@@ -911,7 +958,106 @@ mod tests {
         assert_eq!(args.command, "uname -a");
     }
 
+    #[test]
+    fn forced_elicitation_requires_client_capability() {
+        let server = test_server_with_mode(ApprovalMode::Elicitation);
+        let err = server
+            .approval_flow_for(&crate::models::OperationContext {
+                tool_name: "execute_command".to_string(),
+                command: Some("uname -a".to_string()),
+                remote_path: None,
+                local_path: None,
+                instance_id: Some("dev-server".to_string()),
+            })
+            .unwrap_err();
+
+        assert!(err.to_string().contains("elicitation"));
+    }
+
+    #[test]
+    fn elicitation_wait_matches_response_id_and_preserves_other_messages() {
+        let mut server = test_server_with_mode(ApprovalMode::Elicitation);
+        let mut init_reader = BufReader::new(Cursor::new(Vec::<u8>::new()));
+        let mut init_output = Vec::new();
+        server
+            .dispatch_with_context(
+                test_context(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {
+                            "elicitation": {}
+                        }
+                    }
+                }),
+                MessageFraming::Newline,
+                &mut init_reader,
+                &mut init_output,
+            )
+            .unwrap();
+
+        let queued_tool_response = json!({
+            "jsonrpc": "2.0",
+            "id": 999,
+            "result": {}
+        });
+        let ping = json!({
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "ping",
+            "params": {}
+        });
+        let accept = json!({
+            "jsonrpc": "2.0",
+            "id": "elicitation-id",
+            "result": {
+                "action": "accept"
+            }
+        });
+        let mut reader = BufReader::new(Cursor::new(format!(
+            "{}\n{}\n{}\n",
+            queued_tool_response, ping, accept
+        )));
+        let mut output = Vec::new();
+        let pending = test_pending_tool_call();
+
+        let accepted = server
+            .request_elicitation_approval(
+                &mut reader,
+                &mut output,
+                MessageFraming::Newline,
+                &pending,
+                json!("elicitation-id"),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "elicitation-id",
+                    "method": "elicitation/create",
+                    "params": {}
+                }),
+            )
+            .unwrap();
+
+        assert!(accepted);
+
+        let mut output_reader = BufReader::new(Cursor::new(output));
+        let elicitation_request = read_message(&mut output_reader).unwrap().unwrap();
+        assert_eq!(elicitation_request.payload["method"], "elicitation/create");
+        let ping_response = read_message(&mut output_reader).unwrap().unwrap();
+        assert_eq!(ping_response.payload["id"], 100);
+        assert!(read_message(&mut output_reader).unwrap().is_none());
+
+        let queued = server.next_message(&mut reader).unwrap().unwrap();
+        assert_eq!(queued.payload, queued_tool_response);
+    }
+
     fn test_server() -> McpServer {
+        test_server_with_mode(ApprovalMode::Auto)
+    }
+
+    fn test_server_with_mode(approval_mode: ApprovalMode) -> McpServer {
         let db_path = PathBuf::from(format!(
             "/private/tmp/xiic-ssh-mcp-test-{}.sqlite3",
             uuid::Uuid::new_v4()
@@ -920,9 +1066,32 @@ mod tests {
             DesktopCore::new(db_path.clone(), DEFAULT_KEYRING_SERVICE)
                 .expect("test core should initialize"),
         );
-        let server = McpServer::new(core, WhitelistMode::Strict, ApprovalMode::Auto, None);
+        let server = McpServer::new(core, WhitelistMode::Strict, approval_mode, None);
         let _ = std::fs::remove_file(db_path);
         server
+    }
+
+    fn test_pending_tool_call() -> crate::models::PendingToolCall {
+        let tool_call = crate::models::ToolCall {
+            name: "create_session".to_string(),
+            arguments: json!({
+                "instance_id": "dev-server"
+            }),
+        };
+        let operation = crate::models::OperationContext {
+            tool_name: "create_session".to_string(),
+            command: None,
+            remote_path: None,
+            local_path: None,
+            instance_id: Some("dev-server".to_string()),
+        };
+        crate::models::PendingToolCall {
+            id: json!(7),
+            tool_call,
+            approval: crate::models::ApprovalOperationMetadata::from(&operation),
+            operation,
+            context: test_context(),
+        }
     }
 
     fn test_context() -> RequestContext {

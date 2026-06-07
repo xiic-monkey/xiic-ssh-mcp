@@ -351,7 +351,7 @@ pub struct OperationContext {
 pub enum RuleDecision {
     Allow,
     Deny(String),
-    NeedsElicitation,
+    NeedsApproval,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

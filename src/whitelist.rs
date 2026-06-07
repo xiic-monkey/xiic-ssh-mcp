@@ -67,9 +67,9 @@ impl WhitelistChecker {
             .filter(|r| r.enabled && r.action == RuleAction::Allow)
         {
             match rule.rule_type {
-                RuleType::Command => {}
+                RuleType::Command | RuleType::Path => {}
                 _ => {
-                    if let Some(value) = rule_value(ctx, &rule.rule_type)
+                    if let Some(value) = matching_rule_value(ctx, rule)
                         && glob_match(&rule.pattern, value)
                     {
                         covered_dims
@@ -82,6 +82,9 @@ impl WhitelistChecker {
 
         if command_allow_covered(command_analysis.as_ref(), rules) {
             covered_dims.entry("command").or_insert(0);
+        }
+        if path_allow_covered(ctx, rules) {
+            covered_dims.entry("path").or_insert(0);
         }
 
         // All present dimensions must be covered by allow rules
@@ -100,7 +103,7 @@ impl WhitelistChecker {
             return RuleDecision::Allow;
         }
 
-        RuleDecision::NeedsElicitation
+        RuleDecision::NeedsApproval
     }
 
     fn present_dimensions(ctx: &OperationContext) -> Vec<&str> {
@@ -108,7 +111,7 @@ impl WhitelistChecker {
         if ctx.command.is_some() {
             dims.push("command");
         }
-        if ctx.remote_path.is_some() {
+        if ctx.remote_path.is_some() || ctx.local_path.is_some() {
             dims.push("path");
         }
         if ctx.instance_id.is_some() {
@@ -123,13 +126,30 @@ impl WhitelistChecker {
     }
 }
 
-fn rule_value<'a>(ctx: &'a OperationContext, rule_type: &RuleType) -> Option<&'a str> {
+fn rule_values<'a>(ctx: &'a OperationContext, rule_type: &RuleType) -> Vec<&'a str> {
     match rule_type {
-        RuleType::Tool => Some(ctx.tool_name.as_str()),
-        RuleType::Command => ctx.command.as_deref(),
-        RuleType::Path => ctx.remote_path.as_deref(),
-        RuleType::Instance => ctx.instance_id.as_deref(),
+        RuleType::Tool => vec![ctx.tool_name.as_str()],
+        RuleType::Command => ctx.command.as_deref().into_iter().collect(),
+        RuleType::Path => path_values(ctx),
+        RuleType::Instance => ctx.instance_id.as_deref().into_iter().collect(),
     }
+}
+
+fn matching_rule_value<'a>(ctx: &'a OperationContext, rule: &'a WhitelistRule) -> Option<&'a str> {
+    rule_values(ctx, &rule.rule_type)
+        .into_iter()
+        .find(|value| glob_match(&rule.pattern, value))
+}
+
+fn path_values(ctx: &OperationContext) -> Vec<&str> {
+    let mut values = Vec::new();
+    if let Some(remote_path) = ctx.remote_path.as_deref() {
+        values.push(remote_path);
+    }
+    if let Some(local_path) = ctx.local_path.as_deref() {
+        values.push(local_path);
+    }
+    values
 }
 
 fn matching_deny_value<'a>(
@@ -138,8 +158,7 @@ fn matching_deny_value<'a>(
     rule: &'a WhitelistRule,
 ) -> Option<(&'a str, &'a WhitelistRule)> {
     if rule.rule_type != RuleType::Command {
-        let value = rule_value(ctx, &rule.rule_type)?;
-        return glob_match(&rule.pattern, value).then_some((value, rule));
+        return matching_rule_value(ctx, rule).map(|value| (value, rule));
     }
 
     let command = ctx.command.as_deref()?;
@@ -169,6 +188,19 @@ fn command_allow_covered(analysis: Option<&CommandAnalysis>, rules: &[WhitelistR
                     && rule.action == RuleAction::Allow
                     && rule.rule_type == RuleType::Command
                     && glob_match(&rule.pattern, segment)
+            })
+        })
+}
+
+fn path_allow_covered(ctx: &OperationContext, rules: &[WhitelistRule]) -> bool {
+    let values = path_values(ctx);
+    !values.is_empty()
+        && values.iter().all(|value| {
+            rules.iter().any(|rule| {
+                rule.enabled
+                    && rule.action == RuleAction::Allow
+                    && rule.rule_type == RuleType::Path
+                    && glob_match(&rule.pattern, value)
             })
         })
 }
@@ -283,10 +315,11 @@ fn push_segment(command: &str, start: usize, end: usize, segments: &mut Vec<Stri
 
 pub fn approval_key(ctx: &OperationContext) -> String {
     format!(
-        "{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}",
         ctx.tool_name,
         ctx.command.as_deref().unwrap_or(""),
         ctx.remote_path.as_deref().unwrap_or(""),
+        ctx.local_path.as_deref().unwrap_or(""),
         ctx.instance_id.as_deref().unwrap_or(""),
     )
 }
@@ -368,6 +401,25 @@ mod tests {
         rules
     }
 
+    fn transfer_ctx(tool_name: &str, remote_path: &str, local_path: &str) -> OperationContext {
+        OperationContext {
+            tool_name: tool_name.into(),
+            command: None,
+            remote_path: Some(remote_path.into()),
+            local_path: Some(local_path.into()),
+            instance_id: Some("dev-server".into()),
+        }
+    }
+
+    fn transfer_rules(tool_name: &str, path_rules: Vec<WhitelistRule>) -> Vec<WhitelistRule> {
+        let mut rules = vec![
+            rule(1, RuleType::Tool, tool_name, RuleAction::Allow),
+            rule(2, RuleType::Instance, "*", RuleAction::Allow),
+        ];
+        rules.extend(path_rules);
+        rules
+    }
+
     #[test]
     fn glob_star_matches_all() {
         assert!(glob_match("*", "anything"));
@@ -433,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_needs_elicitation() {
+    fn evaluate_needs_approval() {
         let rules = vec![rule(1, RuleType::Tool, "list_servers", RuleAction::Allow)];
 
         let ctx = OperationContext {
@@ -446,7 +498,105 @@ mod tests {
 
         let approvals = HashMap::new();
         let result = WhitelistChecker::evaluate(&rules, &ctx, &approvals);
-        assert!(matches!(result, RuleDecision::NeedsElicitation));
+        assert!(matches!(result, RuleDecision::NeedsApproval));
+    }
+
+    #[test]
+    fn path_allow_requires_local_path_for_uploads() {
+        let rules = transfer_rules(
+            "upload_file",
+            vec![rule(3, RuleType::Path, "/srv/uploads/*", RuleAction::Allow)],
+        );
+        let ctx = transfer_ctx("upload_file", "/srv/uploads/config.txt", "/etc/shadow");
+
+        let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
+
+        assert!(matches!(result, RuleDecision::NeedsApproval));
+    }
+
+    #[test]
+    fn path_allow_requires_local_path_for_downloads() {
+        let rules = transfer_rules(
+            "download_to_local",
+            vec![rule(
+                3,
+                RuleType::Path,
+                "/srv/downloads/*",
+                RuleAction::Allow,
+            )],
+        );
+        let ctx = transfer_ctx(
+            "download_to_local",
+            "/srv/downloads/report.txt",
+            "/Users/test/.ssh/authorized_keys",
+        );
+
+        let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
+
+        assert!(matches!(result, RuleDecision::NeedsApproval));
+    }
+
+    #[test]
+    fn path_allow_covers_transfer_when_remote_and_local_paths_match() {
+        let rules = transfer_rules(
+            "upload_file",
+            vec![
+                rule(3, RuleType::Path, "/srv/uploads/*", RuleAction::Allow),
+                rule(
+                    4,
+                    RuleType::Path,
+                    "/Users/test/exports/*",
+                    RuleAction::Allow,
+                ),
+            ],
+        );
+        let ctx = transfer_ctx(
+            "upload_file",
+            "/srv/uploads/config.txt",
+            "/Users/test/exports/config.txt",
+        );
+
+        let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
+
+        assert!(matches!(result, RuleDecision::Allow));
+    }
+
+    #[test]
+    fn path_deny_matches_local_path() {
+        let rules = transfer_rules(
+            "upload_file",
+            vec![
+                rule(3, RuleType::Path, "/srv/uploads/*", RuleAction::Allow),
+                rule(
+                    4,
+                    RuleType::Path,
+                    "/Users/test/exports/*",
+                    RuleAction::Allow,
+                ),
+                rule(5, RuleType::Path, "/etc/*", RuleAction::Deny),
+            ],
+        );
+        let ctx = transfer_ctx("upload_file", "/srv/uploads/config.txt", "/etc/shadow");
+
+        let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
+
+        assert!(matches!(result, RuleDecision::Deny(_)));
+    }
+
+    #[test]
+    fn approval_key_includes_local_path() {
+        let first = transfer_ctx(
+            "download_to_local",
+            "/srv/downloads/report.txt",
+            "/tmp/a.txt",
+        );
+        let second = transfer_ctx(
+            "download_to_local",
+            "/srv/downloads/report.txt",
+            "/tmp/b.txt",
+        );
+
+        assert_ne!(approval_key(&first), approval_key(&second));
     }
 
     #[test]
@@ -463,13 +613,13 @@ mod tests {
     }
 
     #[test]
-    fn compound_command_needs_elicitation_when_any_segment_is_not_allowed() {
+    fn compound_command_needs_approval_when_any_segment_is_not_allowed() {
         let rules = base_rules(vec![rule(3, RuleType::Command, "cd *", RuleAction::Allow)]);
         let ctx = execute_ctx("cd xx & rm -rf /");
 
         let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
 
-        assert!(matches!(result, RuleDecision::NeedsElicitation));
+        assert!(matches!(result, RuleDecision::NeedsApproval));
     }
 
     #[test]
@@ -527,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn complex_command_substitution_needs_elicitation() {
+    fn complex_command_substitution_needs_approval() {
         let rules = base_rules(vec![rule(
             3,
             RuleType::Command,
@@ -538,11 +688,11 @@ mod tests {
 
         let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
 
-        assert!(matches!(result, RuleDecision::NeedsElicitation));
+        assert!(matches!(result, RuleDecision::NeedsApproval));
     }
 
     #[test]
-    fn complex_backticks_need_elicitation() {
+    fn complex_backticks_need_approval() {
         let rules = base_rules(vec![rule(
             3,
             RuleType::Command,
@@ -553,11 +703,11 @@ mod tests {
 
         let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
 
-        assert!(matches!(result, RuleDecision::NeedsElicitation));
+        assert!(matches!(result, RuleDecision::NeedsApproval));
     }
 
     #[test]
-    fn redirection_needs_elicitation() {
+    fn redirection_needs_approval() {
         let rules = base_rules(vec![rule(
             3,
             RuleType::Command,
@@ -568,11 +718,11 @@ mod tests {
 
         let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
 
-        assert!(matches!(result, RuleDecision::NeedsElicitation));
+        assert!(matches!(result, RuleDecision::NeedsApproval));
     }
 
     #[test]
-    fn malformed_commands_need_elicitation() {
+    fn malformed_commands_need_approval() {
         let rules = base_rules(vec![rule(3, RuleType::Command, "ls *", RuleAction::Allow)]);
 
         let unclosed_quote =
@@ -580,7 +730,7 @@ mod tests {
         let empty_segment =
             WhitelistChecker::evaluate(&rules, &execute_ctx("ls &&"), &HashMap::new());
 
-        assert!(matches!(unclosed_quote, RuleDecision::NeedsElicitation));
-        assert!(matches!(empty_segment, RuleDecision::NeedsElicitation));
+        assert!(matches!(unclosed_quote, RuleDecision::NeedsApproval));
+        assert!(matches!(empty_segment, RuleDecision::NeedsApproval));
     }
 }

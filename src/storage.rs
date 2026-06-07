@@ -435,12 +435,11 @@ fn ensure_operation_logs_column(connection: &Connection, column_name: &str) -> R
         return Ok(());
     }
 
-    let sql = format!(
-        "ALTER TABLE operation_logs ADD COLUMN {column_name} TEXT NOT NULL DEFAULT ''"
-    );
-    connection.execute(&sql, []).with_context(|| {
-        format!("failed to add '{column_name}' column to operation_logs")
-    })?;
+    let sql =
+        format!("ALTER TABLE operation_logs ADD COLUMN {column_name} TEXT NOT NULL DEFAULT ''");
+    connection
+        .execute(&sql, [])
+        .with_context(|| format!("failed to add '{column_name}' column to operation_logs"))?;
     Ok(())
 }
 

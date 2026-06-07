@@ -456,12 +456,15 @@ impl DesktopCore {
         ctx: &RequestContext,
         args: UploadLocalFileArgs,
     ) -> Result<UploadLocalFileResult> {
-        let result = self.upload_file(ctx, UploadFileArgs {
-            session_id: args.session_id,
-            local_path: args.local_path.clone(),
-            remote_path: args.remote_path.clone(),
-            overwrite: args.overwrite,
-        })?;
+        let result = self.upload_file(
+            ctx,
+            UploadFileArgs {
+                session_id: args.session_id,
+                local_path: args.local_path.clone(),
+                remote_path: args.remote_path.clone(),
+                overwrite: args.overwrite,
+            },
+        )?;
 
         Ok(UploadLocalFileResult {
             bytes_written: result.bytes_written,
@@ -564,11 +567,14 @@ impl DesktopCore {
             bail!("local path '{}' already exists", args.local_path);
         }
 
-        let result = self.download_file(ctx, DownloadFileArgs {
-            session_id: args.session_id,
-            remote_path: args.remote_path.clone(),
-            local_path: Some(args.local_path.clone()),
-        })?;
+        let result = self.download_file(
+            ctx,
+            DownloadFileArgs {
+                session_id: args.session_id,
+                remote_path: args.remote_path.clone(),
+                local_path: Some(args.local_path.clone()),
+            },
+        )?;
 
         Ok(DownloadToLocalResult {
             local_path: result.local_path,
@@ -664,7 +670,7 @@ impl DesktopCore {
 
             channel
                 .exec(&sudo_cmd)
-                .with_context(|| format!("failed to execute sudo command"))?;
+                .context("failed to execute sudo command")?;
 
             // 将密码写入 stdin，然后关闭写入端以发送 EOF
             let pw_with_newline = format!("{}\n", password);
@@ -692,7 +698,9 @@ impl DesktopCore {
             channel
                 .wait_close()
                 .context("failed waiting for sudo command exit")?;
-            let exit_code = channel.exit_status().context("failed to read sudo exit code")?;
+            let exit_code = channel
+                .exit_status()
+                .context("failed to read sudo exit code")?;
 
             (
                 instance_id,
@@ -1081,12 +1089,15 @@ mod tests {
         std::fs::write(&local_path, "keep me").expect("existing file should be written");
 
         let err = core
-            .download_to_local(&test_context(), DownloadToLocalArgs {
-                session_id: "missing-session".to_string(),
-                remote_path: "/tmp/remote.txt".to_string(),
-                local_path: local_path.display().to_string(),
-                overwrite: false,
-            })
+            .download_to_local(
+                &test_context(),
+                DownloadToLocalArgs {
+                    session_id: "missing-session".to_string(),
+                    remote_path: "/tmp/remote.txt".to_string(),
+                    local_path: local_path.display().to_string(),
+                    overwrite: false,
+                },
+            )
             .expect_err("existing local file should not be overwritten");
 
         assert!(err.to_string().contains("already exists"));
@@ -1211,11 +1222,14 @@ mod tests {
         let (core, test_dir) = make_test_core();
         // 空命令校验在 prompt_sudo_password 之前，不需要 GUI
         let err = core
-            .sudo_command(&test_context(), SudoCommandArgs {
-                session_id: "any".to_string(),
-                command: "   ".to_string(),
-                timeout_secs: None,
-            })
+            .sudo_command(
+                &test_context(),
+                SudoCommandArgs {
+                    session_id: "any".to_string(),
+                    command: "   ".to_string(),
+                    timeout_secs: None,
+                },
+            )
             .expect_err("empty command should fail");
 
         assert!(err.to_string().contains("command cannot be empty"));

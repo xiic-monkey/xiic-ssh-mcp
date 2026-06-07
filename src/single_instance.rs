@@ -20,7 +20,10 @@ impl SingleInstanceGuard {
             match OpenOptions::new().write(true).create_new(true).open(path) {
                 Ok(mut file) => {
                     write_lock_owner_pid(&mut file).with_context(|| {
-                        format!("failed to write single-instance owner to '{}'", path.display())
+                        format!(
+                            "failed to write single-instance owner to '{}'",
+                            path.display()
+                        )
                     })?;
                     return Ok(Some(Self {
                         path: path.to_path_buf(),
@@ -37,7 +40,12 @@ impl SingleInstanceGuard {
                         continue;
                     }
 
-                    match OpenOptions::new().write(true).create(true).truncate(true).open(path) {
+                    match OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(path)
+                    {
                         Ok(mut file) => {
                             write_lock_owner_pid(&mut file).with_context(|| {
                                 format!(
@@ -58,7 +66,10 @@ impl SingleInstanceGuard {
                         }
                         Err(err) => {
                             return Err(err).with_context(|| {
-                                format!("failed to recover single-instance lock '{}'", path.display())
+                                format!(
+                                    "failed to recover single-instance lock '{}'",
+                                    path.display()
+                                )
                             });
                         }
                     }
@@ -97,8 +108,12 @@ fn remove_stale_lock(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err)
-            .with_context(|| format!("failed to remove stale single-instance lock '{}'", path.display())),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed to remove stale single-instance lock '{}'",
+                path.display()
+            )
+        }),
     }
 }
 
@@ -149,8 +164,9 @@ fn process_alive(pid: u32) -> bool {
     }
 
     let mut exit_code = 0;
-    let ok =
-        unsafe { windows_sys::Win32::System::Threading::GetExitCodeProcess(handle, &mut exit_code) };
+    let ok = unsafe {
+        windows_sys::Win32::System::Threading::GetExitCodeProcess(handle, &mut exit_code)
+    };
     unsafe {
         CloseHandle(handle);
     }
@@ -172,10 +188,8 @@ mod tests {
 
     #[test]
     fn acquires_lock_after_stale_pid_file() {
-        let lock_path = std::env::temp_dir().join(format!(
-            "xiic-ssh-mcp-lock-{}.lock",
-            uuid::Uuid::new_v4()
-        ));
+        let lock_path =
+            std::env::temp_dir().join(format!("xiic-ssh-mcp-lock-{}.lock", uuid::Uuid::new_v4()));
 
         {
             let mut file = OpenOptions::new()
