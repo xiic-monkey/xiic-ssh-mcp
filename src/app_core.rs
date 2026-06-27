@@ -56,12 +56,30 @@ impl DesktopCore {
         keyring_service: impl Into<String>,
         notify_endpoint: Option<String>,
     ) -> Result<Self> {
-        Ok(Self {
+        let core = Self {
             store: InstanceStore::new(db_path)?,
             secrets: SecretStore::new(keyring_service),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             notify_endpoint,
-        })
+        };
+        core.migrate_legacy_secrets()?;
+        Ok(core)
+    }
+
+    #[cfg(test)]
+    fn new_with_secret_store(
+        db_path: PathBuf,
+        secrets: SecretStore,
+        notify_endpoint: Option<String>,
+    ) -> Result<Self> {
+        let core = Self {
+            store: InstanceStore::new(db_path)?,
+            secrets,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            notify_endpoint,
+        };
+        core.migrate_legacy_secrets()?;
+        Ok(core)
     }
 
     pub fn list_servers(&self) -> Result<ListServersResult> {
@@ -122,13 +140,8 @@ impl DesktopCore {
         let existing_secret = self.load_secret(&draft.instance_id)?;
         let secret = self.secret_for_draft(&draft, existing_secret.as_ref(), true)?;
         let stored = self.store.save_instance(&draft)?;
-        self.store.save_secret(&draft.instance_id, &secret)?;
-        if let Err(err) = self.secrets.save_secret(&draft.instance_id, &secret) {
-            eprintln!(
-                "warning: failed to store keychain secret for '{}': {err:#}",
-                draft.instance_id
-            );
-        }
+        self.secrets.save_secret(&draft.instance_id, &secret)?;
+        self.store.delete_secret(&draft.instance_id)?;
 
         Ok(InstanceSummary::from_stored(stored, true))
     }
@@ -807,17 +820,32 @@ impl DesktopCore {
     }
 
     fn load_secret(&self, instance_id: &str) -> Result<Option<SecretPayload>> {
-        if let Some(secret) = self.secrets.load_secret(instance_id)? {
-            return Ok(Some(secret));
-        }
-        self.store.load_secret(instance_id)
+        self.secrets.load_secret(instance_id)
     }
 
     fn has_secret(&self, instance_id: &str) -> Result<bool> {
-        if self.secrets.has_secret(instance_id)? {
-            return Ok(true);
+        self.secrets.has_secret(instance_id)
+    }
+
+    fn migrate_legacy_secrets(&self) -> Result<()> {
+        for legacy in self.store.list_secrets()? {
+            if self.secrets.has_secret(&legacy.instance_id)? {
+                self.store.delete_secret(&legacy.instance_id)?;
+                continue;
+            }
+
+            match self
+                .secrets
+                .save_secret(&legacy.instance_id, &legacy.secret)
+            {
+                Ok(()) => self.store.delete_secret(&legacy.instance_id)?,
+                Err(err) => eprintln!(
+                    "warning: failed to migrate legacy SQLite secret for '{}': {err:#}",
+                    legacy.instance_id
+                ),
+            }
         }
-        self.store.has_secret(instance_id)
+        Ok(())
     }
 
     pub fn get_private_key_path(&self, instance_id: &str) -> Result<Option<String>> {
@@ -1062,6 +1090,77 @@ fn known_hosts_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap as TestHashMap, HashSet};
+    use std::sync::{Arc as TestArc, Mutex as TestMutex};
+
+    use anyhow::anyhow;
+
+    use crate::credentials::CredentialBackend;
+
+    #[derive(Default)]
+    struct MockCredentialBackend {
+        entries: TestMutex<TestHashMap<String, String>>,
+        fail_set: TestMutex<HashSet<String>>,
+    }
+
+    impl MockCredentialBackend {
+        fn key(service_name: &str, account: &str) -> String {
+            format!("{service_name}|{account}")
+        }
+
+        fn fail_next_set(&self, account: &str) {
+            self.fail_set
+                .lock()
+                .expect("fail set should lock")
+                .insert(account.to_string());
+        }
+
+        fn load_payload(&self, service_name: &str, account: &str) -> Option<SecretPayload> {
+            self.entries
+                .lock()
+                .expect("entries should lock")
+                .get(&Self::key(service_name, account))
+                .map(|payload| serde_json::from_str(payload).expect("payload should decode"))
+        }
+    }
+
+    impl CredentialBackend for MockCredentialBackend {
+        fn set_password(&self, service_name: &str, account: &str, payload: &str) -> Result<()> {
+            if self
+                .fail_set
+                .lock()
+                .expect("fail set should lock")
+                .remove(account)
+            {
+                return Err(anyhow!("mock keychain set failed"));
+            }
+
+            self.entries
+                .lock()
+                .expect("entries should lock")
+                .insert(Self::key(service_name, account), payload.to_string());
+            Ok(())
+        }
+
+        fn get_password(&self, service_name: &str, account: &str) -> Result<Option<String>> {
+            Ok(self
+                .entries
+                .lock()
+                .expect("entries should lock")
+                .get(&Self::key(service_name, account))
+                .cloned())
+        }
+
+        fn delete_password(&self, service_name: &str, account: &str) -> Result<()> {
+            self.entries
+                .lock()
+                .expect("entries should lock")
+                .remove(&Self::key(service_name, account));
+            Ok(())
+        }
+    }
+
+    const TEST_SERVICE: &str = "com.xiic.ssh-manager.test";
 
     fn make_test_core() -> (DesktopCore, PathBuf) {
         let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-{}", Uuid::new_v4()));
@@ -1075,11 +1174,218 @@ mod tests {
         (core, test_dir)
     }
 
+    fn make_mock_core() -> (DesktopCore, PathBuf, TestArc<MockCredentialBackend>) {
+        let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).expect("test dir should be created");
+        let db_path = test_dir.join("instances.sqlite3");
+        let backend = TestArc::new(MockCredentialBackend::default());
+        let core = DesktopCore::new_with_secret_store(
+            db_path,
+            SecretStore::with_backend(TEST_SERVICE, backend.clone()),
+            None,
+        )
+        .expect("test core should initialize");
+        (core, test_dir, backend)
+    }
+
+    fn make_mock_core_from_db(
+        db_path: PathBuf,
+        backend: TestArc<MockCredentialBackend>,
+    ) -> DesktopCore {
+        DesktopCore::new_with_secret_store(
+            db_path,
+            SecretStore::with_backend(TEST_SERVICE, backend),
+            None,
+        )
+        .expect("test core should initialize")
+    }
+
+    fn password_draft(instance_id: &str) -> InstanceDraft {
+        InstanceDraft {
+            instance_id: instance_id.to_string(),
+            name: "Production".to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            username: "root".to_string(),
+            auth_kind: AuthKind::Password,
+            host_key_check: false,
+            notes: None,
+            password: Some("secret".to_string()),
+            private_key: None,
+            private_key_path: None,
+            passphrase: None,
+            keep_existing_secret: false,
+        }
+    }
+
+    fn password_secret(password: &str) -> SecretPayload {
+        SecretPayload {
+            password: Some(password.to_string()),
+            private_key: None,
+            private_key_path: None,
+            passphrase: None,
+        }
+    }
+
+    fn save_legacy_secret(store: &InstanceStore, instance_id: &str, secret: &SecretPayload) {
+        store
+            .save_instance(&password_draft(instance_id))
+            .expect("legacy instance should be saved");
+        store
+            .save_secret(instance_id, secret)
+            .expect("legacy secret should be saved");
+    }
+
     fn test_context() -> RequestContext {
         RequestContext {
             client_id: "test-client".to_string(),
             client_session_id: Uuid::new_v4().to_string(),
         }
+    }
+
+    #[test]
+    fn save_instance_stores_secret_only_in_keychain() {
+        let (core, test_dir, backend) = make_mock_core();
+
+        let summary = core
+            .save_instance(password_draft("prod"))
+            .expect("instance should save");
+
+        assert!(summary.has_secret);
+        assert_eq!(
+            backend
+                .load_payload(TEST_SERVICE, "prod")
+                .expect("secret should be in keychain"),
+            password_secret("secret")
+        );
+        assert!(
+            core.store
+                .load_secret("prod")
+                .expect("sqlite secret lookup should succeed")
+                .is_none(),
+            "new saves must not write instance_secrets"
+        );
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn save_instance_fails_when_keychain_save_fails_without_sqlite_fallback() {
+        let (core, test_dir, backend) = make_mock_core();
+        backend.fail_next_set("prod");
+
+        let err = core
+            .save_instance(password_draft("prod"))
+            .expect_err("keychain failure should fail save");
+
+        assert!(err.to_string().contains("failed to store secret"));
+        assert!(
+            core.store
+                .load_secret("prod")
+                .expect("sqlite secret lookup should succeed")
+                .is_none(),
+            "failed keychain save must not fall back to SQLite"
+        );
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn legacy_sqlite_secret_migrates_to_keychain_and_is_deleted() {
+        let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).expect("test dir should be created");
+        let db_path = test_dir.join("instances.sqlite3");
+        let store = InstanceStore::new(db_path.clone()).expect("store should initialize");
+        save_legacy_secret(&store, "prod", &password_secret("legacy"));
+
+        let backend = TestArc::new(MockCredentialBackend::default());
+        let core = make_mock_core_from_db(db_path, backend.clone());
+
+        assert_eq!(
+            backend
+                .load_payload(TEST_SERVICE, "prod")
+                .expect("secret should migrate to keychain"),
+            password_secret("legacy")
+        );
+        assert!(
+            core.store
+                .load_secret("prod")
+                .expect("sqlite secret lookup should succeed")
+                .is_none(),
+            "migrated secret should be deleted from SQLite"
+        );
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn legacy_sqlite_secret_does_not_overwrite_existing_keychain_secret() {
+        let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).expect("test dir should be created");
+        let db_path = test_dir.join("instances.sqlite3");
+        let store = InstanceStore::new(db_path.clone()).expect("store should initialize");
+        save_legacy_secret(&store, "prod", &password_secret("legacy"));
+
+        let backend = TestArc::new(MockCredentialBackend::default());
+        backend
+            .set_password(
+                TEST_SERVICE,
+                "prod",
+                &serde_json::to_string(&password_secret("keychain")).expect("secret should encode"),
+            )
+            .expect("existing keychain secret should save");
+        let core = make_mock_core_from_db(db_path, backend.clone());
+
+        assert_eq!(
+            backend
+                .load_payload(TEST_SERVICE, "prod")
+                .expect("keychain secret should remain"),
+            password_secret("keychain")
+        );
+        assert!(
+            core.store
+                .load_secret("prod")
+                .expect("sqlite secret lookup should succeed")
+                .is_none(),
+            "conflicting legacy secret should be deleted"
+        );
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn legacy_sqlite_secret_is_not_used_when_keychain_is_missing() {
+        let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).expect("test dir should be created");
+        let db_path = test_dir.join("instances.sqlite3");
+        let store = InstanceStore::new(db_path.clone()).expect("store should initialize");
+        save_legacy_secret(&store, "prod", &password_secret("legacy"));
+
+        let backend = TestArc::new(MockCredentialBackend::default());
+        backend.fail_next_set("prod");
+        let core = make_mock_core_from_db(db_path, backend);
+
+        assert!(
+            core.load_secret("prod")
+                .expect("keychain lookup should succeed")
+                .is_none(),
+            "runtime load must not fall back to SQLite"
+        );
+        assert!(
+            !core
+                .has_secret("prod")
+                .expect("keychain has_secret lookup should succeed"),
+            "runtime has_secret must not fall back to SQLite"
+        );
+        assert!(
+            core.store
+                .load_secret("prod")
+                .expect("sqlite secret should remain after failed migration")
+                .is_some(),
+            "failed migration should preserve legacy row"
+        );
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
     }
 
     #[test]

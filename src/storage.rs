@@ -9,6 +9,12 @@ use crate::models::{
     StoredInstance, WhitelistRule,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSecret {
+    pub instance_id: String,
+    pub secret: SecretPayload,
+}
+
 #[derive(Clone)]
 pub struct InstanceStore {
     db_path: PathBuf,
@@ -200,6 +206,31 @@ impl InstanceStore {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(err) => Err(err).context("failed to load stored secret"),
         }
+    }
+
+    pub fn list_secrets(&self) -> Result<Vec<StoredSecret>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT instance_id, secret_json
+             FROM instance_secrets
+             ORDER BY instance_id COLLATE NOCASE ASC",
+        )?;
+
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut secrets = Vec::new();
+        for row in rows {
+            let (instance_id, secret_json) = row.context("failed to read stored secret row")?;
+            let secret = serde_json::from_str(&secret_json)
+                .with_context(|| format!("failed to decode secret for '{}'", instance_id))?;
+            secrets.push(StoredSecret {
+                instance_id,
+                secret,
+            });
+        }
+        Ok(secrets)
     }
 
     pub fn delete_secret(&self, instance_id: &str) -> Result<()> {
