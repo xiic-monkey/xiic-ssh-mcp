@@ -62,6 +62,7 @@ type OperationLogEntry = {
 
 type AppSettings = {
   use_system_approval: boolean;
+  prefer_client_approval_for_codex: boolean;
 };
 
 type ParsedTarget = {
@@ -365,12 +366,44 @@ export default function App() {
   }
 
   async function handleToggleSystemApproval(useSystem: boolean) {
+    if (!appSettings) {
+      return;
+    }
     setSavingSettings(true);
-    const newSettings: AppSettings = { use_system_approval: useSystem };
+    const newSettings: AppSettings = {
+      ...appSettings,
+      use_system_approval: useSystem,
+    };
     try {
       await invoke("save_settings", { settings: newSettings });
       setAppSettings(newSettings);
       setStatus(useSystem ? "已启用系统弹窗审批。" : "已禁用系统弹窗审批。");
+      setStatusTone("success");
+    } catch (error) {
+      setStatus(asMessage(error));
+      setStatusTone("danger");
+    } finally {
+      setSavingSettings(false);
+    }
+  }
+
+  async function handleTogglePreferCodexApproval(preferClientApproval: boolean) {
+    if (!appSettings) {
+      return;
+    }
+    setSavingSettings(true);
+    const newSettings: AppSettings = {
+      ...appSettings,
+      prefer_client_approval_for_codex: preferClientApproval,
+    };
+    try {
+      await invoke("save_settings", { settings: newSettings });
+      setAppSettings(newSettings);
+      setStatus(
+        preferClientApproval
+          ? "已启用 Codex 单层审批。请重启 MCP 服务器以让新会话生效。"
+          : "已禁用 Codex 单层审批。请重启 MCP 服务器以让新会话生效。",
+      );
       setStatusTone("success");
     } catch (error) {
       setStatus(asMessage(error));
@@ -551,6 +584,7 @@ export default function App() {
             restartingMcp={restartingMcp}
             restartResult={restartResult}
             onToggleSystemApproval={handleToggleSystemApproval}
+            onTogglePreferCodexApproval={handleTogglePreferCodexApproval}
             onRestartMcp={handleRestartMcp}
             onClose={closeSettings}
             onDragMouseDown={(event) => void handleDragMouseDown(event)}
@@ -964,6 +998,7 @@ function SettingsPanel({
   restartingMcp,
   restartResult,
   onToggleSystemApproval,
+  onTogglePreferCodexApproval,
   onRestartMcp,
   onClose,
   onDragMouseDown,
@@ -973,6 +1008,7 @@ function SettingsPanel({
   restartingMcp: boolean;
   restartResult: { kind: "success" | "error"; message: string } | null;
   onToggleSystemApproval: (useSystem: boolean) => void;
+  onTogglePreferCodexApproval: (preferClientApproval: boolean) => void;
   onRestartMcp: () => Promise<void>;
   onClose: () => void;
   onDragMouseDown: (event: React.MouseEvent<HTMLElement>) => void;
@@ -1031,6 +1067,25 @@ function SettingsPanel({
               />
               <span className="toggle-slider" />
               <span className="toggle-label">{appSettings?.use_system_approval ? "开启" : "关闭"}</span>
+            </label>
+          </div>
+
+          <div className="settings-item">
+            <div className="settings-item-info">
+              <strong>Codex 优先使用客户端审批</strong>
+              <p>开启后，Codex 中优先使用 Codex 的审批卡片，不再弹出 xiic-ssh 的本地二次审批。仅对 Codex 生效，修改后请重启 MCP 服务器。</p>
+            </div>
+            <label className="toggle-switch settings-toggle">
+              <input
+                type="checkbox"
+                checked={appSettings?.prefer_client_approval_for_codex ?? false}
+                disabled={saving}
+                onChange={(e) => onTogglePreferCodexApproval(e.target.checked)}
+              />
+              <span className="toggle-slider" />
+              <span className="toggle-label">
+                {appSettings?.prefer_client_approval_for_codex ? "开启" : "关闭"}
+              </span>
             </label>
           </div>
         </div>

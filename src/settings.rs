@@ -9,14 +9,22 @@ use crate::paths::shared_app_data_dir;
 pub struct AppSettings {
     /// 启用系统原生弹窗进行审批（跳过 Tauri 桌面审批 App）。
     pub use_system_approval: bool,
+    /// 在 Codex 中优先使用客户端审批卡片，跳过 xiic-ssh 的本地二次审批。
+    #[serde(default = "default_prefer_client_approval_for_codex")]
+    pub prefer_client_approval_for_codex: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             use_system_approval: true,
+            prefer_client_approval_for_codex: default_prefer_client_approval_for_codex(),
         }
     }
+}
+
+fn default_prefer_client_approval_for_codex() -> bool {
+    true
 }
 
 fn settings_file_path() -> anyhow::Result<PathBuf> {
@@ -43,4 +51,37 @@ pub fn save_settings(settings: &AppSettings) -> anyhow::Result<()> {
     let content = serde_json::to_string_pretty(settings)?;
     std::fs::write(&path, content)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppSettings;
+
+    #[test]
+    fn missing_new_field_defaults_to_true() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{
+              "use_system_approval": false
+            }"#,
+        )
+        .expect("legacy settings should deserialize");
+
+        assert!(!settings.use_system_approval);
+        assert!(settings.prefer_client_approval_for_codex);
+    }
+
+    #[test]
+    fn round_trip_preserves_new_field() {
+        let settings = AppSettings {
+            use_system_approval: false,
+            prefer_client_approval_for_codex: false,
+        };
+
+        let serialized = serde_json::to_string(&settings).expect("settings should serialize");
+        let restored: AppSettings =
+            serde_json::from_str(&serialized).expect("settings should deserialize");
+
+        assert!(!restored.use_system_approval);
+        assert!(!restored.prefer_client_approval_for_codex);
+    }
 }

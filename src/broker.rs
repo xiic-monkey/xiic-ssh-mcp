@@ -11,9 +11,9 @@ use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 
 use crate::app_core::DesktopCore;
-use crate::local_ipc::{
-    BROKER_HEALTH_CHECK_KIND, BROKER_HEALTH_OK_KIND, broker_server_healthy, remove_stale_endpoint,
-};
+#[cfg(unix)]
+use crate::local_ipc::remove_stale_endpoint;
+use crate::local_ipc::{BROKER_HEALTH_CHECK_KIND, BROKER_HEALTH_OK_KIND, broker_server_healthy};
 use crate::mcp::McpServer;
 use crate::mcp_protocol::{IncomingMessage, MessageFraming, read_message, write_message};
 use crate::models::{ApprovalMode, BrokerHello, BrokerWelcome, RequestContext, WhitelistMode};
@@ -313,9 +313,9 @@ fn create_windows_pipe_server(endpoint: &str) -> Result<File> {
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_PIPE_CONNECTED, GetLastError, INVALID_HANDLE_VALUE,
     };
-    use windows_sys::Win32::Storage::FileSystem::CreateNamedPipeW;
+    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, PIPE_ACCESS_DUPLEX, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+        ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
         PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
 

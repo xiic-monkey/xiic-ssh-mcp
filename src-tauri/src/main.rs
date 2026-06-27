@@ -8,7 +8,8 @@ use tauri::{Emitter, Manager, State};
 use xiic_ssh_mcp::app_core::{DEFAULT_CLIENT_ID, DEFAULT_KEYRING_SERVICE, DesktopCore};
 use xiic_ssh_mcp::local_ipc::{
     LOG_NOTIFICATION_PAYLOAD, NOTIFY_HEALTH_CHECK_KIND, NOTIFY_HEALTH_OK_KIND,
-    default_approval_endpoint, default_notify_endpoint, notify_server_healthy,
+    default_approval_endpoint, default_broker_endpoint, default_notify_endpoint,
+    notify_server_healthy,
     remove_stale_endpoint,
 };
 use xiic_ssh_mcp::models::{
@@ -129,8 +130,10 @@ fn restart_mcp() -> Result<String, String> {
     let data_dir = xiic_ssh_mcp::paths::shared_app_data_dir().map_err(|e| e.to_string())?;
     let notify = default_notify_endpoint(&data_dir);
     let approval = default_approval_endpoint(&data_dir);
+    let broker = default_broker_endpoint(&data_dir);
     remove_stale_endpoint(&notify);
     remove_stale_endpoint(&approval);
+    remove_stale_endpoint(&broker);
 
     eprintln!("[xiic-ssh] MCP 重启完成，IDE 将在几秒后自动重连");
     Ok("MCP 服务器已重启，IDE 将在几秒后自动重新连接。".to_string())
