@@ -139,8 +139,8 @@ impl DesktopCore {
 
         let existing_secret = self.load_secret(&draft.instance_id)?;
         let secret = self.secret_for_draft(&draft, existing_secret.as_ref(), true)?;
+        self.save_and_verify_secret(&draft.instance_id, &secret)?;
         let stored = self.store.save_instance(&draft)?;
-        self.secrets.save_secret(&draft.instance_id, &secret)?;
         self.store.delete_secret(&draft.instance_id)?;
 
         Ok(InstanceSummary::from_stored(stored, true))
@@ -834,16 +834,25 @@ impl DesktopCore {
                 continue;
             }
 
-            match self
-                .secrets
-                .save_secret(&legacy.instance_id, &legacy.secret)
-            {
+            match self.save_and_verify_secret(&legacy.instance_id, &legacy.secret) {
                 Ok(()) => self.store.delete_secret(&legacy.instance_id)?,
                 Err(err) => eprintln!(
                     "warning: failed to migrate legacy SQLite secret for '{}': {err:#}",
                     legacy.instance_id
                 ),
             }
+        }
+        Ok(())
+    }
+
+    fn save_and_verify_secret(&self, instance_id: &str, secret: &SecretPayload) -> Result<()> {
+        self.secrets.save_secret(instance_id, secret)?;
+        let persisted = self.secrets.load_secret(instance_id)?;
+        if persisted.as_ref() != Some(secret) {
+            bail!(
+                "keychain secret verification failed for instance '{}'",
+                instance_id
+            );
         }
         Ok(())
     }
@@ -1101,6 +1110,7 @@ mod tests {
     struct MockCredentialBackend {
         entries: TestMutex<TestHashMap<String, String>>,
         fail_set: TestMutex<HashSet<String>>,
+        discard_next_set: TestMutex<HashSet<String>>,
     }
 
     impl MockCredentialBackend {
@@ -1112,6 +1122,13 @@ mod tests {
             self.fail_set
                 .lock()
                 .expect("fail set should lock")
+                .insert(account.to_string());
+        }
+
+        fn discard_next_set(&self, account: &str) {
+            self.discard_next_set
+                .lock()
+                .expect("discard set should lock")
                 .insert(account.to_string());
         }
 
@@ -1133,6 +1150,15 @@ mod tests {
                 .remove(account)
             {
                 return Err(anyhow!("mock keychain set failed"));
+            }
+
+            if self
+                .discard_next_set
+                .lock()
+                .expect("discard set should lock")
+                .remove(account)
+            {
+                return Ok(());
             }
 
             self.entries
@@ -1291,6 +1317,27 @@ mod tests {
     }
 
     #[test]
+    fn save_instance_fails_when_keychain_write_cannot_be_read_back() {
+        let (core, test_dir, backend) = make_mock_core();
+        backend.discard_next_set("prod");
+
+        let err = core
+            .save_instance(password_draft("prod"))
+            .expect_err("unreadable keychain save should fail");
+
+        assert!(err.to_string().contains("verification failed"));
+        assert!(
+            core.store
+                .get_instance("prod")
+                .expect("instance lookup should succeed")
+                .is_none(),
+            "metadata must not be saved when the credential cannot be verified"
+        );
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
     fn legacy_sqlite_secret_migrates_to_keychain_and_is_deleted() {
         let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&test_dir).expect("test dir should be created");
@@ -1313,6 +1360,29 @@ mod tests {
                 .expect("sqlite secret lookup should succeed")
                 .is_none(),
             "migrated secret should be deleted from SQLite"
+        );
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn legacy_secret_is_preserved_when_keychain_migration_cannot_be_verified() {
+        let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).expect("test dir should be created");
+        let db_path = test_dir.join("instances.sqlite3");
+        let store = InstanceStore::new(db_path.clone()).expect("store should initialize");
+        save_legacy_secret(&store, "prod", &password_secret("legacy"));
+
+        let backend = TestArc::new(MockCredentialBackend::default());
+        backend.discard_next_set("prod");
+        let _core = make_mock_core_from_db(db_path.clone(), backend);
+
+        assert!(
+            store
+                .load_secret("prod")
+                .expect("legacy secret lookup should succeed")
+                .is_some(),
+            "legacy secret must remain until the keychain copy can be read back"
         );
 
         std::fs::remove_dir_all(test_dir).expect("test dir should be removed");

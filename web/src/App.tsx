@@ -34,6 +34,7 @@ type InstanceDraft = {
   private_key_path: string;
   passphrase: string;
   keep_existing_secret: boolean;
+  has_saved_secret: boolean;
 };
 
 type TestConnectionResult = {
@@ -87,6 +88,7 @@ const emptyDraft = (): InstanceDraft => ({
   private_key_path: "",
   passphrase: "",
   keep_existing_secret: false,
+  has_saved_secret: false,
 });
 
 function fromSummary(instance: InstanceSummary): InstanceDraft {
@@ -104,7 +106,17 @@ function fromSummary(instance: InstanceSummary): InstanceDraft {
     private_key_path: "",
     passphrase: "",
     keep_existing_secret: instance.has_secret,
+    has_saved_secret: instance.has_secret,
   };
+}
+
+function hasInlineCredential(draft: InstanceDraft): boolean {
+  return Boolean(
+    draft.password.trim()
+    || draft.private_key.trim()
+    || draft.private_key_path.trim()
+    || draft.passphrase.trim(),
+  );
 }
 
 export default function App() {
@@ -295,10 +307,24 @@ export default function App() {
       setStatusTone("danger");
       return;
     }
+    if (!isCreating && !draft.keep_existing_secret && !hasInlineCredential(draft)) {
+      setStatus("当前没有可保留的凭据，请输入密码或选择私钥后再保存。");
+      setStatusTone("danger");
+      return;
+    }
     setSaving(true);
     try {
-      const saved = await invoke<InstanceSummary>("save_instance", { draft });
-      await loadData();
+      const { has_saved_secret: _, ...draftForSave } = draft;
+      const saved = await invoke<InstanceSummary>("save_instance", { draft: draftForSave });
+      setInstances((current) => {
+        const index = current.findIndex((instance) => instance.instance_id === saved.instance_id);
+        if (index < 0) {
+          return [...current, saved];
+        }
+        return current.map((instance) =>
+          instance.instance_id === saved.instance_id ? saved : instance,
+        );
+      });
       setSelectedId(saved.instance_id);
       setDraft({
         ...fromSummary(saved),
@@ -717,7 +743,7 @@ export default function App() {
                   <span>按 known_hosts 校验主机指纹</span>
                 </label>
 
-                {!isCreating ? (
+                {!isCreating && draft.has_saved_secret ? (
                   <label className="checkbox">
                     <input
                       checked={draft.keep_existing_secret}
@@ -726,7 +752,7 @@ export default function App() {
                       }
                       type="checkbox"
                     />
-                    <span>如果密钥字段为空，则保留已存凭据</span>
+                    <span>留空时保留已存凭据</span>
                   </label>
                 ) : null}
               </div>
@@ -739,7 +765,9 @@ export default function App() {
                     placeholder={
                       isCreating
                         ? "远程账户密码"
-                        : "留空则保留已保存的 SSH 密码"
+                        : draft.has_saved_secret
+                          ? "留空则保留已保存的 SSH 密码"
+                          : "请输入远程账户密码"
                     }
                     type="password"
                     value={draft.password}
