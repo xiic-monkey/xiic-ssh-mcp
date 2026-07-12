@@ -1,12 +1,19 @@
 use std::sync::Arc;
+#[cfg(not(target_os = "macos"))]
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+#[cfg(not(target_os = "macos"))]
 use keyring::{Entry, Error as KeyringError};
+#[cfg(target_os = "macos")]
+use security_framework::os::macos::keychain::SecKeychain;
+#[cfg(target_os = "macos")]
+use security_framework::os::macos::passwords::find_generic_password;
 
 use crate::models::SecretPayload;
 
 /// Keychain 访问超时时间（秒）
+#[cfg(not(target_os = "macos"))]
 const KEYRING_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Clone)]
@@ -23,6 +30,40 @@ pub(crate) trait CredentialBackend: Send + Sync {
 
 struct KeyringBackend;
 
+#[cfg(target_os = "macos")]
+impl CredentialBackend for KeyringBackend {
+    fn set_password(&self, service_name: &str, account: &str, payload: &str) -> Result<()> {
+        let keychain = SecKeychain::default().context("failed to open default keychain")?;
+        keychain
+            .set_generic_password(service_name, account, payload.as_bytes())
+            .context("failed to store keychain secret")
+    }
+
+    fn get_password(&self, service_name: &str, account: &str) -> Result<Option<String>> {
+        let keychain = SecKeychain::default().context("failed to open default keychain")?;
+        match find_generic_password(Some(&[keychain]), service_name, account) {
+            Ok((payload, _)) => String::from_utf8(payload.to_vec())
+                .map(Some)
+                .context("keychain secret is not valid UTF-8"),
+            Err(err) if err.code() == -25300 => Ok(None), // errSecItemNotFound
+            Err(err) => Err(err).context("failed to load keychain secret"),
+        }
+    }
+
+    fn delete_password(&self, service_name: &str, account: &str) -> Result<()> {
+        let keychain = SecKeychain::default().context("failed to open default keychain")?;
+        match find_generic_password(Some(&[keychain]), service_name, account) {
+            Ok((_, item)) => {
+                item.delete();
+                Ok(())
+            }
+            Err(err) if err.code() == -25300 => Ok(()), // errSecItemNotFound
+            Err(err) => Err(err).context("failed to delete keychain secret"),
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 impl CredentialBackend for KeyringBackend {
     fn set_password(&self, service_name: &str, account: &str, payload: &str) -> Result<()> {
         let entry =
