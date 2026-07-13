@@ -42,6 +42,7 @@ pub struct McpServer {
     core: Arc<DesktopCore>,
     whitelist_mode: WhitelistMode,
     approval_mode: ApprovalMode,
+    client_id: Option<String>,
     client_supports_elicitation: bool,
     pending_messages: VecDeque<IncomingMessage>,
     checker: WhitelistChecker,
@@ -60,6 +61,7 @@ impl McpServer {
             core,
             whitelist_mode,
             approval_mode,
+            client_id: None,
             client_supports_elicitation: false,
             pending_messages: VecDeque::new(),
             checker,
@@ -135,6 +137,10 @@ impl McpServer {
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("incoming JSON-RPC message is missing method"))?;
 
+        if self.client_id.is_none() {
+            self.client_id = Some(request_context.client_id.clone());
+        }
+
         let id = message.get("id").cloned();
         let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
 
@@ -158,7 +164,11 @@ impl McpServer {
             )),
             "tools/list" => DispatchResult::Respond(success_response(id, self.handle_tools_list())),
             "tools/call" => {
-                match self.handle_tool_call(request_context.clone(), params, id.clone()) {
+                match self.handle_tool_call(
+                    self.effective_request_context(request_context),
+                    params,
+                    id.clone(),
+                ) {
                     Ok(result) => result,
                     Err(err) => {
                         DispatchResult::Respond(success_response(id, tool_error(err.to_string())))
@@ -233,11 +243,27 @@ impl McpServer {
         struct InitializeParams {
             protocol_version: Option<String>,
             capabilities: Option<Value>,
+            client_info: Option<ClientInfo>,
+        }
+
+        #[derive(Deserialize)]
+        struct ClientInfo {
+            name: Option<String>,
         }
 
         let params: InitializeParams =
             serde_json::from_value(params).context("invalid initialize params")?;
         self.client_supports_elicitation = has_elicitation_capability(params.capabilities.as_ref());
+        if let Some(client_name) = params.client_info.and_then(|info| info.name)
+            && !client_name.trim().is_empty()
+        {
+            self.client_id = Some(canonical_client_id(client_name.trim()));
+        }
+        eprintln!(
+            "[xiic-ssh-mcp] MCP client initialized: client_id={}, elicitation={}",
+            self.client_id.as_deref().unwrap_or("unknown"),
+            self.client_supports_elicitation
+        );
 
         Ok(json!({
             "protocolVersion": params.protocol_version.unwrap_or_else(|| DEFAULT_PROTOCOL_VERSION.to_string()),
@@ -252,6 +278,13 @@ impl McpServer {
             },
             "instructions": "Manage SSH sessions stored by the local Xiic SSH Manager desktop app. Operations not in the whitelist require approval."
         }))
+    }
+
+    fn effective_request_context(&self, mut request_context: RequestContext) -> RequestContext {
+        if let Some(client_id) = &self.client_id {
+            request_context.client_id = client_id.clone();
+        }
+        request_context
     }
 
     fn handle_tools_list(&self) -> Value {
@@ -484,24 +517,29 @@ impl McpServer {
 
     fn build_elicitation_flow(&self, ctx: &OperationContext) -> ApprovalFlow {
         let request_id = Value::String(Uuid::new_v4().to_string());
-        let details = json!({
-            "tool_name": ctx.tool_name,
-            "command": ctx.command,
-            "remote_path": ctx.remote_path,
-            "local_path": ctx.local_path,
-            "instance_id": ctx.instance_id,
-        });
         let request = json!({
             "jsonrpc": "2.0",
             "id": request_id,
             "method": "elicitation/create",
             "params": {
                 "message": format!(
-                    "SSH operation '{}' requires approval.",
-                    ctx.tool_name
+                    "是否允许 SSH 操作 '{}'？连接：{}。命令：{}",
+                    ctx.tool_name,
+                    ctx.instance_id.as_deref().unwrap_or("-"),
+                    ctx.command.as_deref().unwrap_or("-")
                 ),
-                "requestId": Uuid::new_v4().to_string(),
-                "details": details,
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "approved": {
+                            "type": "boolean",
+                            "title": "批准此 SSH 操作",
+                            "description": "仅在确认允许此操作时提交。",
+                            "default": true
+                        }
+                    },
+                    "required": ["approved"]
+                }
             }
         });
 
@@ -542,9 +580,15 @@ impl McpServer {
                 let result = message
                     .payload
                     .get("result")
-                    .and_then(|result| result.get("action"))
-                    .and_then(Value::as_str);
-                return Ok(matches!(result, Some("accept")));
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let action = result.get("action").and_then(Value::as_str);
+                let approved = result
+                    .get("content")
+                    .and_then(|content| content.get("approved"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                return Ok(action == Some("accept") && approved);
             }
 
             if let Some(method) = message.payload.get("method").and_then(Value::as_str) {
@@ -754,6 +798,13 @@ fn has_elicitation_capability(capabilities: Option<&Value>) -> bool {
 
 fn is_trusted_codex_client(request_context: &RequestContext) -> bool {
     request_context.client_id == "codex"
+}
+
+fn canonical_client_id(client_id: &str) -> String {
+    match client_id {
+        "codex" | "codex-mcp-client" => "codex".to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn should_prefer_client_approval(
@@ -1025,6 +1076,42 @@ mod tests {
     }
 
     #[test]
+    fn initialize_client_info_enables_codex_approval_routing() {
+        let server = initialized_codex_server_with_capability(ApprovalMode::Auto);
+        let settings = crate::settings::AppSettings {
+            use_system_approval: true,
+            prefer_client_approval_for_codex: true,
+        };
+        let context = server.effective_request_context(test_context());
+        let flow = server
+            .approval_flow_for_settings(&context, &test_operation_context(), &settings)
+            .expect("approval flow should resolve");
+
+        assert_eq!(context.client_id, "codex");
+        assert!(matches!(flow, ApprovalFlow::Elicitation { .. }));
+    }
+
+    #[test]
+    fn elicitation_request_uses_standard_confirmation_schema() {
+        let server = test_server_with_mode(ApprovalMode::Auto);
+        let flow = server.build_elicitation_flow(&test_operation_context());
+        let ApprovalFlow::Elicitation { request, .. } = flow else {
+            panic!("auto approval should build elicitation flow");
+        };
+
+        assert_eq!(request["method"], "elicitation/create");
+        assert_eq!(request["params"]["requestedSchema"]["type"], "object");
+        assert_eq!(
+            request["params"]["requestedSchema"]["properties"]["approved"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            request["params"]["requestedSchema"]["required"][0],
+            "approved"
+        );
+    }
+
+    #[test]
     fn codex_falls_back_to_local_without_elicitation_capability() {
         let server = test_server_with_mode(ApprovalMode::Auto);
         let settings = crate::settings::AppSettings {
@@ -1106,7 +1193,10 @@ mod tests {
             "jsonrpc": "2.0",
             "id": "elicitation-id",
             "result": {
-                "action": "accept"
+                "action": "accept",
+                "content": {
+                    "approved": true
+                }
             }
         });
         let mut reader = BufReader::new(Cursor::new(format!(
@@ -1178,6 +1268,36 @@ mod tests {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {
                             "elicitation": {}
+                        }
+                    }
+                }),
+                MessageFraming::Newline,
+                &mut reader,
+                &mut output,
+            )
+            .expect("initialize should succeed");
+        server
+    }
+
+    fn initialized_codex_server_with_capability(approval_mode: ApprovalMode) -> McpServer {
+        let mut server = test_server_with_mode(approval_mode);
+        let mut reader = BufReader::new(Cursor::new(Vec::<u8>::new()));
+        let mut output = Vec::new();
+        server
+            .dispatch_with_context(
+                test_context(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {
+                            "elicitation": {}
+                        },
+                        "clientInfo": {
+                            "name": "codex-mcp-client",
+                            "version": "test"
                         }
                     }
                 }),

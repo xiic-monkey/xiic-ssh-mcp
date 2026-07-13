@@ -4,6 +4,7 @@ use std::net::Shutdown;
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
+use std::sync::mpsc;
 #[cfg(target_os = "windows")]
 use std::{fs::File, os::windows::io::FromRawHandle};
 
@@ -43,43 +44,75 @@ pub fn run_stdio_bridge(endpoint: &str, client_id: &str) -> Result<()> {
     let mut upstream_reader = stream.try_clone()?;
     let mut upstream_writer = stream;
 
+    let (done_tx, done_rx) = mpsc::channel();
+    let inbound_done = done_tx.clone();
     let inbound = std::thread::spawn(move || -> Result<()> {
         let stdin = io::stdin();
         let mut stdin_reader = BufReader::new(stdin.lock());
-        loop {
-            let message = match read_message(&mut stdin_reader)? {
-                Some(message) => message,
-                None => {
-                    shutdown_write(&upstream_writer)?;
-                    break;
-                }
-            };
-            write_message(&mut upstream_writer, &message.payload, message.framing)?;
-        }
-        Ok(())
+        let result = (|| -> Result<()> {
+            loop {
+                let message = match read_message(&mut stdin_reader)? {
+                    Some(message) => message,
+                    None => {
+                        shutdown_write(&upstream_writer)?;
+                        break;
+                    }
+                };
+                write_message(&mut upstream_writer, &message.payload, message.framing)?;
+            }
+            Ok(())
+        })();
+        let _ = inbound_done.send(BridgeSide::Inbound);
+        result
     });
 
+    let outbound_done = done_tx;
     let outbound = std::thread::spawn(move || -> Result<()> {
         let stdout = io::stdout();
         let mut stdout_writer = stdout.lock();
         let mut upstream_buf = BufReader::new(&mut upstream_reader);
-        loop {
-            let message = match read_message(&mut upstream_buf)? {
-                Some(message) => message,
-                None => break,
-            };
-            write_message(&mut stdout_writer, &message.payload, message.framing)?;
-        }
-        Ok(())
+        let result = (|| -> Result<()> {
+            loop {
+                let message = match read_message(&mut upstream_buf)? {
+                    Some(message) => message,
+                    None => break,
+                };
+                write_message(&mut stdout_writer, &message.payload, message.framing)?;
+            }
+            Ok(())
+        })();
+        let _ = outbound_done.send(BridgeSide::Outbound);
+        result
     });
 
-    inbound
-        .join()
-        .map_err(|_| anyhow!("stdio bridge inbound panicked"))??;
-    outbound
-        .join()
-        .map_err(|_| anyhow!("stdio bridge outbound panicked"))??;
-    Ok(())
+    match done_rx
+        .recv()
+        .context("stdio bridge completion channel closed")?
+    {
+        BridgeSide::Outbound => {
+            // The broker closed first. Do not wait for stdin forever with a
+            // dead transport; returning lets the MCP host restart this helper.
+            outbound
+                .join()
+                .map_err(|_| anyhow!("stdio bridge outbound panicked"))??;
+            Ok(())
+        }
+        BridgeSide::Inbound => {
+            inbound
+                .join()
+                .map_err(|_| anyhow!("stdio bridge inbound panicked"))??;
+            outbound
+                .join()
+                .map_err(|_| anyhow!("stdio bridge outbound panicked"))??;
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BridgeSide {
+    Inbound,
+    Outbound,
 }
 
 pub fn run_broker(
