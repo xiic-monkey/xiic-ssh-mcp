@@ -6,10 +6,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use xiic_ssh_mcp::app_core::{DEFAULT_CLIENT_ID, DEFAULT_KEYRING_SERVICE, DesktopCore};
+use xiic_ssh_mcp::app_core::{DEFAULT_CLIENT_ID, DesktopCore};
 use xiic_ssh_mcp::broker::{run_broker, run_stdio_bridge};
 use xiic_ssh_mcp::local_ipc::{
-    broker_server_healthy, default_broker_endpoint, notify_server_healthy, remove_stale_endpoint,
+    broker_server_healthy, default_broker_endpoint, remove_stale_endpoint,
 };
 use xiic_ssh_mcp::models::{ApprovalMode, WhitelistMode};
 use xiic_ssh_mcp::paths::shared_app_data_dir;
@@ -37,20 +37,15 @@ fn main() -> Result<()> {
         .parent()
         .map(|dir| dir.join("mcp.lock"))
         .unwrap_or_else(|| PathBuf::from("mcp.lock"));
-    let _instance_lock = match SingleInstanceGuard::acquire(&lock_path, || {
-        options
-            .notify_socket
-            .as_deref()
-            .map(notify_server_healthy)
-            .unwrap_or(true)
-    })? {
-        Some(lock) => lock,
-        None => return Ok(()),
-    };
+    let _instance_lock =
+        match SingleInstanceGuard::acquire(&lock_path, || broker_server_healthy(&broker_endpoint))?
+        {
+            Some(lock) => lock,
+            None => return Ok(()),
+        };
     let approval_endpoint = options.approval_endpoint.clone();
     let core = Arc::new(DesktopCore::new_with_socket(
         options.db_path,
-        options.keyring_service,
         options.notify_socket,
     )?);
 
@@ -78,8 +73,6 @@ fn ensure_daemon(options: &CliOptions, broker_endpoint: &str) -> Result<()> {
         .arg("--daemon")
         .arg("--db-path")
         .arg(&options.db_path)
-        .arg("--keyring-service")
-        .arg(&options.keyring_service)
         .arg("--approval-mode")
         .arg(approval_mode_as_str(options.approval_mode))
         .arg("--whitelist")
@@ -112,7 +105,6 @@ fn ensure_daemon(options: &CliOptions, broker_endpoint: &str) -> Result<()> {
 
 struct CliOptions {
     db_path: PathBuf,
-    keyring_service: String,
     notify_socket: Option<String>,
     whitelist_mode: WhitelistMode,
     approval_mode: ApprovalMode,
@@ -128,7 +120,6 @@ impl CliOptions {
         I: IntoIterator<Item = String>,
     {
         let mut db_path = None;
-        let mut keyring_service = DEFAULT_KEYRING_SERVICE.to_string();
         let mut notify_socket = None;
         let mut whitelist_mode = WhitelistMode::Strict;
         let mut approval_mode = ApprovalMode::Auto;
@@ -150,7 +141,7 @@ impl CliOptions {
                     db_path = Some(PathBuf::from(value));
                 }
                 "--keyring-service" => {
-                    keyring_service = iter
+                    let _legacy_keyring_service = iter
                         .next()
                         .ok_or_else(|| anyhow::anyhow!("--keyring-service requires a value"))?;
                 }
@@ -226,7 +217,6 @@ impl CliOptions {
 
         Ok(Self {
             db_path,
-            keyring_service,
             notify_socket,
             whitelist_mode,
             approval_mode,
@@ -257,17 +247,16 @@ fn print_help() {
     println!(
         "xiic-ssh-mcp\n\n\
          Usage:\n  \
-         xiic-ssh-mcp --db-path <path> [--client-id <id>] [--broker-endpoint <path-or-pipe>] [--daemon] [--keyring-service <service>] [--notify-socket <path>] [--approval-endpoint <path-or-pipe>] [--whitelist strict|off] [--approval-mode auto|elicitation|local]\n\n\
+         xiic-ssh-mcp --db-path <path> [--client-id <id>] [--broker-endpoint <path-or-pipe>] [--daemon] [--notify-socket <path>] [--approval-endpoint <path-or-pipe>] [--whitelist strict|off] [--approval-mode auto|elicitation|local]\n\n\
          Options:\n  \
          --daemon                  Run the long-lived local MCP daemon\n  \
          --db-path <path>          Path to SQLite database\n  \
          --client-id <id>          Stable client/agent id for operation logs\n  \
          --broker-endpoint <x>     Local IPC endpoint for stdio helper <-> daemon bridge\n  \
-         --keyring-service <srv>   Keyring service name (default: {})\n  \
+         --keyring-service <srv>   Deprecated legacy option; accepted but ignored\n  \
          --notify-socket <path>    Local IPC endpoint for UI log notifications\n  \
          --approval-endpoint <x>   Local IPC endpoint for approval request/response\n  \
          --whitelist <mode>        Whitelist mode: 'strict' (default) or 'off'\n  \
          --approval-mode <mode>    Approval mode: 'auto' (default), 'elicitation', or 'local'\n",
-        DEFAULT_KEYRING_SERVICE,
     );
 }

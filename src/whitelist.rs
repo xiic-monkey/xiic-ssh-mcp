@@ -315,12 +315,16 @@ fn push_segment(command: &str, start: usize, end: usize, segments: &mut Vec<Stri
 
 pub fn approval_key(ctx: &OperationContext) -> String {
     format!(
-        "{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}",
         ctx.tool_name,
         ctx.command.as_deref().unwrap_or(""),
         ctx.remote_path.as_deref().unwrap_or(""),
         ctx.local_path.as_deref().unwrap_or(""),
         ctx.instance_id.as_deref().unwrap_or(""),
+        ctx.overwrite
+            .map(|value| value.to_string())
+            .as_deref()
+            .unwrap_or(""),
     )
 }
 
@@ -389,6 +393,7 @@ mod tests {
             remote_path: None,
             local_path: None,
             instance_id: Some("dev-server".into()),
+            overwrite: None,
         }
     }
 
@@ -408,6 +413,7 @@ mod tests {
             remote_path: Some(remote_path.into()),
             local_path: Some(local_path.into()),
             instance_id: Some("dev-server".into()),
+            overwrite: Some(true),
         }
     }
 
@@ -457,6 +463,7 @@ mod tests {
             remote_path: None,
             local_path: None,
             instance_id: Some("dev-server".into()),
+            overwrite: None,
         };
 
         let approvals = HashMap::new();
@@ -477,6 +484,7 @@ mod tests {
             remote_path: None,
             local_path: None,
             instance_id: Some("dev-server".into()),
+            overwrite: None,
         };
 
         let approvals = HashMap::new();
@@ -494,6 +502,7 @@ mod tests {
             remote_path: None,
             local_path: None,
             instance_id: Some("dev-server".into()),
+            overwrite: None,
         };
 
         let approvals = HashMap::new();
@@ -597,6 +606,19 @@ mod tests {
         );
 
         assert_ne!(approval_key(&first), approval_key(&second));
+    }
+
+    #[test]
+    fn approval_key_includes_overwrite_choice() {
+        let overwrite = transfer_ctx(
+            "download_to_local",
+            "/srv/downloads/report.txt",
+            "/tmp/report.txt",
+        );
+        let mut preserve = overwrite.clone();
+        preserve.overwrite = Some(false);
+
+        assert_ne!(approval_key(&overwrite), approval_key(&preserve));
     }
 
     #[test]

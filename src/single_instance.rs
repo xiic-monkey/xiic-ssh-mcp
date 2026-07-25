@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+use crate::paths::ensure_private_file;
+
 pub struct SingleInstanceGuard {
     path: PathBuf,
     _file: File,
@@ -19,6 +21,7 @@ impl SingleInstanceGuard {
         for attempt in 0..3 {
             match OpenOptions::new().write(true).create_new(true).open(path) {
                 Ok(mut file) => {
+                    ensure_private_file(path)?;
                     write_lock_owner_pid(&mut file).with_context(|| {
                         format!(
                             "failed to write single-instance owner to '{}'",
@@ -47,6 +50,7 @@ impl SingleInstanceGuard {
                         .open(path)
                     {
                         Ok(mut file) => {
+                            ensure_private_file(path)?;
                             write_lock_owner_pid(&mut file).with_context(|| {
                                 format!(
                                     "failed to write single-instance owner to '{}'",

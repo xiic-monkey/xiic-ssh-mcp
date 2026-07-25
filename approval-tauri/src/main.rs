@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 
 use anyhow::Context;
@@ -11,7 +12,7 @@ use xiic_ssh_mcp::local_ipc::{
     default_approval_endpoint, remove_stale_endpoint,
 };
 use xiic_ssh_mcp::models::{ApprovalRequest, ApprovalRequestedEvent};
-use xiic_ssh_mcp::paths::shared_app_data_dir;
+use xiic_ssh_mcp::paths::{ensure_private_dir, ensure_private_file, shared_app_data_dir};
 use xiic_ssh_mcp::single_instance::SingleInstanceGuard;
 
 type ApprovalState = Arc<Mutex<ApprovalQueue>>;
@@ -112,7 +113,7 @@ fn main() {
 
 fn approval_endpoint() -> anyhow::Result<String> {
     let data_dir = shared_app_data_dir()?;
-    std::fs::create_dir_all(&data_dir)?;
+    ensure_private_dir(&data_dir)?;
     Ok(default_approval_endpoint(&data_dir))
 }
 
@@ -151,6 +152,13 @@ fn start_approval_listener(app: tauri::AppHandle, approvals: ApprovalState, endp
                 return;
             }
         };
+        if let Err(err) = ensure_private_file(Path::new(&endpoint)) {
+            eprintln!("[xiic-ssh] failed to secure approval endpoint: {err}");
+            if let Ok(mut queue) = approvals.lock() {
+                queue.reject_all();
+            }
+            return;
+        }
 
         eprintln!("[xiic-ssh] approval listener ready at {endpoint}");
 

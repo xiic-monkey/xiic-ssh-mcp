@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { Check, Clock3, ShieldAlert, X } from "lucide-react";
 
 type ApprovalOperationMetadata = {
   tool_name: string;
@@ -8,6 +9,7 @@ type ApprovalOperationMetadata = {
   remote_path: string | null;
   local_path: string | null;
   instance_id: string | null;
+  overwrite: boolean | null;
 };
 
 type ApprovalRequest = {
@@ -35,6 +37,9 @@ export default function ApprovalApp() {
   const [status, setStatus] = useState("等待审批请求…");
 
   useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
     const loadApproval = async () => {
       try {
         const current = await invoke<ApprovalRequestedEvent | null>("get_active_approval");
@@ -51,6 +56,9 @@ export default function ApprovalApp() {
   }, []);
 
   useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
     const setup = async () => {
       const unlistenRequested = await listen<ApprovalRequestedEvent>("approval-requested", (event) => {
         setActiveApproval(event.payload.request);
@@ -101,7 +109,9 @@ export default function ApprovalApp() {
       {activeApproval ? (
         <section aria-label="SSH 操作审批" className="approval-panel">
           <div className="approval-panel-header">
-            <div className="approval-dot" aria-hidden="true" />
+            <span className="approval-header-icon" aria-hidden="true">
+              <ShieldAlert size={18} />
+            </span>
             <div>
               <h1>操作审批</h1>
               <p>{pendingApprovalCount > 0 ? `后面还有 ${pendingApprovalCount} 个待审批请求` : "请确认是否执行此操作"}</p>
@@ -120,6 +130,9 @@ export default function ApprovalApp() {
             {activeApproval.metadata.remote_path ? (
               <ApprovalField label="远端路径" value={activeApproval.metadata.remote_path} mono />
             ) : null}
+            {activeApproval.metadata.overwrite !== null ? (
+              <ApprovalField label="覆盖文件" value={activeApproval.metadata.overwrite ? "是" : "否"} />
+            ) : null}
           </div>
 
           <div className="approval-panel-actions">
@@ -129,6 +142,7 @@ export default function ApprovalApp() {
               onClick={() => void resolveApproval(false)}
               type="button"
             >
+              <X size={15} />
               拒绝
             </button>
             <button
@@ -137,6 +151,7 @@ export default function ApprovalApp() {
               onClick={() => void resolveApproval(true)}
               type="button"
             >
+              <Check size={15} />
               允许执行
             </button>
           </div>
@@ -144,7 +159,8 @@ export default function ApprovalApp() {
       ) : (
         <div className="approval-idle-shell">
           <div className="approval-idle-card">
-            <strong>操作审批</strong>
+            <span className="approval-idle-icon"><Clock3 size={18} /></span>
+            <strong>等待操作审批</strong>
             <span>{status}</span>
           </div>
         </div>
@@ -199,8 +215,16 @@ function approvalToolName(toolName: string): string {
       return "上传文件";
     case "download_file":
       return "下载文件";
+    case "upload_local_file":
+      return "上传本地文件";
+    case "download_to_local":
+      return "下载到本地";
     case "create_session":
       return "创建会话";
+    case "close_session":
+      return "关闭会话";
+    case "sudo":
+      return "sudo 命令";
     default:
       return toolName;
   }

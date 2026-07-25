@@ -2,33 +2,26 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::paths::shared_app_data_dir;
+use crate::paths::{ensure_private_dir, ensure_private_file, shared_app_data_dir};
 
 /// 应用持久化配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     /// 启用系统原生弹窗进行审批（跳过 Tauri 桌面审批 App）。
     pub use_system_approval: bool,
-    /// 在 Codex 中优先使用客户端审批卡片，跳过 xiic-ssh 的本地二次审批。
-    #[serde(default = "default_prefer_client_approval_for_codex")]
-    pub prefer_client_approval_for_codex: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             use_system_approval: true,
-            prefer_client_approval_for_codex: default_prefer_client_approval_for_codex(),
         }
     }
 }
 
-fn default_prefer_client_approval_for_codex() -> bool {
-    true
-}
-
 fn settings_file_path() -> anyhow::Result<PathBuf> {
     let dir = shared_app_data_dir()?;
+    ensure_private_dir(&dir)?;
     Ok(dir.join("settings.json"))
 }
 
@@ -50,6 +43,7 @@ pub fn save_settings(settings: &AppSettings) -> anyhow::Result<()> {
     let path = settings_file_path()?;
     let content = serde_json::to_string_pretty(settings)?;
     std::fs::write(&path, content)?;
+    ensure_private_file(&path)?;
     Ok(())
 }
 
@@ -58,23 +52,22 @@ mod tests {
     use super::AppSettings;
 
     #[test]
-    fn missing_new_field_defaults_to_true() {
+    fn legacy_extra_fields_are_ignored() {
         let settings: AppSettings = serde_json::from_str(
             r#"{
-              "use_system_approval": false
+              "use_system_approval": false,
+              "prefer_client_approval_for_codex": true
             }"#,
         )
         .expect("legacy settings should deserialize");
 
         assert!(!settings.use_system_approval);
-        assert!(settings.prefer_client_approval_for_codex);
     }
 
     #[test]
     fn round_trip_preserves_new_field() {
         let settings = AppSettings {
             use_system_approval: false,
-            prefer_client_approval_for_codex: false,
         };
 
         let serialized = serde_json::to_string(&settings).expect("settings should serialize");
@@ -82,6 +75,5 @@ mod tests {
             serde_json::from_str(&serialized).expect("settings should deserialize");
 
         assert!(!restored.use_system_approval);
-        assert!(!restored.prefer_client_approval_for_codex);
     }
 }

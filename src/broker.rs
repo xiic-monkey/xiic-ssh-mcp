@@ -18,6 +18,8 @@ use crate::local_ipc::{BROKER_HEALTH_CHECK_KIND, BROKER_HEALTH_OK_KIND, broker_s
 use crate::mcp::McpServer;
 use crate::mcp_protocol::{IncomingMessage, MessageFraming, read_message, write_message};
 use crate::models::{ApprovalMode, BrokerHello, BrokerWelcome, RequestContext, WhitelistMode};
+#[cfg(unix)]
+use crate::paths::ensure_private_file;
 
 pub fn run_stdio_bridge(endpoint: &str, client_id: &str) -> Result<()> {
     let mut stream = connect_broker_stream(endpoint)?;
@@ -130,6 +132,8 @@ pub fn run_broker(
 
         remove_stale_endpoint(endpoint);
         let listener = UnixListener::bind(endpoint).with_context(|| endpoint.to_string())?;
+        ensure_private_file(std::path::Path::new(endpoint))
+            .with_context(|| format!("failed to secure broker endpoint '{endpoint}'"))?;
         eprintln!("[xiic-ssh-mcp] broker listening on {endpoint}");
 
         for stream in listener.incoming() {

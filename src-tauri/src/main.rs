@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tauri::{Emitter, Manager, State};
-use xiic_ssh_mcp::app_core::{DEFAULT_CLIENT_ID, DEFAULT_KEYRING_SERVICE, DesktopCore};
+use xiic_ssh_mcp::app_core::{DEFAULT_CLIENT_ID, DesktopCore};
 use xiic_ssh_mcp::local_ipc::{
     LOG_NOTIFICATION_PAYLOAD, NOTIFY_HEALTH_CHECK_KIND, NOTIFY_HEALTH_OK_KIND,
     default_approval_endpoint, default_broker_endpoint, default_notify_endpoint,
@@ -16,7 +16,7 @@ use xiic_ssh_mcp::models::{
     InstanceDraft, InstanceSummary, McpConfigBundle, McpConfigRequest, OperationLogEntry,
     TestConnectionResult,
 };
-use xiic_ssh_mcp::paths::shared_app_data_dir;
+use xiic_ssh_mcp::paths::{ensure_private_dir, ensure_private_file, shared_app_data_dir};
 use xiic_ssh_mcp::single_instance::SingleInstanceGuard;
 
 struct DesktopState {
@@ -190,7 +190,7 @@ fn main() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(move |app| {
             let data_dir = shared_app_data_dir()?;
-            std::fs::create_dir_all(&data_dir)?;
+            ensure_private_dir(&data_dir)?;
             let notify_endpoint = default_notify_endpoint(&data_dir);
             let instance_lock =
                 match SingleInstanceGuard::acquire(&data_dir.join("manager.lock"), || {
@@ -208,7 +208,6 @@ fn main() {
             let mcp_config = core.mcp_config_bundle(McpConfigRequest {
                 command_path: &command_path,
                 db_path: &db_path,
-                keyring_service: DEFAULT_KEYRING_SERVICE,
                 notify_endpoint: Some(&notify_endpoint),
                 approval_endpoint: Some(&approval_endpoint),
                 client_id: DEFAULT_CLIENT_ID,
@@ -247,7 +246,7 @@ fn main() {
 
 fn build_core() -> anyhow::Result<(Arc<DesktopCore>, PathBuf, String, String)> {
     let data_dir = shared_app_data_dir()?;
-    std::fs::create_dir_all(&data_dir)?;
+    ensure_private_dir(&data_dir)?;
 
     let notify_endpoint = default_notify_endpoint(&data_dir);
     let approval_endpoint = default_approval_endpoint(&data_dir);
@@ -257,7 +256,6 @@ fn build_core() -> anyhow::Result<(Arc<DesktopCore>, PathBuf, String, String)> {
     let database_path = data_dir.join("instances.sqlite3");
     let core = DesktopCore::new_with_socket(
         database_path.clone(),
-        DEFAULT_KEYRING_SERVICE,
         Some(notify_endpoint.clone()),
     )?;
     Ok((
@@ -288,6 +286,10 @@ fn start_notify_listener(app: tauri::AppHandle, endpoint: String) {
                 return;
             }
         };
+        if let Err(err) = ensure_private_file(Path::new(&endpoint)) {
+            eprintln!("[xiic-ssh] failed to secure notify endpoint: {err}");
+            return;
+        }
 
         for stream in listener.incoming() {
             match stream {

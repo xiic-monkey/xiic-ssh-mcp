@@ -50,10 +50,14 @@ impl LocalApprovalClient {
             metadata: metadata.clone(),
         };
 
-        // 如果用户启用了系统弹窗审批，直接走原生对话框，不启动审批 App
+        // 优先使用系统弹窗。只有弹窗本身无法启动时，才回退到独立审批 App，
+        // 避免把“系统 UI 不可用”误报成“用户拒绝”。
         if uses_system_approval() {
             eprintln!("[xiic-ssh-mcp] 使用系统弹窗进行审批（settings.use_system_approval）");
-            return request_via_native_dialog(&request);
+            match request_via_native_dialog(&request) {
+                Ok(accepted) => return Ok(accepted),
+                Err(err) => eprintln!("[xiic-ssh-mcp] 系统审批弹窗失败，尝试独立审批 App: {err:#}"),
+            }
         }
 
         if let Some(endpoint) = &self.approval_endpoint {
@@ -156,40 +160,54 @@ pub fn approval_message(metadata: &ApprovalOperationMetadata) -> String {
             metadata.command.as_deref().unwrap_or("-"),
         ),
         "upload_file" => format!(
-            "是否允许上传本地文件到连接 '{}'？\n\n本地：{}\n远端：{}",
+            "是否允许上传本地文件到连接 '{}'？\n\n本地：{}\n远端：{}\n覆盖已有文件：{}",
             metadata.instance_id.as_deref().unwrap_or("-"),
             metadata.local_path.as_deref().unwrap_or("-"),
             metadata.remote_path.as_deref().unwrap_or("-"),
+            overwrite_label(metadata.overwrite),
         ),
         "upload_local_file" => format!(
-            "是否允许从本地上传文件到连接 '{}'？\n\n{}",
+            "是否允许从本地上传文件到连接 '{}'？\n\n本地：{}\n远端：{}\n覆盖已有文件：{}",
             metadata.instance_id.as_deref().unwrap_or("-"),
+            metadata.local_path.as_deref().unwrap_or("-"),
             metadata.remote_path.as_deref().unwrap_or("-"),
+            overwrite_label(metadata.overwrite),
         ),
         "download_file" => format!(
-            "是否允许从连接 '{}' 下载文件？\n\n远端：{}\n本地：{}",
+            "是否允许从连接 '{}' 下载文件？\n\n远端：{}\n本地：{}\n覆盖已有文件：{}",
             metadata.instance_id.as_deref().unwrap_or("-"),
             metadata.remote_path.as_deref().unwrap_or("-"),
             metadata
                 .local_path
                 .as_deref()
                 .unwrap_or("默认 Downloads 目录"),
+            overwrite_label(metadata.overwrite),
         ),
         "download_to_local" => format!(
-            "是否允许从连接 '{}' 下载文件到本地？\n\n{}",
+            "是否允许从连接 '{}' 下载文件到本地？\n\n远端：{}\n本地：{}\n覆盖已有文件：{}",
             metadata.instance_id.as_deref().unwrap_or("-"),
             metadata.remote_path.as_deref().unwrap_or("-"),
+            metadata.local_path.as_deref().unwrap_or("-"),
+            overwrite_label(metadata.overwrite),
         ),
         "close_session" => format!(
             "是否关闭连接 '{}' 的 SSH 会话？",
             metadata.instance_id.as_deref().unwrap_or("-"),
         ),
         "sudo" => format!(
-            "是否允许在连接 '{}' 上以 sudo 执行命令？\n\n命令：\nsudo {}",
+            "是否允许在连接 '{}' 上以 sudo 执行命令？\n\n命令：\n{}",
             metadata.instance_id.as_deref().unwrap_or("-"),
             metadata.command.as_deref().unwrap_or("-"),
         ),
         _ => format!("是否允许执行 SSH 操作 '{}'？", metadata.tool_name),
+    }
+}
+
+fn overwrite_label(overwrite: Option<bool>) -> &'static str {
+    match overwrite {
+        Some(true) => "是",
+        Some(false) => "否",
+        None => "不适用",
     }
 }
 
@@ -624,14 +642,27 @@ fn request_via_native_dialog(request: &ApprovalRequest) -> Result<bool> {
         "display dialog {} buttons {{\"拒绝\", \"允许执行\"}} default button \"允许执行\" cancel button \"拒绝\" with title \"Xiic SSH 审批\" with icon caution",
         osascript_string(&request.message)
     );
-    let status = Command::new("osascript")
+    let output = Command::new("osascript")
         .args(["-e", &script])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .output()
         .context("failed to show macOS approval dialog")?;
-    Ok(status.success())
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Ok(stdout.contains("button returned:允许执行"));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("User canceled") || stderr.contains("-128") {
+        return Ok(false);
+    }
+
+    bail!(
+        "macOS 审批弹窗退出异常（status={}）：{}",
+        output.status,
+        stderr.trim()
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -724,6 +755,7 @@ mod tests {
             remote_path: None,
             local_path: None,
             instance_id: Some("dev".into()),
+            overwrite: None,
         };
 
         let message = approval_message(&metadata);
@@ -740,6 +772,7 @@ mod tests {
             remote_path: None,
             local_path: None,
             instance_id: Some("production".into()),
+            overwrite: None,
         };
 
         let message = approval_message(&metadata);
@@ -752,16 +785,53 @@ mod tests {
     fn sudo_approval_message_contains_command() {
         let metadata = ApprovalOperationMetadata {
             tool_name: "sudo".into(),
-            command: Some("apt update".into()),
+            command: Some("sudo apt update".into()),
             remote_path: None,
             local_path: None,
             instance_id: Some("dev".into()),
+            overwrite: None,
         };
 
         let message = approval_message(&metadata);
 
         assert!(message.contains("dev"));
         assert!(message.contains("sudo apt update"));
+        assert!(!message.contains("sudo sudo"));
+    }
+
+    #[test]
+    fn file_transfer_approval_message_contains_paths_and_overwrite_choice() {
+        let metadata = ApprovalOperationMetadata {
+            tool_name: "download_to_local".into(),
+            command: None,
+            remote_path: Some("/srv/report.csv".into()),
+            local_path: Some("/tmp/report.csv".into()),
+            instance_id: Some("production".into()),
+            overwrite: Some(false),
+        };
+
+        let message = approval_message(&metadata);
+
+        assert!(message.contains("/srv/report.csv"));
+        assert!(message.contains("/tmp/report.csv"));
+        assert!(message.contains("覆盖已有文件：否"));
+    }
+
+    #[test]
+    fn default_download_approval_discloses_overwrite_behavior() {
+        let metadata = ApprovalOperationMetadata {
+            tool_name: "download_file".into(),
+            command: None,
+            remote_path: Some("/srv/report.csv".into()),
+            local_path: None,
+            instance_id: Some("production".into()),
+            overwrite: Some(true),
+        };
+
+        let message = approval_message(&metadata);
+
+        assert!(message.contains("默认 Downloads 目录"));
+        assert!(message.contains("覆盖已有文件：是"));
     }
 
     #[test]
@@ -815,6 +885,7 @@ mod tests {
                 remote_path: None,
                 local_path: None,
                 instance_id: Some("dev".into()),
+                overwrite: None,
             },
         }
     }

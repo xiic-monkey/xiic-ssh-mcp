@@ -1,8 +1,37 @@
 import { useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
+import {
+  Activity,
+  AlertTriangle,
+  ArrowLeft,
+  Check,
+  CheckCircle2,
+  Clipboard,
+  FileKey2,
+  FolderOpen,
+  KeyRound,
+  ListTree,
+  LoaderCircle,
+  LockKeyhole,
+  Plus,
+  RefreshCw,
+  RotateCcw,
+  Save,
+  Search,
+  Server,
+  Settings,
+  ShieldCheck,
+  SlidersHorizontal,
+  SquareTerminal,
+  Terminal,
+  Trash2,
+  X,
+  XCircle,
+  Zap,
+} from "lucide-react";
 
 type AuthKind = "password" | "private_key";
 
@@ -63,7 +92,6 @@ type OperationLogEntry = {
 
 type AppSettings = {
   use_system_approval: boolean;
-  prefer_client_approval_for_codex: boolean;
 };
 
 type ParsedTarget = {
@@ -72,7 +100,8 @@ type ParsedTarget = {
   username: string;
 };
 
-const appWindow = getCurrentWindow();
+const runningInTauri = isTauri();
+const appWindow = runningInTauri ? getCurrentWindow() : null;
 
 const emptyDraft = (): InstanceDraft => ({
   instance_id: "",
@@ -127,6 +156,8 @@ export default function App() {
   const [isCreating, setIsCreating] = useState(true);
   const [configs, setConfigs] = useState<McpConfigBundle | null>(null);
   const [showConfigDialog, setShowConfigDialog] = useState(false);
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [instanceQuery, setInstanceQuery] = useState("");
   const [status, setStatus] = useState<string>("正在加载连接...");
   const [statusTone, setStatusTone] = useState<"neutral" | "success" | "danger">(
     "neutral",
@@ -147,10 +178,26 @@ export default function App() {
   const logListRef = useRef<HTMLDivElement>(null);
   const activeTabRef = useRef(activeTab);
   const autoRefreshRef = useRef(autoRefresh);
+  const lastLogIdRef = useRef(0);
 
   useEffect(() => {
     void loadData();
   }, []);
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key !== "Escape") return;
+      if (showDeleteDialog) {
+        setShowDeleteDialog(false);
+      } else if (showConfigDialog) {
+        setShowConfigDialog(false);
+      } else if (showSettings) {
+        closeSettings();
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [showConfigDialog, showDeleteDialog, showSettings]);
 
   async function hydrateDraft(instance: InstanceSummary) {
     const baseDraft = fromSummary(instance);
@@ -208,6 +255,12 @@ export default function App() {
       setStatus("已就绪。");
       setStatusTone("neutral");
     } catch (error) {
+      if (!runningInTauri) {
+        startCreateMode();
+        setStatus("浏览器预览模式");
+        setStatusTone("neutral");
+        return;
+      }
       setStatus(asMessage(error));
       setStatusTone("danger");
     }
@@ -228,6 +281,10 @@ export default function App() {
   }, [autoRefresh]);
 
   useEffect(() => {
+    if (!runningInTauri) {
+      return;
+    }
+
     const setup = async () => {
       const unlisten = await listen("log-updated", () => {
         if (activeTabRef.current === "logs" && autoRefreshRef.current) {
@@ -247,7 +304,9 @@ export default function App() {
       const entries = await invoke<OperationLogEntry[]>("get_operation_logs", { limit: 200 });
       const sorted = [...entries].reverse();
       setLogs(sorted);
-      setLastLogId(sorted.length > 0 ? sorted[sorted.length - 1].id : 0);
+      const latestId = sorted.length > 0 ? sorted[sorted.length - 1].id : 0;
+      lastLogIdRef.current = latestId;
+      setLastLogId(latestId);
     } catch (error) {
       setStatus(asMessage(error));
       setStatusTone("danger");
@@ -257,13 +316,14 @@ export default function App() {
   }
 
   async function loadNewLogs() {
-    if (lastLogId === 0) {
+    const sinceId = lastLogIdRef.current;
+    if (sinceId === 0) {
       void loadLogs();
       return;
     }
     try {
       const entries = await invoke<OperationLogEntry[]>("get_operation_logs_since", {
-        sinceId: lastLogId,
+        sinceId,
         limit: 200,
       });
       if (entries.length === 0) return;
@@ -272,7 +332,8 @@ export default function App() {
         const newEntries = entries.filter((e) => !existingIds.has(e.id));
         return [...prev, ...newEntries];
       });
-      const maxId = entries.reduce((max, e) => Math.max(max, e.id), lastLogId);
+      const maxId = entries.reduce((max, e) => Math.max(max, e.id), sinceId);
+      lastLogIdRef.current = maxId;
       setLastLogId(maxId);
     } catch {
       // ignore background refresh failures
@@ -290,6 +351,8 @@ export default function App() {
     setDraft(emptyDraft());
     setTargetInput("");
     setIsCreating(true);
+    setActiveTab("config");
+    setShowSettings(false);
   }
 
   function selectInstance(instance: InstanceSummary) {
@@ -297,6 +360,8 @@ export default function App() {
     void hydrateDraft(instance);
     setTargetInput(formatTarget(instance.username, instance.host, instance.port));
     setIsCreating(false);
+    setActiveTab("config");
+    setShowSettings(false);
     setStatus(`正在编辑 ${instance.name}。`);
     setStatusTone("neutral");
   }
@@ -365,13 +430,10 @@ export default function App() {
     if (!selectedId) {
       return;
     }
-    const confirmed = window.confirm(`确定删除连接“${selectedId}”吗？`);
-    if (!confirmed) {
-      return;
-    }
 
     try {
       await invoke("delete_instance", { instanceId: selectedId });
+      setShowDeleteDialog(false);
       startCreateMode();
       await loadData();
       setStatus(`已删除 ${selectedId}。`);
@@ -404,32 +466,6 @@ export default function App() {
       await invoke("save_settings", { settings: newSettings });
       setAppSettings(newSettings);
       setStatus(useSystem ? "已启用系统弹窗审批。" : "已禁用系统弹窗审批。");
-      setStatusTone("success");
-    } catch (error) {
-      setStatus(asMessage(error));
-      setStatusTone("danger");
-    } finally {
-      setSavingSettings(false);
-    }
-  }
-
-  async function handleTogglePreferCodexApproval(preferClientApproval: boolean) {
-    if (!appSettings) {
-      return;
-    }
-    setSavingSettings(true);
-    const newSettings: AppSettings = {
-      ...appSettings,
-      prefer_client_approval_for_codex: preferClientApproval,
-    };
-    try {
-      await invoke("save_settings", { settings: newSettings });
-      setAppSettings(newSettings);
-      setStatus(
-        preferClientApproval
-          ? "已启用 Codex 单层审批。请重启 MCP 服务器以让新会话生效。"
-          : "已禁用 Codex 单层审批。请重启 MCP 服务器以让新会话生效。",
-      );
       setStatusTone("success");
     } catch (error) {
       setStatus(asMessage(error));
@@ -484,6 +520,30 @@ export default function App() {
   const requiresKey = draft.auth_kind === "private_key";
   const hasPrivateKeyConflict =
     requiresKey && draft.private_key.length > 0 && draft.private_key_path.length > 0;
+  const selectedInstance = instances.find((instance) => instance.instance_id === selectedId);
+  const canUseSavedCredential = Boolean(
+    !isCreating
+    && draft.keep_existing_secret
+    && draft.has_saved_secret
+    && selectedInstance?.auth_kind === draft.auth_kind,
+  );
+  const hasCredential = requiresPassword
+    ? Boolean(draft.password.trim()) || canUseSavedCredential
+    : Boolean(draft.private_key.trim() || draft.private_key_path.trim()) || canUseSavedCredential;
+  const hasRequiredMetadata = Boolean(
+    draft.instance_id.trim()
+    && draft.name.trim()
+    && draft.host.trim()
+    && draft.username.trim()
+    && draft.port > 0,
+  );
+  const canSubmit = hasRequiredMetadata && hasCredential && !hasPrivateKeyConflict;
+  const normalizedQuery = instanceQuery.trim().toLocaleLowerCase();
+  const filteredInstances = normalizedQuery
+    ? instances.filter((instance) =>
+      [instance.name, instance.instance_id, instance.host, instance.username]
+        .some((value) => value.toLocaleLowerCase().includes(normalizedQuery)))
+    : instances;
 
   async function handlePickPrivateKeyFile() {
     try {
@@ -522,6 +582,9 @@ export default function App() {
   }
 
   async function handleDragMouseDown(event: React.MouseEvent<HTMLElement>) {
+    if (!appWindow) {
+      return;
+    }
     if (event.button !== 0) {
       return;
     }
@@ -542,26 +605,47 @@ export default function App() {
         <div className="sidebar-top" onMouseDown={(event) => void handleDragMouseDown(event)}>
           <div className="brand">
             <div className="brand-mark" aria-hidden="true">
-              <svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
-                <rect x="4" y="4" width="40" height="40" rx="9" fill="#ffffff" stroke="#d7dee9" />
-                <path d="M16 18L22 24L16 30" stroke="#203044" strokeWidth="3.2" strokeLinecap="round" strokeLinejoin="round" />
-                <path d="M27 30H33" stroke="#d49139" strokeWidth="3.2" strokeLinecap="round" />
-                <circle cx="31" cy="17" r="2.5" fill="#d49139" />
-              </svg>
+              <SquareTerminal size={20} strokeWidth={1.8} />
             </div>
             <div className="brand-copy">
-              <h1>Xiic SSH 管理器</h1>
-              <p>本地连接与 MCP 接入</p>
+              <h1>Xiic SSH</h1>
+              <p>连接管理器</p>
             </div>
           </div>
         </div>
 
-        <button className="ghost-button" onClick={startCreateMode} type="button">
-          + 新建连接
+        <button className="primary-button sidebar-create-button" onClick={startCreateMode} type="button">
+          <Plus size={15} />
+          新建连接
         </button>
 
+        <div className="sidebar-section-heading">
+          <span>连接</span>
+          <span>{instances.length}</span>
+        </div>
+        <label className="search-field">
+          <Search size={14} aria-hidden="true" />
+          <input
+            aria-label="搜索连接"
+            onChange={(event) => setInstanceQuery(event.target.value)}
+            placeholder="搜索名称、主机或用户"
+            value={instanceQuery}
+          />
+          {instanceQuery ? (
+            <button
+              aria-label="清除搜索"
+              className="search-clear"
+              onClick={() => setInstanceQuery("")}
+              title="清除搜索"
+              type="button"
+            >
+              <X size={13} />
+            </button>
+          ) : null}
+        </label>
+
         <div className="instance-list">
-          {instances.map((instance) => (
+          {filteredInstances.map((instance) => (
             <button
               key={instance.instance_id}
               className={
@@ -570,33 +654,47 @@ export default function App() {
               onClick={() => selectInstance(instance)}
               type="button"
             >
+              <span className="instance-icon" aria-hidden="true">
+                <Server size={15} />
+              </span>
               <div className="instance-title">
                 <strong>{instance.name}</strong>
-                <span>{instance.auth_kind === "password" ? "密码" : "私钥"}</span>
+                {instance.has_secret ? <span className="credential-dot" title="凭据已保存" /> : null}
               </div>
-              <p>{instance.host}:{instance.port}</p>
-              <small>{instance.username}@{instance.instance_id}</small>
+              <p>{instance.username}@{instance.host}:{instance.port}</p>
+              <small>{instance.instance_id}</small>
             </button>
           ))}
 
           {instances.length === 0 ? (
             <div className="empty-state">
-              <p>还没有已保存的连接。</p>
-              <span>请先在右侧创建连接，并在保存前测试是否可用。</span>
+              <Server size={18} aria-hidden="true" />
+              <p>暂无连接</p>
+              <span>新建连接后会显示在这里。</span>
+            </div>
+          ) : filteredInstances.length === 0 ? (
+            <div className="empty-state compact">
+              <Search size={17} aria-hidden="true" />
+              <p>没有匹配结果</p>
             </div>
           ) : null}
         </div>
 
         <div className="sidebar-bottom">
           <button
-            className={"sidebar-settings-btn" + (showSettings ? " active" : "")}
+            className="sidebar-nav-button"
+            onClick={() => setShowConfigDialog(true)}
+            type="button"
+          >
+            <Terminal size={15} />
+            <span>MCP 配置</span>
+          </button>
+          <button
+            className={"sidebar-nav-button" + (showSettings ? " active" : "")}
             onClick={showSettings ? closeSettings : openSettings}
             type="button"
           >
-            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-              <circle cx="8" cy="8" r="2.5" />
-              <path d="M8 1v2M8 13v2M1 8h2M13 8h2M2.5 2.5l1.5 1.5M12 12l1.5 1.5M2.5 13.5l1.5-1.5M12 4l1.5-1.5" />
-            </svg>
+            <Settings size={15} />
             <span>设置</span>
           </button>
         </div>
@@ -610,359 +708,428 @@ export default function App() {
             restartingMcp={restartingMcp}
             restartResult={restartResult}
             onToggleSystemApproval={handleToggleSystemApproval}
-            onTogglePreferCodexApproval={handleTogglePreferCodexApproval}
             onRestartMcp={handleRestartMcp}
             onClose={closeSettings}
             onDragMouseDown={(event) => void handleDragMouseDown(event)}
           />
         ) : (
-        <section className="panel-main">
-          <div className="panel-header" onMouseDown={(event) => void handleDragMouseDown(event)}>
-            <div>
-              <h2>{isCreating ? "新的 SSH 配置" : draft.name || draft.instance_id}</h2>
+          <section className="panel-main">
+            <div className="panel-header" onMouseDown={(event) => void handleDragMouseDown(event)}>
+              <div className="panel-title-group">
+                <span className="panel-eyebrow">{isCreating ? "新建连接" : "SSH 连接"}</span>
+                <h2>{isCreating ? "配置远程主机" : draft.name || draft.instance_id}</h2>
+                {!isCreating && draft.host ? (
+                  <p>{draft.username}@{draft.host}:{draft.port}</p>
+                ) : null}
+              </div>
+              <div className={`status-pill ${statusTone}`} role={statusTone === "danger" ? "alert" : "status"}>
+                {statusTone === "success" ? <CheckCircle2 size={14} /> : null}
+                {statusTone === "danger" ? <XCircle size={14} /> : null}
+                {statusTone === "neutral" ? <Activity size={14} /> : null}
+                <span>{status}</span>
+              </div>
             </div>
-            <div className="header-actions">
+
+            <div className="tab-bar" role="tablist" aria-label="连接视图">
               <button
-                className="ghost-button utility-button"
-                disabled={!configs}
-                onClick={() => setShowConfigDialog(true)}
+                aria-selected={activeTab === "config"}
+                className={activeTab === "config" ? "tab active" : "tab"}
+                onClick={() => setActiveTab("config")}
+                role="tab"
                 type="button"
               >
-                MCP 配置
+                <SlidersHorizontal size={14} />
+                连接配置
               </button>
-              <div className={`status-pill ${statusTone}`}>{status}</div>
+              <button
+                aria-selected={activeTab === "logs"}
+                className={activeTab === "logs" ? "tab active" : "tab"}
+                onClick={() => setActiveTab("logs")}
+                role="tab"
+                type="button"
+              >
+                <ListTree size={14} />
+                操作日志
+              </button>
             </div>
-          </div>
 
-          <div className="tab-bar">
-            <button
-              className={activeTab === "config" ? "tab active" : "tab"}
-              onClick={() => setActiveTab("config")}
-              type="button"
-            >
-              配置
-            </button>
-            <button
-              className={activeTab === "logs" ? "tab active" : "tab"}
-              onClick={() => setActiveTab("logs")}
-              type="button"
-            >
-              操作日志
-            </button>
-          </div>
-
-          {activeTab === "config" ? (
-            <div className="tab-content">
-              <div className="form-grid">
-                <label className="field-span-2">
-                  <span>SSH 目标</span>
-                  <div className="target-row">
-                    <input
-                      onChange={(event) => setTargetInput(event.target.value)}
-                      placeholder="例如：ssh://root@10.0.0.10:22 或 root@10.0.0.10"
-                      value={targetInput}
-                    />
-                    <button className="ghost-button" onClick={applyTargetInput} type="button">
-                      解析
-                    </button>
+            {activeTab === "config" ? (
+              <form
+                className="tab-content connection-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  if (canSubmit) void handleSave();
+                }}
+              >
+                <section className="form-section">
+                  <div className="form-section-heading">
+                    <span className="section-icon"><Server size={16} /></span>
+                    <div>
+                      <h3>连接信息</h3>
+                      <p>用于定位远程主机并在 MCP 中识别此连接。</p>
+                    </div>
                   </div>
-                </label>
-                <label>
-                  <span>连接 ID</span>
-                  <input
-                    disabled={!isCreating}
-                    onChange={(event) => setDraft({ ...draft, instance_id: event.target.value })}
-                    placeholder="例如：prod-server"
-                    value={draft.instance_id}
-                  />
-                </label>
-                <label>
-                  <span>显示名称</span>
-                  <input
-                    onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-                    placeholder="例如：生产服务器"
-                    value={draft.name}
-                  />
-                </label>
-                <label>
-                  <span>主机</span>
-                  <input
-                    onChange={(event) => setDraft({ ...draft, host: event.target.value })}
-                    placeholder="10.0.0.10"
-                    value={draft.host}
-                  />
-                </label>
-                <label>
-                  <span>端口</span>
-                  <input
-                    min={1}
-                    onChange={(event) =>
-                      setDraft({
-                        ...draft,
-                        port: Number.parseInt(event.target.value, 10) || 22,
-                      })
-                    }
-                    type="number"
-                    value={draft.port}
-                  />
-                </label>
-                <label>
-                  <span>用户名</span>
-                  <input
-                    onChange={(event) => setDraft({ ...draft, username: event.target.value })}
-                    placeholder="root"
-                    value={draft.username}
-                  />
-                </label>
-                <label>
-                  <span>认证方式</span>
-                  <select
-                    onChange={(event) =>
-                      setDraft({
-                        ...draft,
-                        auth_kind: event.target.value as AuthKind,
-                      })
-                    }
-                    value={draft.auth_kind}
-                  >
-                    <option value="password">密码</option>
-                    <option value="private_key">私钥</option>
-                  </select>
-                </label>
-              </div>
-
-              <div className="toggle-row">
-                <label className="checkbox">
-                  <input
-                    checked={draft.host_key_check}
-                    onChange={(event) =>
-                      setDraft({ ...draft, host_key_check: event.target.checked })
-                    }
-                    type="checkbox"
-                  />
-                  <span>按 known_hosts 校验主机指纹</span>
-                </label>
-
-                {!isCreating && draft.has_saved_secret ? (
-                  <label className="checkbox">
-                    <input
-                      checked={draft.keep_existing_secret}
-                      onChange={(event) =>
-                        setDraft({ ...draft, keep_existing_secret: event.target.checked })
-                      }
-                      type="checkbox"
-                    />
-                    <span>留空时保留已存凭据</span>
-                  </label>
-                ) : null}
-              </div>
-
-              {requiresPassword ? (
-                <label className="field-block">
-                  <span>SSH 密码</span>
-                  <input
-                    onChange={(event) => setDraft({ ...draft, password: event.target.value })}
-                    placeholder={
-                      isCreating
-                        ? "远程账户密码"
-                        : draft.has_saved_secret
-                          ? "留空则保留已保存的 SSH 密码"
-                          : "请输入远程账户密码"
-                    }
-                    type="password"
-                    value={draft.password}
-                  />
-                </label>
-              ) : null}
-
-              {requiresKey ? (
-                <>
-                  <label className="field-block">
-                    <span>私钥文件</span>
-                    <div className="target-row">
-                      <input
-                        placeholder={
-                          isCreating
-                            ? "选择本地私钥文件"
-                            : "留空则保留已保存的私钥文件路径"
-                        }
-                        readOnly
-                        value={draft.private_key_path}
-                      />
-                      <div className="inline-actions">
-                        <button
-                          className="secondary-button"
-                          onClick={() => void handlePickPrivateKeyFile()}
-                          type="button"
-                        >
-                          选择文件
-                        </button>
-                        <button
-                          className="ghost-button"
-                          disabled={!draft.private_key_path}
-                          onClick={() => setDraft({ ...draft, private_key_path: "" })}
-                          type="button"
-                        >
-                          清空
+                  <div className="form-grid">
+                    <label className="field-span-full">
+                      <span>SSH 目标</span>
+                      <div className="target-row">
+                        <div className="input-with-icon">
+                          <Terminal size={14} />
+                          <input
+                            onChange={(event) => setTargetInput(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") {
+                                event.preventDefault();
+                                applyTargetInput();
+                              }
+                            }}
+                            placeholder="ssh://root@10.0.0.10:22"
+                            value={targetInput}
+                          />
+                        </div>
+                        <button className="secondary-button" onClick={applyTargetInput} type="button">
+                          <Zap size={14} />
+                          解析
                         </button>
                       </div>
+                    </label>
+                    <label className="field-span-6">
+                      <span>连接 ID</span>
+                      <input
+                        disabled={!isCreating}
+                        onChange={(event) => setDraft({ ...draft, instance_id: event.target.value })}
+                        placeholder="prod-server"
+                        value={draft.instance_id}
+                      />
+                    </label>
+                    <label className="field-span-6">
+                      <span>显示名称</span>
+                      <input
+                        onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+                        placeholder="生产服务器"
+                        value={draft.name}
+                      />
+                    </label>
+                    <label className="field-span-6">
+                      <span>主机</span>
+                      <input
+                        onChange={(event) => setDraft({ ...draft, host: event.target.value })}
+                        placeholder="10.0.0.10"
+                        value={draft.host}
+                      />
+                    </label>
+                    <label className="field-span-2">
+                      <span>端口</span>
+                      <input
+                        min={1}
+                        onChange={(event) =>
+                          setDraft({
+                            ...draft,
+                            port: Number.parseInt(event.target.value, 10) || 22,
+                          })
+                        }
+                        type="number"
+                        value={draft.port}
+                      />
+                    </label>
+                    <label className="field-span-4">
+                      <span>用户名</span>
+                      <input
+                        onChange={(event) => setDraft({ ...draft, username: event.target.value })}
+                        placeholder="root"
+                        value={draft.username}
+                      />
+                    </label>
+                  </div>
+                </section>
+
+                <section className="form-section">
+                  <div className="form-section-heading">
+                    <span className="section-icon"><LockKeyhole size={16} /></span>
+                    <div>
+                      <h3>认证与安全</h3>
+                      <p>凭据仅保存在操作系统 Keychain 中。</p>
                     </div>
-                  </label>
-                  <label className="field-block">
-                    <span>直接粘贴私钥内容</span>
-                    <textarea
-                      onChange={(event) => setDraft({ ...draft, private_key: event.target.value })}
-                      placeholder={
-                        isCreating
-                          ? "粘贴 OpenSSH 私钥内容"
-                          : "留空则保留已保存的私钥"
-                      }
-                      rows={4}
-                      value={draft.private_key}
-                    />
-                  </label>
-                  {hasPrivateKeyConflict ? (
-                    <div className="inline-error">私钥内容和私钥文件路径不能同时填写，请保留其中一种。</div>
+                  </div>
+
+                  <div className="auth-mode-field">
+                    <span>认证方式</span>
+                    <div className="segmented-control" role="radiogroup" aria-label="认证方式">
+                      <button
+                        aria-checked={draft.auth_kind === "password"}
+                        className={draft.auth_kind === "password" ? "active" : ""}
+                        onClick={() => setDraft({ ...draft, auth_kind: "password" })}
+                        role="radio"
+                        type="button"
+                      >
+                        <KeyRound size={14} />
+                        密码
+                      </button>
+                      <button
+                        aria-checked={draft.auth_kind === "private_key"}
+                        className={draft.auth_kind === "private_key" ? "active" : ""}
+                        onClick={() => setDraft({ ...draft, auth_kind: "private_key" })}
+                        role="radio"
+                        type="button"
+                      >
+                        <FileKey2 size={14} />
+                        私钥
+                      </button>
+                    </div>
+                  </div>
+
+                  {requiresPassword ? (
+                    <label className="field-block">
+                      <span>SSH 密码</span>
+                      <div className="input-with-icon">
+                        <KeyRound size={14} />
+                        <input
+                          autoComplete="new-password"
+                          onChange={(event) => setDraft({ ...draft, password: event.target.value })}
+                          placeholder={
+                            isCreating
+                              ? "输入远程账户密码"
+                              : draft.has_saved_secret
+                                ? "留空则保留已保存的密码"
+                                : "输入远程账户密码"
+                          }
+                          type="password"
+                          value={draft.password}
+                        />
+                      </div>
+                    </label>
                   ) : null}
-                  <label className="field-block">
-                    <span>私钥口令</span>
-                    <input
-                      onChange={(event) => setDraft({ ...draft, passphrase: event.target.value })}
-                      placeholder="可选口令"
-                      type="password"
-                      value={draft.passphrase}
-                    />
-                  </label>
-                </>
-              ) : null}
 
-              <label className="field-block">
-                <span>备注</span>
-                <textarea
-                  onChange={(event) => setDraft({ ...draft, notes: event.target.value })}
-                  placeholder="可选备注、标签或使用说明"
-                  rows={2}
-                  value={draft.notes}
-                />
-              </label>
-
-              <div className="action-row">
-                <button className="primary-button" disabled={saving} onClick={handleSave} type="button">
-                  {saving ? "保存中..." : "保存连接"}
-                </button>
-                <button className="secondary-button" disabled={testing} onClick={handleTest} type="button">
-                  {testing ? "测试中..." : "测试连接"}
-                </button>
-                {!isCreating ? (
-                  <button className="danger-button" onClick={handleDelete} type="button">
-                    删除
-                  </button>
-                ) : null}
-              </div>
-            </div>
-          ) : (
-            <div className="tab-content log-viewer">
-              <div className="log-toolbar">
-                <span className="log-summary">
-                  {logs.length > 0
-                    ? `共 ${logs.length} 条操作记录`
-                    : loadingLogs
-                      ? "加载中..."
-                      : "暂无操作记录"}
-                </span>
-                <div className="log-toolbar-actions">
-                  <label className="toggle-switch" title={autoRefresh ? "暂停自动刷新" : "恢复自动刷新"}>
-                    <input
-                      type="checkbox"
-                      checked={autoRefresh}
-                      onChange={() => setAutoRefresh((v) => !v)}
-                    />
-                    <span className="toggle-slider" />
-                    <span className="toggle-label">自动</span>
-                  </label>
-                  <button
-                    className="ghost-button icon-button"
-                    disabled={loadingLogs}
-                    onClick={() => void loadLogs()}
-                    title="手动刷新"
-                    type="button"
-                  >
-                    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M1 8a7 7 0 0 1 13.2-3.2M15 8a7 7 0 0 1-13.2 3.2" />
-                      <path d="M14 2v4h-4M2 14v-4h4" />
-                    </svg>
-                  </button>
-                  <button
-                    className={`ghost-button icon-button${expandedStdout === 10 ? " active" : ""}`}
-                    onClick={() => setExpandedStdout((v) => (v === 10 ? 0 : 10))}
-                    title={expandedStdout === 10 ? "折叠 stdout" : "展开最近 10 条 stdout"}
-                    type="button"
-                  >
-                    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M4 6h8M8 2v8" />
-                    </svg>
-                    <span className="icon-badge">10</span>
-                  </button>
-                  <button
-                    className={`ghost-button icon-button${expandedStdout === 20 ? " active" : ""}`}
-                    onClick={() => setExpandedStdout((v) => (v === 20 ? 0 : 20))}
-                    title={expandedStdout === 20 ? "折叠 stdout" : "展开最近 20 条 stdout"}
-                    type="button"
-                  >
-                    <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M4 6h8M8 2v8" />
-                    </svg>
-                    <span className="icon-badge">20</span>
-                  </button>
-                </div>
-              </div>
-
-              <div className="log-list" ref={logListRef}>
-                {logs.map((entry, index) => {
-                  const prev = index > 0 ? logs[index - 1] : null;
-                  const sessionChange = !prev
-                    || prev.client_session_id !== entry.client_session_id
-                    || prev.session_id !== entry.session_id;
-                  const shouldOpen = expandedStdout > 0
-                    && entry.operation === "execute_command"
-                    && index >= latestNExecIndex(logs, expandedStdout)
-                    && entry.operation === "execute_command";
-
-                  return (
-                    <div key={entry.id}>
-                      {sessionChange ? (
-                        <div className="log-separator">
-                          <span className="log-separator-label">
-                            {formatLogSeparator(entry)}
-                          </span>
+                  {requiresKey ? (
+                    <div className="key-fields">
+                      <label className="field-block">
+                        <span>私钥文件</span>
+                        <div className="target-row">
+                          <div className="input-with-icon">
+                            <FileKey2 size={14} />
+                            <input
+                              placeholder={isCreating ? "选择本地私钥文件" : "留空则保留已保存的路径"}
+                              readOnly
+                              value={draft.private_key_path}
+                            />
+                          </div>
+                          <div className="inline-actions">
+                            <button
+                              className="secondary-button"
+                              onClick={() => void handlePickPrivateKeyFile()}
+                              type="button"
+                            >
+                              <FolderOpen size={14} />
+                              选择文件
+                            </button>
+                            {draft.private_key_path ? (
+                              <button
+                                aria-label="清除私钥文件"
+                                className="icon-button ghost-button"
+                                onClick={() => setDraft({ ...draft, private_key_path: "" })}
+                                title="清除私钥文件"
+                                type="button"
+                              >
+                                <X size={14} />
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+                      </label>
+                      <div className="field-divider"><span>或者</span></div>
+                      <label className="field-block">
+                        <span>直接粘贴私钥内容</span>
+                        <textarea
+                          onChange={(event) => setDraft({ ...draft, private_key: event.target.value })}
+                          placeholder={isCreating ? "粘贴 OpenSSH 私钥内容" : "留空则保留已保存的私钥"}
+                          rows={3}
+                          value={draft.private_key}
+                        />
+                      </label>
+                      {hasPrivateKeyConflict ? (
+                        <div className="inline-error" role="alert">
+                          <AlertTriangle size={14} />
+                          私钥内容和私钥文件不能同时使用，请保留其中一种。
                         </div>
                       ) : null}
-                      <div className="log-entry">
-                        <div className="log-entry-meta">
-                          <span className="log-time">{formatLogTime(entry.created_at)}</span>
-                          <span className="log-client-badge" title={entry.client_session_id || "client session"}>
-                            {formatClientLabel(entry)}
-                          </span>
-                          {entry.session_id ? (
-                            <span className="log-session-badge" title={entry.session_id}>
-                              ssh:{shortId(entry.session_id)}
+                      <label className="field-block compact-field">
+                        <span>私钥口令</span>
+                        <input
+                          autoComplete="new-password"
+                          onChange={(event) => setDraft({ ...draft, passphrase: event.target.value })}
+                          placeholder="可选"
+                          type="password"
+                          value={draft.passphrase}
+                        />
+                      </label>
+                    </div>
+                  ) : null}
+
+                  <div className="security-options">
+                    <label className="checkbox-row">
+                      <input
+                        checked={draft.host_key_check}
+                        onChange={(event) => setDraft({ ...draft, host_key_check: event.target.checked })}
+                        type="checkbox"
+                      />
+                      <span className="checkbox-indicator"><Check size={12} /></span>
+                      <span>
+                        <strong>校验主机指纹</strong>
+                        <small>要求远程主机存在于 known_hosts。</small>
+                      </span>
+                    </label>
+                    {!isCreating && draft.has_saved_secret ? (
+                      <label className="checkbox-row">
+                        <input
+                          checked={draft.keep_existing_secret}
+                          onChange={(event) => setDraft({ ...draft, keep_existing_secret: event.target.checked })}
+                          type="checkbox"
+                        />
+                        <span className="checkbox-indicator"><Check size={12} /></span>
+                        <span>
+                          <strong>保留已保存凭据</strong>
+                          <small>凭据字段留空时继续使用 Keychain 中的值。</small>
+                        </span>
+                      </label>
+                    ) : null}
+                  </div>
+                </section>
+
+                <section className="form-section notes-section">
+                  <label className="field-block">
+                    <span>备注</span>
+                    <textarea
+                      onChange={(event) => setDraft({ ...draft, notes: event.target.value })}
+                      placeholder="可选：环境、用途或维护说明"
+                      rows={2}
+                      value={draft.notes}
+                    />
+                  </label>
+                </section>
+
+                <div className="form-action-bar">
+                  <div className="form-action-primary">
+                    <button className="primary-button" disabled={saving || !canSubmit} type="submit">
+                      {saving ? <LoaderCircle className="spin-icon" size={15} /> : <Save size={15} />}
+                      {saving ? "保存中" : "保存连接"}
+                    </button>
+                    <button
+                      className="secondary-button"
+                      disabled={testing || !canSubmit}
+                      onClick={() => void handleTest()}
+                      type="button"
+                    >
+                      {testing ? <LoaderCircle className="spin-icon" size={15} /> : <Zap size={15} />}
+                      {testing ? "测试中" : "测试连接"}
+                    </button>
+                  </div>
+                  {!isCreating ? (
+                    <button
+                      className="danger-button"
+                      onClick={() => setShowDeleteDialog(true)}
+                      type="button"
+                    >
+                      <Trash2 size={14} />
+                      删除连接
+                    </button>
+                  ) : null}
+                </div>
+              </form>
+            ) : (
+              <div className="tab-content log-viewer">
+                <div className="log-toolbar">
+                  <span className="log-summary">
+                    {logs.length > 0
+                      ? `${logs.length} 条操作记录`
+                      : loadingLogs
+                        ? "正在加载日志"
+                        : "暂无操作记录"}
+                  </span>
+                  <div className="log-toolbar-actions">
+                    <label className="toggle-switch" title={autoRefresh ? "暂停自动刷新" : "恢复自动刷新"}>
+                      <input
+                        type="checkbox"
+                        checked={autoRefresh}
+                        onChange={() => setAutoRefresh((value) => !value)}
+                      />
+                      <span className="toggle-slider" />
+                      <span className="toggle-label">自动刷新</span>
+                    </label>
+                    <button
+                      aria-label="刷新日志"
+                      className="ghost-button icon-button"
+                      disabled={loadingLogs}
+                      onClick={() => void loadLogs()}
+                      title="刷新日志"
+                      type="button"
+                    >
+                      <RefreshCw className={loadingLogs ? "spin-icon" : ""} size={14} />
+                    </button>
+                    <div className="stdout-control" aria-label="展开最近 stdout">
+                      <ListTree size={13} />
+                      <span>输出</span>
+                      {[10, 20].map((count) => (
+                        <button
+                          key={count}
+                          className={expandedStdout === count ? "active" : ""}
+                          onClick={() => setExpandedStdout((value) => (value === count ? 0 : count as 10 | 20))}
+                          title={expandedStdout === count ? "折叠 stdout" : `展开最近 ${count} 条 stdout`}
+                          type="button"
+                        >
+                          {count}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="log-list" ref={logListRef}>
+                  {logs.length === 0 && !loadingLogs ? (
+                    <div className="log-empty-state">
+                      <Activity size={20} />
+                      <span>SSH 操作会实时显示在这里</span>
+                    </div>
+                  ) : null}
+                  {logs.map((entry, index) => {
+                    const prev = index > 0 ? logs[index - 1] : null;
+                    const sessionChange = !prev
+                      || prev.client_session_id !== entry.client_session_id
+                      || prev.session_id !== entry.session_id;
+                    const shouldOpen = expandedStdout > 0
+                      && entry.operation === "execute_command"
+                      && index >= latestNExecIndex(logs, expandedStdout);
+
+                    return (
+                      <div key={entry.id}>
+                        {sessionChange ? (
+                          <div className="log-separator">
+                            <span className="log-separator-label">{formatLogSeparator(entry)}</span>
+                          </div>
+                        ) : null}
+                        <div className="log-entry">
+                          <div className="log-entry-meta">
+                            <span className="log-time">{formatLogTime(entry.created_at)}</span>
+                            <span className="log-client-badge" title={entry.client_session_id || "client session"}>
+                              {formatClientLabel(entry)}
                             </span>
-                          ) : null}
-                          <span className={`log-op-badge log-op-${entry.operation}`}>
-                            {entry.operation}
-                          </span>
-                        </div>
-                        <div className="log-entry-body">
-                          <LogEntryBody entry={entry} autoOpenStdout={shouldOpen} />
+                            {entry.session_id ? (
+                              <span className="log-session-badge" title={entry.session_id}>
+                                ssh:{shortId(entry.session_id)}
+                              </span>
+                            ) : null}
+                            <span className={`log-op-badge log-op-${entry.operation}`}>{entry.operation}</span>
+                          </div>
+                          <div className="log-entry-body">
+                            <LogEntryBody entry={entry} autoOpenStdout={shouldOpen} />
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  );
-                })}
+                    );
+                  })}
+                </div>
               </div>
-            </div>
-          )}
-        </section>
+            )}
+          </section>
         )}
       </main>
 
@@ -974,18 +1141,23 @@ export default function App() {
             onClick={(event) => event.stopPropagation()}
           >
             <div className="dialog-header">
-              <div>
+              <div className="dialog-title-group">
+                <span className="dialog-icon"><Terminal size={17} /></span>
+                <div>
                 <h2>MCP 配置</h2>
                 <p className="dialog-subtitle">
                   {configs ? `命令：${configs.command}` : "正在加载 MCP 配置..."}
                 </p>
+                </div>
               </div>
               <button
-                className="ghost-button utility-button"
+                aria-label="关闭 MCP 配置"
+                className="ghost-button icon-button"
                 onClick={() => setShowConfigDialog(false)}
+                title="关闭"
                 type="button"
               >
-                关闭
+                <X size={16} />
               </button>
             </div>
 
@@ -997,11 +1169,12 @@ export default function App() {
                     <p>{configs?.command ?? "正在加载..."}</p>
                   </div>
                   <button
-                    className="ghost-button utility-button"
+                    className="ghost-button"
                     disabled={!configs || !configs.helper_found}
                     onClick={() => configs && configs.helper_found && copyConfig("STDIO", configs.stdio_json)}
                     type="button"
                   >
+                    <Clipboard size={14} />
                     复制 JSON
                   </button>
                 </div>
@@ -1016,6 +1189,33 @@ export default function App() {
           </section>
         </div>
       ) : null}
+
+      {showDeleteDialog && selectedId ? (
+        <div className="dialog-backdrop" onClick={() => setShowDeleteDialog(false)} role="presentation">
+          <section
+            aria-label="删除连接"
+            aria-modal="true"
+            className="confirm-dialog"
+            onClick={(event) => event.stopPropagation()}
+            role="dialog"
+          >
+            <span className="confirm-icon danger"><Trash2 size={20} /></span>
+            <div className="confirm-copy">
+              <h2>删除“{draft.name || selectedId}”？</h2>
+              <p>连接配置与 Keychain 中的凭据将被移除，正在使用此连接的 SSH 会话也会关闭。</p>
+            </div>
+            <div className="confirm-actions">
+              <button className="secondary-button" onClick={() => setShowDeleteDialog(false)} type="button">
+                取消
+              </button>
+              <button className="danger-button solid" onClick={() => void handleDelete()} type="button">
+                <Trash2 size={14} />
+                删除连接
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1026,7 +1226,6 @@ function SettingsPanel({
   restartingMcp,
   restartResult,
   onToggleSystemApproval,
-  onTogglePreferCodexApproval,
   onRestartMcp,
   onClose,
   onDragMouseDown,
@@ -1036,113 +1235,141 @@ function SettingsPanel({
   restartingMcp: boolean;
   restartResult: { kind: "success" | "error"; message: string } | null;
   onToggleSystemApproval: (useSystem: boolean) => void;
-  onTogglePreferCodexApproval: (preferClientApproval: boolean) => void;
   onRestartMcp: () => Promise<void>;
   onClose: () => void;
   onDragMouseDown: (event: React.MouseEvent<HTMLElement>) => void;
 }) {
+  const [activeSection, setActiveSection] = useState<"approval" | "mcp">("approval");
+
   function restartButtonContent() {
     if (restartingMcp) {
       return (
         <>
-          <span className="spinner" />
-          重启中...
+          <LoaderCircle className="spin-icon" size={14} />
+          重启中
         </>
       );
     }
     if (restartResult) {
       return (
         <>
-          <span className={restartResult.kind === "success" ? "feedback-icon success" : "feedback-icon error"}>
-            {restartResult.kind === "success" ? "✓" : "✗"}
-          </span>
+          {restartResult.kind === "success" ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
           {restartResult.kind === "success" ? "已重启" : "失败"}
         </>
       );
     }
-    return "重启服务器";
+    return (
+      <>
+        <RotateCcw size={14} />
+        重启服务器
+      </>
+    );
   }
 
   return (
     <section className="panel-main">
       <div className="panel-header" onMouseDown={onDragMouseDown}>
-        <div>
+        <div className="panel-title-group">
+          <span className="panel-eyebrow">偏好设置</span>
           <h2>软件设置</h2>
+          <p>管理审批体验与本地 MCP 服务。</p>
         </div>
-        <div className="header-actions">
-          <button className="ghost-button utility-button" onClick={onClose} type="button">
-            返回
-          </button>
-        </div>
+        <button className="secondary-button" onClick={onClose} type="button">
+          <ArrowLeft size={14} />
+          返回连接
+        </button>
       </div>
 
-      <div className="settings-shell">
-        <div className="settings-section">
-          <h3 className="settings-section-title">审批</h3>
-          <p className="settings-section-desc">配置 SSH 操作执行时的审批行为。</p>
+      <div className="settings-layout">
+        <nav className="settings-nav" aria-label="设置分类">
+          <button
+            aria-current={activeSection === "approval" ? "page" : undefined}
+            className={activeSection === "approval" ? "active" : ""}
+            onClick={() => setActiveSection("approval")}
+            type="button"
+          >
+            <ShieldCheck size={16} />
+            <span>
+              <strong>审批与安全</strong>
+              <small>操作确认方式</small>
+            </span>
+          </button>
+          <button
+            aria-current={activeSection === "mcp" ? "page" : undefined}
+            className={activeSection === "mcp" ? "active" : ""}
+            onClick={() => setActiveSection("mcp")}
+            type="button"
+          >
+            <Terminal size={16} />
+            <span>
+              <strong>MCP 服务</strong>
+              <small>进程与连接</small>
+            </span>
+          </button>
+        </nav>
 
-          <div className="settings-item">
-            <div className="settings-item-info">
-              <strong>使用系统弹窗进行审核</strong>
-              <p>开启后使用系统原生对话框；关闭后使用独立审批窗口。</p>
-            </div>
-            <label className="toggle-switch settings-toggle">
-              <input
-                type="checkbox"
-                checked={appSettings?.use_system_approval ?? false}
-                disabled={saving}
-                onChange={(e) => onToggleSystemApproval(e.target.checked)}
-              />
-              <span className="toggle-slider" />
-              <span className="toggle-label">{appSettings?.use_system_approval ? "开启" : "关闭"}</span>
-            </label>
-          </div>
+        <div className="settings-content">
+          {activeSection === "approval" ? (
+            <section className="settings-section">
+              <div className="settings-section-heading">
+                <span className="section-icon"><ShieldCheck size={17} /></span>
+                <div>
+                  <h3>审批与安全</h3>
+                  <p>决定敏感 SSH 操作由哪个本地界面确认。</p>
+                </div>
+              </div>
+              <div className="settings-row">
+                <div className="settings-item-info">
+                  <strong>使用系统弹窗审批</strong>
+                  <p>开启后使用操作系统原生对话框；关闭后使用独立审批窗口。</p>
+                  <span className="settings-current-value">
+                    当前：{appSettings?.use_system_approval ? "系统原生对话框" : "Xiic 独立审批窗口"}
+                  </span>
+                </div>
+                <label className="toggle-switch settings-toggle">
+                  <input
+                    type="checkbox"
+                    checked={appSettings?.use_system_approval ?? false}
+                    disabled={saving || !appSettings}
+                    onChange={(event) => onToggleSystemApproval(event.target.checked)}
+                  />
+                  <span className="toggle-slider" />
+                  <span className="toggle-label">{appSettings?.use_system_approval ? "开启" : "关闭"}</span>
+                </label>
+              </div>
+            </section>
+          ) : (
+            <section className="settings-section">
+              <div className="settings-section-heading">
+                <span className="section-icon"><Terminal size={17} /></span>
+                <div>
+                  <h3>MCP 服务</h3>
+                  <p>处理后台进程异常或客户端无法重连的情况。</p>
+                </div>
+              </div>
+              <div className="settings-row danger-zone">
+                <div className="settings-item-info">
+                  <strong>重启 MCP 服务器</strong>
+                  <p>结束当前进程并清理残留文件。IDE 通常会在数秒后自动重连，正在执行的操作会中断。</p>
+                </div>
+                <button
+                  className={"danger-button" + (restartResult?.kind === "success" ? " feedback-success" : "") + (restartResult?.kind === "error" ? " feedback-error" : "")}
+                  disabled={restartingMcp}
+                  onClick={() => void onRestartMcp()}
+                  type="button"
+                >
+                  {restartButtonContent()}
+                </button>
+              </div>
 
-          <div className="settings-item">
-            <div className="settings-item-info">
-              <strong>Codex 优先使用客户端审批</strong>
-              <p>开启后，Codex 中优先使用 Codex 的审批卡片，不再弹出 xiic-ssh 的本地二次审批。仅对 Codex 生效，修改后请重启 MCP 服务器。</p>
-            </div>
-            <label className="toggle-switch settings-toggle">
-              <input
-                type="checkbox"
-                checked={appSettings?.prefer_client_approval_for_codex ?? false}
-                disabled={saving}
-                onChange={(e) => onTogglePreferCodexApproval(e.target.checked)}
-              />
-              <span className="toggle-slider" />
-              <span className="toggle-label">
-                {appSettings?.prefer_client_approval_for_codex ? "开启" : "关闭"}
-              </span>
-            </label>
-          </div>
-        </div>
-
-        <div className="settings-section">
-          <h3 className="settings-section-title">MCP 服务器</h3>
-          <p className="settings-section-desc">管理 MCP 后台进程。如果服务器意外退出导致工具调用超时，可尝试重启。</p>
-
-          <div className="settings-item">
-            <div className="settings-item-info">
-              <strong>重启 MCP 服务器</strong>
-              <p>结束当前 MCP 进程并清理残留文件，IDE 将在几秒后自动重连。正在进行的操作将被中断。</p>
-            </div>
-            <button
-              className={"danger-button" + (restartResult?.kind === "success" ? " feedback-success" : "") + (restartResult?.kind === "error" ? " feedback-error" : "")}
-              disabled={restartingMcp}
-              onClick={onRestartMcp}
-              style={{ flexShrink: 0, display: "inline-flex", alignItems: "center", gap: "6px" }}
-              type="button"
-            >
-              {restartButtonContent()}
-            </button>
-          </div>
-
-          {restartResult ? (
-            <div className={"settings-feedback " + restartResult.kind}>
-              {restartResult.message}
-            </div>
-          ) : null}
+              {restartResult ? (
+                <div className={"settings-feedback " + restartResult.kind} role="status">
+                  {restartResult.kind === "success" ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
+                  {restartResult.message}
+                </div>
+              ) : null}
+            </section>
+          )}
         </div>
       </div>
     </section>

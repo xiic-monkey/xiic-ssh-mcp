@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::app_core::DesktopCore;
-use crate::approval::LocalApprovalClient;
+use crate::approval::{LocalApprovalClient, approval_message};
 use crate::mcp_protocol::{IncomingMessage, MessageFraming, read_message, write_message};
 use crate::models::{
     ApprovalMode, ApprovalOperationMetadata, CloseSessionArgs, CreateSessionResult,
@@ -17,7 +17,6 @@ use crate::models::{
     RuleDecision, SudoCommandArgs, ToolCall, UploadFileArgs, UploadFileResult, UploadLocalFileArgs,
     UploadLocalFileResult, WhitelistMode,
 };
-use crate::settings::AppSettings;
 use crate::whitelist::WhitelistChecker;
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -170,9 +169,10 @@ impl McpServer {
                     id.clone(),
                 ) {
                     Ok(result) => result,
-                    Err(err) => {
-                        DispatchResult::Respond(success_response(id, tool_error(err.to_string())))
-                    }
+                    Err(err) => DispatchResult::Respond(success_response(
+                        id,
+                        tool_error(format!("{err:#}")),
+                    )),
                 }
             }
             _ => DispatchResult::Respond(error_response(
@@ -451,7 +451,7 @@ impl McpServer {
                 Ok(DispatchResult::Respond(error_response(id, -32001, reason)))
             }
             RuleDecision::NeedsApproval => {
-                let flow = match self.approval_flow_for(&request_context, &ctx) {
+                let flow = match self.approval_flow_for(&ctx) {
                     Ok(flow) => flow,
                     Err(err) => {
                         return Ok(DispatchResult::Respond(error_response(
@@ -475,34 +475,10 @@ impl McpServer {
         }
     }
 
-    fn approval_flow_for(
-        &self,
-        request_context: &RequestContext,
-        ctx: &OperationContext,
-    ) -> Result<ApprovalFlow> {
-        let settings = crate::settings::load_settings();
-        self.approval_flow_for_settings(request_context, ctx, &settings)
-    }
-
-    fn approval_flow_for_settings(
-        &self,
-        request_context: &RequestContext,
-        ctx: &OperationContext,
-        settings: &AppSettings,
-    ) -> Result<ApprovalFlow> {
+    fn approval_flow_for(&self, ctx: &OperationContext) -> Result<ApprovalFlow> {
         match self.approval_mode {
             ApprovalMode::Local => Ok(ApprovalFlow::Local),
-            ApprovalMode::Auto => {
-                if should_prefer_client_approval(
-                    settings,
-                    request_context,
-                    self.client_supports_elicitation,
-                ) {
-                    Ok(self.build_elicitation_flow(ctx))
-                } else {
-                    Ok(ApprovalFlow::Local)
-                }
-            }
+            ApprovalMode::Auto => Ok(ApprovalFlow::Local),
             ApprovalMode::Elicitation => {
                 if self.client_supports_elicitation {
                     Ok(self.build_elicitation_flow(ctx))
@@ -517,17 +493,13 @@ impl McpServer {
 
     fn build_elicitation_flow(&self, ctx: &OperationContext) -> ApprovalFlow {
         let request_id = Value::String(Uuid::new_v4().to_string());
+        let metadata = ApprovalOperationMetadata::from(ctx);
         let request = json!({
             "jsonrpc": "2.0",
             "id": request_id,
             "method": "elicitation/create",
             "params": {
-                "message": format!(
-                    "是否允许 SSH 操作 '{}'？连接：{}。命令：{}",
-                    ctx.tool_name,
-                    ctx.instance_id.as_deref().unwrap_or("-"),
-                    ctx.command.as_deref().unwrap_or("-")
-                ),
+                "message": approval_message(&metadata),
                 "requestedSchema": {
                     "type": "object",
                     "properties": {
@@ -622,6 +594,7 @@ impl McpServer {
                 remote_path: None,
                 local_path: None,
                 instance_id: None,
+                overwrite: None,
             }),
             "create_session" => {
                 #[derive(Deserialize)]
@@ -635,6 +608,7 @@ impl McpServer {
                     remote_path: None,
                     local_path: None,
                     instance_id: Some(args.instance_id),
+                    overwrite: None,
                 })
             }
             "execute_command" => {
@@ -646,6 +620,7 @@ impl McpServer {
                     remote_path: None,
                     local_path: None,
                     instance_id: Some(instance_id),
+                    overwrite: None,
                 })
             }
             "upload_file" => {
@@ -657,6 +632,7 @@ impl McpServer {
                     remote_path: Some(args.remote_path),
                     local_path: Some(args.local_path),
                     instance_id: Some(instance_id),
+                    overwrite: Some(args.overwrite),
                 })
             }
             "download_file" => {
@@ -668,6 +644,7 @@ impl McpServer {
                     remote_path: Some(args.remote_path),
                     local_path: args.local_path,
                     instance_id: Some(instance_id),
+                    overwrite: Some(true),
                 })
             }
             "upload_local_file" => {
@@ -679,6 +656,7 @@ impl McpServer {
                     remote_path: Some(args.remote_path),
                     local_path: Some(args.local_path),
                     instance_id: Some(instance_id),
+                    overwrite: Some(args.overwrite),
                 })
             }
             "download_to_local" => {
@@ -690,6 +668,7 @@ impl McpServer {
                     remote_path: Some(args.remote_path),
                     local_path: Some(args.local_path),
                     instance_id: Some(instance_id),
+                    overwrite: Some(args.overwrite),
                 })
             }
             "close_session" => {
@@ -701,6 +680,7 @@ impl McpServer {
                     remote_path: None,
                     local_path: None,
                     instance_id: Some(instance_id),
+                    overwrite: None,
                 })
             }
             "sudo" => {
@@ -712,6 +692,7 @@ impl McpServer {
                     remote_path: None,
                     local_path: None,
                     instance_id: Some(instance_id),
+                    overwrite: None,
                 })
             }
             _ => bail!("unknown tool '{}'", tool_call.name),
@@ -796,25 +777,11 @@ fn has_elicitation_capability(capabilities: Option<&Value>) -> bool {
         .is_some()
 }
 
-fn is_trusted_codex_client(request_context: &RequestContext) -> bool {
-    request_context.client_id == "codex"
-}
-
 fn canonical_client_id(client_id: &str) -> String {
     match client_id {
         "codex" | "codex-mcp-client" => "codex".to_string(),
         other => other.to_string(),
     }
-}
-
-fn should_prefer_client_approval(
-    settings: &AppSettings,
-    request_context: &RequestContext,
-    client_supports_elicitation: bool,
-) -> bool {
-    settings.prefer_client_approval_for_codex
-        && is_trusted_codex_client(request_context)
-        && client_supports_elicitation
 }
 
 fn success_response(id: Value, result: Value) -> Value {
@@ -892,12 +859,11 @@ fn _type_assertions(
 #[cfg(test)]
 mod tests {
     use std::io::{BufReader, Cursor};
-    use std::path::PathBuf;
     use std::sync::Arc;
 
     use serde_json::json;
 
-    use crate::app_core::{DEFAULT_KEYRING_SERVICE, DesktopCore};
+    use crate::app_core::DesktopCore;
     use crate::models::{ApprovalMode, RequestContext, WhitelistMode};
 
     use super::{
@@ -1046,57 +1012,35 @@ mod tests {
     fn forced_elicitation_requires_client_capability() {
         let server = test_server_with_mode(ApprovalMode::Elicitation);
         let err = server
-            .approval_flow_for(
-                &test_context(),
-                &crate::models::OperationContext {
-                    tool_name: "execute_command".to_string(),
-                    command: Some("uname -a".to_string()),
-                    remote_path: None,
-                    local_path: None,
-                    instance_id: Some("dev-server".to_string()),
-                },
-            )
+            .approval_flow_for(&crate::models::OperationContext {
+                tool_name: "execute_command".to_string(),
+                command: Some("uname -a".to_string()),
+                remote_path: None,
+                local_path: None,
+                instance_id: Some("dev-server".to_string()),
+                overwrite: None,
+            })
             .unwrap_err();
 
         assert!(err.to_string().contains("elicitation"));
     }
 
     #[test]
-    fn codex_prefers_elicitation_when_enabled_and_capable() {
-        let server = initialized_test_server_with_capability(ApprovalMode::Auto);
-        let settings = crate::settings::AppSettings {
-            use_system_approval: true,
-            prefer_client_approval_for_codex: true,
-        };
-        let flow = server
-            .approval_flow_for_settings(&codex_context(), &test_operation_context(), &settings)
-            .expect("approval flow should resolve");
-
-        assert!(matches!(flow, ApprovalFlow::Elicitation { .. }));
-    }
-
-    #[test]
-    fn initialize_client_info_enables_codex_approval_routing() {
+    fn auto_mode_always_uses_local_approval() {
         let server = initialized_codex_server_with_capability(ApprovalMode::Auto);
-        let settings = crate::settings::AppSettings {
-            use_system_approval: true,
-            prefer_client_approval_for_codex: true,
-        };
-        let context = server.effective_request_context(test_context());
         let flow = server
-            .approval_flow_for_settings(&context, &test_operation_context(), &settings)
+            .approval_flow_for(&test_operation_context())
             .expect("approval flow should resolve");
 
-        assert_eq!(context.client_id, "codex");
-        assert!(matches!(flow, ApprovalFlow::Elicitation { .. }));
+        assert!(matches!(flow, ApprovalFlow::Local));
     }
 
     #[test]
     fn elicitation_request_uses_standard_confirmation_schema() {
-        let server = test_server_with_mode(ApprovalMode::Auto);
+        let server = test_server_with_mode(ApprovalMode::Elicitation);
         let flow = server.build_elicitation_flow(&test_operation_context());
         let ApprovalFlow::Elicitation { request, .. } = flow else {
-            panic!("auto approval should build elicitation flow");
+            panic!("elicitation mode should build elicitation flow");
         };
 
         assert_eq!(request["method"], "elicitation/create");
@@ -1109,48 +1053,6 @@ mod tests {
             request["params"]["requestedSchema"]["required"][0],
             "approved"
         );
-    }
-
-    #[test]
-    fn codex_falls_back_to_local_without_elicitation_capability() {
-        let server = test_server_with_mode(ApprovalMode::Auto);
-        let settings = crate::settings::AppSettings {
-            use_system_approval: true,
-            prefer_client_approval_for_codex: true,
-        };
-        let flow = server
-            .approval_flow_for_settings(&codex_context(), &test_operation_context(), &settings)
-            .expect("approval flow should resolve");
-
-        assert!(matches!(flow, ApprovalFlow::Local));
-    }
-
-    #[test]
-    fn codex_uses_local_when_setting_disabled() {
-        let server = initialized_test_server_with_capability(ApprovalMode::Auto);
-        let settings = crate::settings::AppSettings {
-            use_system_approval: true,
-            prefer_client_approval_for_codex: false,
-        };
-        let flow = server
-            .approval_flow_for_settings(&codex_context(), &test_operation_context(), &settings)
-            .expect("approval flow should resolve");
-
-        assert!(matches!(flow, ApprovalFlow::Local));
-    }
-
-    #[test]
-    fn non_codex_clients_stay_local_in_auto_mode() {
-        let server = initialized_test_server_with_capability(ApprovalMode::Auto);
-        let settings = crate::settings::AppSettings {
-            use_system_approval: true,
-            prefer_client_approval_for_codex: true,
-        };
-        let flow = server
-            .approval_flow_for_settings(&test_context(), &test_operation_context(), &settings)
-            .expect("approval flow should resolve");
-
-        assert!(matches!(flow, ApprovalFlow::Local));
     }
 
     #[test]
@@ -1240,42 +1142,14 @@ mod tests {
     }
 
     fn test_server_with_mode(approval_mode: ApprovalMode) -> McpServer {
-        let db_path = PathBuf::from(format!(
-            "/private/tmp/xiic-ssh-mcp-test-{}.sqlite3",
+        let db_path = std::env::temp_dir().join(format!(
+            "xiic-ssh-mcp-test-{}.sqlite3",
             uuid::Uuid::new_v4()
         ));
-        let core = Arc::new(
-            DesktopCore::new(db_path.clone(), DEFAULT_KEYRING_SERVICE)
-                .expect("test core should initialize"),
-        );
+        let core =
+            Arc::new(DesktopCore::new(db_path.clone()).expect("test core should initialize"));
         let server = McpServer::new(core, WhitelistMode::Strict, approval_mode, None);
         let _ = std::fs::remove_file(db_path);
-        server
-    }
-
-    fn initialized_test_server_with_capability(approval_mode: ApprovalMode) -> McpServer {
-        let mut server = test_server_with_mode(approval_mode);
-        let mut reader = BufReader::new(Cursor::new(Vec::<u8>::new()));
-        let mut output = Vec::new();
-        server
-            .dispatch_with_context(
-                test_context(),
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2024-11-05",
-                        "capabilities": {
-                            "elicitation": {}
-                        }
-                    }
-                }),
-                MessageFraming::Newline,
-                &mut reader,
-                &mut output,
-            )
-            .expect("initialize should succeed");
         server
     }
 
@@ -1322,6 +1196,7 @@ mod tests {
             remote_path: None,
             local_path: None,
             instance_id: Some("dev-server".to_string()),
+            overwrite: None,
         };
         crate::models::PendingToolCall {
             id: json!(7),
@@ -1339,13 +1214,6 @@ mod tests {
         }
     }
 
-    fn codex_context() -> RequestContext {
-        RequestContext {
-            client_id: "codex".to_string(),
-            client_session_id: uuid::Uuid::new_v4().to_string(),
-        }
-    }
-
     fn test_operation_context() -> crate::models::OperationContext {
         crate::models::OperationContext {
             tool_name: "create_session".to_string(),
@@ -1353,6 +1221,7 @@ mod tests {
             remote_path: None,
             local_path: None,
             instance_id: Some("dev-server".to_string()),
+            overwrite: None,
         }
     }
 }

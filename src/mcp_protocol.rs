@@ -3,6 +3,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 
+const MAX_MCP_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MessageFraming {
     Newline,
@@ -20,16 +22,11 @@ where
     R: Read,
 {
     let mut content_length = None;
-    let mut line = String::new();
 
     loop {
-        line.clear();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .context("failed to read MCP message")?;
-        if bytes_read == 0 {
+        let Some(line) = read_line_limited(reader, "MCP message")? else {
             return Ok(None);
-        }
+        };
 
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
@@ -37,6 +34,9 @@ where
         }
 
         if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            if trimmed.len() > MAX_MCP_MESSAGE_BYTES {
+                bail!("MCP message exceeds the 16 MiB limit");
+            }
             let value = serde_json::from_str(trimmed)
                 .context("failed to parse newline-delimited MCP JSON-RPC message")?;
             return Ok(Some(IncomingMessage {
@@ -52,6 +52,9 @@ where
                 .trim()
                 .parse::<usize>()
                 .context("invalid Content-Length header")?;
+            if parsed > MAX_MCP_MESSAGE_BYTES {
+                bail!("MCP message exceeds the 16 MiB limit");
+            }
             content_length = Some(parsed);
             break;
         }
@@ -64,13 +67,9 @@ where
     }
 
     loop {
-        line.clear();
-        let bytes_read = reader
-            .read_line(&mut line)
-            .context("failed to read MCP header")?;
-        if bytes_read == 0 {
+        let Some(line) = read_line_limited(reader, "MCP header")? else {
             bail!("unexpected EOF while reading MCP headers");
-        }
+        };
 
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
@@ -84,6 +83,9 @@ where
                 .trim()
                 .parse::<usize>()
                 .context("invalid Content-Length header")?;
+            if parsed > MAX_MCP_MESSAGE_BYTES {
+                bail!("MCP message exceeds the 16 MiB limit");
+            }
             content_length = Some(parsed);
         }
     }
@@ -100,6 +102,40 @@ where
         payload: value,
         framing: MessageFraming::ContentLength,
     }))
+}
+
+fn read_line_limited<R>(reader: &mut BufReader<R>, label: &str) -> Result<Option<String>>
+where
+    R: Read,
+{
+    let mut bytes = Vec::new();
+    loop {
+        let buffer = reader
+            .fill_buf()
+            .with_context(|| format!("failed to read {label}"))?;
+        if buffer.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(buffer.len(), |index| index + 1);
+        if bytes.len() + consumed > MAX_MCP_MESSAGE_BYTES + 2 {
+            bail!("MCP message exceeds the 16 MiB limit");
+        }
+        bytes.extend_from_slice(&buffer[..consumed]);
+        reader.consume(consumed);
+
+        if newline.is_some() {
+            break;
+        }
+    }
+
+    String::from_utf8(bytes)
+        .map(Some)
+        .context("MCP message is not valid UTF-8")
 }
 
 pub fn write_message<W>(writer: &mut W, payload: &Value, framing: MessageFraming) -> Result<()>
@@ -134,7 +170,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{MessageFraming, read_message, write_message};
+    use super::{MAX_MCP_MESSAGE_BYTES, MessageFraming, read_message, write_message};
 
     fn initialize_payload() -> serde_json::Value {
         json!({
@@ -173,6 +209,28 @@ mod tests {
 
         assert_eq!(message.framing, MessageFraming::ContentLength);
         assert_eq!(message.payload["method"], "initialize");
+    }
+
+    #[test]
+    fn rejects_oversized_content_length_before_allocating_body() {
+        let input = format!("Content-Length: {}\r\n\r\n", MAX_MCP_MESSAGE_BYTES + 1);
+        let mut reader = BufReader::new(Cursor::new(input.into_bytes()));
+
+        let error = read_message(&mut reader).expect_err("oversized message should fail");
+
+        assert!(error.to_string().contains("16 MiB"));
+    }
+
+    #[test]
+    fn rejects_oversized_newline_delimited_message() {
+        let mut input = vec![b' '; MAX_MCP_MESSAGE_BYTES + 1];
+        input[0] = b'{';
+        input.push(b'\n');
+        let mut reader = BufReader::new(Cursor::new(input));
+
+        let error = read_message(&mut reader).expect_err("oversized message should fail");
+
+        assert!(error.to_string().contains("16 MiB"));
     }
 
     #[test]

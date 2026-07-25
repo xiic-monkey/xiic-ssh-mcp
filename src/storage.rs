@@ -8,6 +8,7 @@ use crate::models::{
     AuthKind, InstanceDraft, OperationLogEntry, RuleAction, RuleType, SecretPayload,
     StoredInstance, WhitelistRule,
 };
+use crate::paths::{ensure_private_dir, ensure_private_file};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSecret {
@@ -23,12 +24,24 @@ pub struct InstanceStore {
 impl InstanceStore {
     pub fn new(db_path: PathBuf) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
+            let parent_existed = parent.exists();
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create '{}'", parent.display()))?;
+            if !parent_existed {
+                ensure_private_dir(parent).with_context(|| {
+                    format!("failed to secure new directory '{}'", parent.display())
+                })?;
+            }
         }
 
         let store = Self { db_path };
         store.init_schema()?;
+        ensure_private_file(&store.db_path).with_context(|| {
+            format!(
+                "failed to secure SQLite database '{}'",
+                store.db_path.display()
+            )
+        })?;
         Ok(store)
     }
 
@@ -493,11 +506,44 @@ fn _ensure_send_sync(_: &Path) {}
 mod tests {
     use std::env;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     use rusqlite::Connection;
 
     use super::InstanceStore;
     use crate::models::{AuthKind, InstanceDraft, SecretPayload};
     use uuid::Uuid;
+
+    #[cfg(unix)]
+    #[test]
+    fn database_and_parent_directory_are_private() {
+        let test_root = env::temp_dir().join(format!("xiic-ssh-mcp-storage-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&test_root).expect("test root should be created");
+        let test_dir = test_root.join("private-data");
+        let db_path = test_dir.join("instances.sqlite3");
+
+        let _store = InstanceStore::new(db_path.clone()).expect("store should initialize");
+
+        assert_eq!(
+            std::fs::metadata(&test_dir)
+                .expect("directory metadata should load")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&db_path)
+                .expect("database metadata should load")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        std::fs::remove_dir_all(test_root).expect("test root should be removed");
+    }
 
     #[test]
     fn secret_round_trip_preserves_private_key_path() {

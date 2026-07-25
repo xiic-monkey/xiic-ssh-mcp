@@ -27,6 +27,10 @@ Xiic SSH MCP 是一个本地 MCP 服务器，为 Cursor、Claude Desktop 等 AI 
 | `execute_command` | 在会话中执行远程命令 |
 | `upload_file` | 通过 SFTP 将本地文件上传到远端路径 |
 | `download_file` | 通过 SFTP 将远端文件下载到本地路径 |
+| `upload_local_file` | 上传本地文件（兼容别名，支持显式覆盖控制） |
+| `download_to_local` | 下载到指定本地路径，支持显式覆盖控制 |
+| `close_session` | 关闭活动 SSH 会话 |
+| `sudo` | 经本地密码输入框以 sudo 执行命令 |
 
 文件传输工具的参数语义如下：
 
@@ -39,6 +43,15 @@ Xiic SSH MCP 是一个本地 MCP 服务器，为 Cursor、Claude Desktop 等 AI 
   - `session_id`: SSH 会话 ID
   - `remote_path`: 远端文件路径
   - `local_path`: 可选，本地保存路径；不传时默认保存到 `~/Downloads/<文件名>`
+- `upload_local_file`
+  - 参数与 `upload_file` 相同
+- `download_to_local`
+  - `session_id`: SSH 会话 ID
+  - `remote_path`: 远端文件路径
+  - `local_path`: 必选，本地保存路径
+  - `overwrite`: 是否覆盖已有本地文件，默认 `true`
+
+上传和下载采用流式传输，不会把整个文件载入内存。命令的 stdout、stderr 分别限制为 4 MiB，单条 MCP 输入消息限制为 16 MiB。
 
 ## 安全机制
 
@@ -60,13 +73,17 @@ Xiic SSH MCP 是一个本地 MCP 服务器，为 Cursor、Claude Desktop 等 AI 
 - **Local 模式**：弹出独立的审批窗口（Tauri 应用），或使用系统原生弹窗
 
 审批模式由 `--approval-mode` 参数控制：
-- `auto`（默认）：客户端声明支持 elicitation 时使用 elicitation，否则使用 local；设置中的「使用系统弹窗进行审核」开启时始终使用 local
+- `auto`（默认）：始终使用 local，不信任客户端自报身份或能力来切换审批方式
 - `elicitation`：强制 elicitation；如果客户端未声明支持 elicitation 能力，会直接拒绝该操作
 - `local`：强制本地审批
 
 设置中的「使用系统弹窗进行审核」开启时，local 审批会直接调用系统原生对话框（macOS AppleScript / Windows PowerShell / Linux zenity），跳过审批 App；关闭时则使用独立审批窗口。
 
 ### 凭据存储
+
+连接元数据、白名单、操作日志及凭据密文保存在 SQLite。密码、私钥内容、私钥路径及口令会使用 AES-256-GCM 加密后写入 `instance_secrets`；随机主密钥位于同一应用私有目录的 `credentials.key`，不会使用操作系统 Keychain。密文使用实例 ID 作为附加认证数据，不能被复制到另一条连接后解密。
+
+应用数据目录在 Unix 系统上限制为 `0700`，数据库、设置文件、锁文件与本地 IPC 文件限制为 `0600`。
 
 ## 安装
 
@@ -113,7 +130,6 @@ curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh | ba
       "command": "/path/to/xiic-ssh-mcp",
       "args": [
         "--db-path", "~/Library/Application Support/com.xiic.sshmanager/instances.sqlite3",
-        "--keyring-service", "com.xiic.ssh-manager",
         "--notify-socket", "~/Library/Application Support/com.xiic.sshmanager/notify.sock",
         "--approval-mode", "auto",
         "--approval-endpoint", "~/Library/Application Support/com.xiic.sshmanager/approval.sock"
@@ -131,7 +147,7 @@ curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh | ba
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `--db-path <path>` | SQLite 数据库路径 | 必选 |
-| `--keyring-service <name>` | Keychain 服务名 | `com.xiic.ssh-manager` |
+| `--keyring-service <name>` | 已废弃；为兼容旧配置保留且会被忽略 | 无 |
 | `--notify-socket <path>` | 日志通知 IPC 端点 | 无 |
 | `--whitelist <strict\|off>` | 白名单模式 | `strict` |
 | `--approval-mode <auto\|elicitation\|local>` | 审批模式 | `auto` |
@@ -166,4 +182,4 @@ cargo build --manifest-path src-tauri/Cargo.toml && ./src-tauri/target/debug/xii
 - **React + TypeScript** — 前端界面
 - **SQLite** — 连接配置、白名单规则、操作日志持久化
 - **ssh2** — SSH/SFTP 协议实现（vendored-openssl）
-- **keyring** — 操作系统 Keychain 凭据存储
+- **aes-gcm** — 本地凭据的认证加密存储

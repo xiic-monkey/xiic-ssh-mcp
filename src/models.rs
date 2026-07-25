@@ -119,7 +119,6 @@ pub struct McpConfigBundle {
 pub struct McpConfigRequest<'a> {
     pub command_path: &'a str,
     pub db_path: &'a str,
-    pub keyring_service: &'a str,
     pub notify_endpoint: Option<&'a str>,
     pub approval_endpoint: Option<&'a str>,
     pub client_id: &'a str,
@@ -345,6 +344,7 @@ pub struct OperationContext {
     pub remote_path: Option<String>,
     pub local_path: Option<String>,
     pub instance_id: Option<String>,
+    pub overwrite: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -405,6 +405,8 @@ pub struct ApprovalOperationMetadata {
     pub remote_path: Option<String>,
     pub local_path: Option<String>,
     pub instance_id: Option<String>,
+    #[serde(default)]
+    pub overwrite: Option<bool>,
 }
 
 impl From<&OperationContext> for ApprovalOperationMetadata {
@@ -415,6 +417,7 @@ impl From<&OperationContext> for ApprovalOperationMetadata {
             remote_path: value.remote_path.clone(),
             local_path: value.local_path.clone(),
             instance_id: value.instance_id.clone(),
+            overwrite: value.overwrite,
         }
     }
 }

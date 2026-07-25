@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::fs::File;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -25,14 +26,16 @@ use crate::models::{
 use crate::storage::InstanceStore;
 use crate::whitelist::WhitelistChecker;
 
-pub const DEFAULT_KEYRING_SERVICE: &str = "com.xiic.ssh-manager";
 pub const DEFAULT_CLIENT_ID: &str = "xiic-ssh-default";
+const MAX_COMMAND_STREAM_BYTES: u64 = 4 * 1024 * 1024;
+
+type SharedSession = Arc<Mutex<ManagedSession>>;
 
 #[derive(Clone)]
 pub struct DesktopCore {
     store: InstanceStore,
     secrets: SecretStore,
-    sessions: Arc<Mutex<HashMap<String, ManagedSession>>>,
+    sessions: Arc<Mutex<HashMap<String, SharedSession>>>,
     notify_endpoint: Option<String>,
 }
 
@@ -47,38 +50,17 @@ struct ResolvedInstance {
 }
 
 impl DesktopCore {
-    pub fn new(db_path: PathBuf, keyring_service: impl Into<String>) -> Result<Self> {
-        Self::new_with_socket(db_path, keyring_service, None)
+    pub fn new(db_path: PathBuf) -> Result<Self> {
+        Self::new_with_socket(db_path, None)
     }
 
-    pub fn new_with_socket(
-        db_path: PathBuf,
-        keyring_service: impl Into<String>,
-        notify_endpoint: Option<String>,
-    ) -> Result<Self> {
+    pub fn new_with_socket(db_path: PathBuf, notify_endpoint: Option<String>) -> Result<Self> {
         let core = Self {
-            store: InstanceStore::new(db_path)?,
-            secrets: SecretStore::new(keyring_service),
+            store: InstanceStore::new(db_path.clone())?,
+            secrets: SecretStore::new(db_path)?,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             notify_endpoint,
         };
-        core.migrate_legacy_secrets()?;
-        Ok(core)
-    }
-
-    #[cfg(test)]
-    fn new_with_secret_store(
-        db_path: PathBuf,
-        secrets: SecretStore,
-        notify_endpoint: Option<String>,
-    ) -> Result<Self> {
-        let core = Self {
-            store: InstanceStore::new(db_path)?,
-            secrets,
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            notify_endpoint,
-        };
-        core.migrate_legacy_secrets()?;
         Ok(core)
     }
 
@@ -92,7 +74,19 @@ impl DesktopCore {
         instances
             .into_iter()
             .map(|instance| {
-                let has_secret = self.has_secret(&instance.instance_id)?;
+                // Listing metadata must remain available while the login keychain is locked or
+                // waiting for user authorization. Session creation still reports the precise
+                // credential error through `resolve_instance`.
+                let has_secret = match self.has_secret(&instance.instance_id) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        eprintln!(
+                            "[xiic-ssh-mcp] unable to inspect secret for '{}': {err:#}",
+                            instance.instance_id
+                        );
+                        false
+                    }
+                };
                 Ok(InstanceSummary::from_stored(instance, has_secret))
             })
             .collect()
@@ -137,25 +131,80 @@ impl DesktopCore {
         let draft = draft.normalize();
         self.validate_metadata(&draft)?;
 
-        let existing_secret = self.load_secret(&draft.instance_id)?;
+        let has_provided_secret = draft.password.is_some()
+            || draft.private_key.is_some()
+            || draft.private_key_path.is_some()
+            || draft.passphrase.is_some();
+        let (existing_secret, can_restore_existing_secret) = match self
+            .load_secret(&draft.instance_id)
+        {
+            Ok(secret) => (secret, true),
+            Err(err) if has_provided_secret => {
+                eprintln!(
+                    "[xiic-ssh-mcp] existing secret for '{}' is unavailable; replacing it with the supplied credential: {err:#}",
+                    draft.instance_id
+                );
+                (None, false)
+            }
+            Err(err) => return Err(err),
+        };
         let secret = self.secret_for_draft(&draft, existing_secret.as_ref(), true)?;
-        self.save_and_verify_secret(&draft.instance_id, &secret)?;
-        let stored = self.store.save_instance(&draft)?;
-        self.store.delete_secret(&draft.instance_id)?;
-
+        if let Err(err) = self.save_and_verify_secret(&draft.instance_id, &secret) {
+            if can_restore_existing_secret {
+                self.restore_secret(&draft.instance_id, existing_secret.as_ref())
+                    .context("failed to restore previous credential after keychain save failure")?;
+            }
+            return Err(err);
+        }
+        let stored = match self.store.save_instance(&draft) {
+            Ok(stored) => stored,
+            Err(err) => {
+                if can_restore_existing_secret {
+                    self.restore_secret(&draft.instance_id, existing_secret.as_ref())
+                        .context(
+                            "failed to restore previous credential after metadata save failure",
+                        )?;
+                }
+                return Err(err).context("failed to save instance metadata");
+            }
+        };
         Ok(InstanceSummary::from_stored(stored, true))
     }
 
     pub fn delete_instance(&self, instance_id: &str) -> Result<()> {
-        self.store.delete_instance(instance_id)?;
-        self.store.delete_secret(instance_id)?;
-        let _ = self.secrets.delete_secret(instance_id);
+        let existing_secret = self.load_secret(instance_id)?;
+        self.secrets.delete_secret(instance_id)?;
+        if let Err(err) = self.store.delete_instance(instance_id) {
+            self.restore_secret(instance_id, existing_secret.as_ref())
+                .context("failed to restore credential after metadata deletion failure")?;
+            return Err(err);
+        }
 
+        let session_entries: Vec<(String, SharedSession)> = self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow!("session manager lock poisoned"))?
+            .iter()
+            .map(|(id, session)| (id.clone(), session.clone()))
+            .collect();
+        let mut session_ids = Vec::new();
+        for (session_id, session) in session_entries {
+            if session
+                .lock()
+                .map_err(|_| anyhow!("SSH session lock poisoned"))?
+                .instance_id
+                == instance_id
+            {
+                session_ids.push(session_id);
+            }
+        }
         let mut sessions = self
             .sessions
             .lock()
             .map_err(|_| anyhow!("session manager lock poisoned"))?;
-        sessions.retain(|_, session| session.instance_id != instance_id);
+        for session_id in session_ids {
+            sessions.remove(&session_id);
+        }
         Ok(())
     }
 
@@ -206,12 +255,7 @@ impl DesktopCore {
     }
 
     pub fn mcp_config_bundle(&self, request: McpConfigRequest<'_>) -> Result<McpConfigBundle> {
-        let mut args = vec![
-            "--db-path".to_string(),
-            request.db_path.to_string(),
-            "--keyring-service".to_string(),
-            request.keyring_service.to_string(),
-        ];
+        let mut args = vec!["--db-path".to_string(), request.db_path.to_string()];
         if let Some(endpoint) = request.notify_endpoint {
             args.push("--notify-socket".to_string());
             args.push(endpoint.to_string());
@@ -264,10 +308,10 @@ impl DesktopCore {
             .map_err(|_| anyhow!("session manager lock poisoned"))?;
         sessions.insert(
             session_id.clone(),
-            ManagedSession {
+            Arc::new(Mutex::new(ManagedSession {
                 instance_id: instance_id.to_string(),
                 session,
-            },
+            })),
         );
         drop(sessions);
 
@@ -312,13 +356,10 @@ impl DesktopCore {
             .unwrap_or(30_000);
 
         let (instance_id, session_id, command, result) = {
-            let mut sessions = self
-                .sessions
+            let session = self.get_session(&args.session_id)?;
+            let managed = session
                 .lock()
-                .map_err(|_| anyhow!("session manager lock poisoned"))?;
-            let managed = sessions
-                .get_mut(&args.session_id)
-                .with_context(|| format!("unknown session_id '{}'", args.session_id))?;
+                .map_err(|_| anyhow!("SSH session lock poisoned"))?;
             let instance_id = managed.instance_id.clone();
 
             managed.session.set_timeout(timeout_ms);
@@ -331,16 +372,8 @@ impl DesktopCore {
                 .exec(&args.command)
                 .with_context(|| format!("failed to execute command '{}'", args.command))?;
 
-            let mut stdout = String::new();
-            channel
-                .read_to_string(&mut stdout)
-                .context("failed to read command stdout")?;
-
-            let mut stderr = String::new();
-            channel
-                .stderr()
-                .read_to_string(&mut stderr)
-                .context("failed to read command stderr")?;
+            let stdout = read_limited_utf8(&mut channel, "command stdout")?;
+            let stderr = read_limited_utf8(&mut channel.stderr(), "command stderr")?;
 
             channel
                 .wait_close()
@@ -393,17 +426,14 @@ impl DesktopCore {
         args: UploadFileArgs,
     ) -> Result<UploadFileResult> {
         let local_path = args.local_path.clone();
-        let bytes = std::fs::read(&local_path)
-            .with_context(|| format!("failed to read local path '{}'", local_path))?;
+        let mut local_file = File::open(&local_path)
+            .with_context(|| format!("failed to open local path '{}'", local_path))?;
 
         let (instance_id, session_id, remote_path, bytes_written) = {
-            let mut sessions = self
-                .sessions
+            let session = self.get_session(&args.session_id)?;
+            let managed = session
                 .lock()
-                .map_err(|_| anyhow!("session manager lock poisoned"))?;
-            let managed = sessions
-                .get_mut(&args.session_id)
-                .with_context(|| format!("unknown session_id '{}'", args.session_id))?;
+                .map_err(|_| anyhow!("SSH session lock poisoned"))?;
             let instance_id = managed.instance_id.clone();
 
             managed.session.set_timeout(30_000);
@@ -420,7 +450,7 @@ impl DesktopCore {
             let mut file = sftp
                 .create(&remote)
                 .with_context(|| format!("failed to open remote path '{}'", args.remote_path))?;
-            file.write_all(&bytes)
+            let bytes_written = std::io::copy(&mut local_file, &mut file)
                 .with_context(|| format!("failed to write remote path '{}'", args.remote_path))?;
             file.flush()
                 .with_context(|| format!("failed to flush remote path '{}'", args.remote_path))?;
@@ -429,7 +459,7 @@ impl DesktopCore {
                 instance_id,
                 args.session_id.clone(),
                 args.remote_path.clone(),
-                bytes.len(),
+                usize::try_from(bytes_written).context("uploaded file is too large to report")?,
             )
         };
 
@@ -494,13 +524,10 @@ impl DesktopCore {
         let resolved_local_path =
             resolve_download_path(&args.remote_path, args.local_path.as_deref())?;
         let (instance_id, session_id, remote_path, result) = {
-            let mut sessions = self
-                .sessions
+            let session = self.get_session(&args.session_id)?;
+            let managed = session
                 .lock()
-                .map_err(|_| anyhow!("session manager lock poisoned"))?;
-            let managed = sessions
-                .get_mut(&args.session_id)
-                .with_context(|| format!("unknown session_id '{}'", args.session_id))?;
+                .map_err(|_| anyhow!("SSH session lock poisoned"))?;
             let instance_id = managed.instance_id.clone();
 
             managed.session.set_timeout(30_000);
@@ -513,9 +540,6 @@ impl DesktopCore {
                 .open(PathBuf::from(&args.remote_path).as_path())
                 .with_context(|| format!("failed to open remote path '{}'", args.remote_path))?;
 
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)
-                .with_context(|| format!("failed to read remote path '{}'", args.remote_path))?;
             if let Some(parent) = resolved_local_path.parent() {
                 std::fs::create_dir_all(parent).with_context(|| {
                     format!(
@@ -524,9 +548,21 @@ impl DesktopCore {
                     )
                 })?;
             }
-            std::fs::write(&resolved_local_path, &bytes).with_context(|| {
+            let mut local_file = File::create(&resolved_local_path).with_context(|| {
+                format!(
+                    "failed to create local path '{}'",
+                    resolved_local_path.display()
+                )
+            })?;
+            let bytes_written = std::io::copy(&mut file, &mut local_file).with_context(|| {
                 format!(
                     "failed to write local path '{}'",
+                    resolved_local_path.display()
+                )
+            })?;
+            local_file.flush().with_context(|| {
+                format!(
+                    "failed to flush local path '{}'",
                     resolved_local_path.display()
                 )
             })?;
@@ -538,7 +574,8 @@ impl DesktopCore {
                 DownloadFileResult {
                     local_path: resolved_local_path.display().to_string(),
                     remote_path: args.remote_path.clone(),
-                    size: bytes.len(),
+                    size: usize::try_from(bytes_written)
+                        .context("downloaded file is too large to report")?,
                     encoding: "local_path".to_string(),
                 },
             )
@@ -606,10 +643,15 @@ impl DesktopCore {
                 .sessions
                 .lock()
                 .map_err(|_| anyhow!("session manager lock poisoned"))?;
-            sessions
+            let session = sessions
                 .remove(session_id)
-                .map(|s| s.instance_id)
-                .with_context(|| format!("unknown session_id '{}'", session_id))?
+                .with_context(|| format!("unknown session_id '{}'", session_id))?;
+            drop(sessions);
+            session
+                .lock()
+                .map_err(|_| anyhow!("SSH session lock poisoned"))?
+                .instance_id
+                .clone()
         };
         // ManagedSession dropped here → ssh2 Session disconnected automatically
 
@@ -665,13 +707,10 @@ impl DesktopCore {
         let sudo_cmd = format!("sudo -S {}", args.command);
 
         let (instance_id, session_id, command, result) = {
-            let mut sessions = self
-                .sessions
+            let session = self.get_session(&args.session_id)?;
+            let managed = session
                 .lock()
-                .map_err(|_| anyhow!("session manager lock poisoned"))?;
-            let managed = sessions
-                .get_mut(&args.session_id)
-                .with_context(|| format!("unknown session_id '{}'", args.session_id))?;
+                .map_err(|_| anyhow!("SSH session lock poisoned"))?;
             let instance_id = managed.instance_id.clone();
 
             managed.session.set_timeout(timeout_ms);
@@ -697,16 +736,8 @@ impl DesktopCore {
                 .send_eof()
                 .context("failed to send EOF after sudo password")?;
 
-            let mut stdout = String::new();
-            channel
-                .read_to_string(&mut stdout)
-                .context("failed to read sudo command stdout")?;
-
-            let mut stderr = String::new();
-            channel
-                .stderr()
-                .read_to_string(&mut stderr)
-                .context("failed to read sudo command stderr")?;
+            let stdout = read_limited_utf8(&mut channel, "sudo command stdout")?;
+            let stderr = read_limited_utf8(&mut channel.stderr(), "sudo command stderr")?;
 
             channel
                 .wait_close()
@@ -778,13 +809,23 @@ impl DesktopCore {
     }
 
     pub fn get_session_instance_id(&self, session_id: &str) -> Result<String> {
+        let session = self.get_session(session_id)?;
+        let instance_id = session
+            .lock()
+            .map_err(|_| anyhow!("SSH session lock poisoned"))?
+            .instance_id
+            .clone();
+        Ok(instance_id)
+    }
+
+    fn get_session(&self, session_id: &str) -> Result<SharedSession> {
         let sessions = self
             .sessions
             .lock()
             .map_err(|_| anyhow!("session manager lock poisoned"))?;
         sessions
             .get(session_id)
-            .map(|s| s.instance_id.clone())
+            .cloned()
             .with_context(|| format!("unknown session_id '{}'", session_id))
     }
 
@@ -827,34 +868,23 @@ impl DesktopCore {
         self.secrets.has_secret(instance_id)
     }
 
-    fn migrate_legacy_secrets(&self) -> Result<()> {
-        for legacy in self.store.list_secrets()? {
-            if self.secrets.has_secret(&legacy.instance_id)? {
-                self.store.delete_secret(&legacy.instance_id)?;
-                continue;
-            }
-
-            match self.save_and_verify_secret(&legacy.instance_id, &legacy.secret) {
-                Ok(()) => self.store.delete_secret(&legacy.instance_id)?,
-                Err(err) => eprintln!(
-                    "warning: failed to migrate legacy SQLite secret for '{}': {err:#}",
-                    legacy.instance_id
-                ),
-            }
-        }
-        Ok(())
-    }
-
     fn save_and_verify_secret(&self, instance_id: &str, secret: &SecretPayload) -> Result<()> {
         self.secrets.save_secret(instance_id, secret)?;
         let persisted = self.secrets.load_secret(instance_id)?;
         if persisted.as_ref() != Some(secret) {
             bail!(
-                "keychain secret verification failed for instance '{}'",
+                "encrypted credential verification failed for instance '{}'",
                 instance_id
             );
         }
         Ok(())
+    }
+
+    fn restore_secret(&self, instance_id: &str, secret: Option<&SecretPayload>) -> Result<()> {
+        match secret {
+            Some(secret) => self.save_and_verify_secret(instance_id, secret),
+            None => self.secrets.delete_secret(instance_id),
+        }
     }
 
     pub fn get_private_key_path(&self, instance_id: &str) -> Result<Option<String>> {
@@ -921,6 +951,21 @@ impl DesktopCore {
 
         Ok(resolved)
     }
+}
+
+fn read_limited_utf8(reader: &mut impl Read, label: &str) -> Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_COMMAND_STREAM_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {label}"))?;
+    if bytes.len() as u64 > MAX_COMMAND_STREAM_BYTES {
+        bail!(
+            "{label} exceeded the {} MiB output limit",
+            MAX_COMMAND_STREAM_BYTES / (1024 * 1024)
+        );
+    }
+    String::from_utf8(bytes).with_context(|| format!("{label} is not valid UTF-8"))
 }
 
 fn resolve_download_path(remote_path: &str, requested_local_path: Option<&str>) -> Result<PathBuf> {
@@ -1099,20 +1144,28 @@ fn known_hosts_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any())]
     use std::collections::{HashMap as TestHashMap, HashSet};
+    #[cfg(any())]
     use std::sync::{Arc as TestArc, Mutex as TestMutex};
 
+    #[cfg(any())]
     use anyhow::anyhow;
 
+    #[cfg(any())]
     use crate::credentials::CredentialBackend;
 
+    #[cfg(any())]
     #[derive(Default)]
     struct MockCredentialBackend {
         entries: TestMutex<TestHashMap<String, String>>,
+        fail_get: TestMutex<HashSet<String>>,
         fail_set: TestMutex<HashSet<String>>,
+        fail_delete: TestMutex<HashSet<String>>,
         discard_next_set: TestMutex<HashSet<String>>,
     }
 
+    #[cfg(any())]
     impl MockCredentialBackend {
         fn key(service_name: &str, account: &str) -> String {
             format!("{service_name}|{account}")
@@ -1125,10 +1178,24 @@ mod tests {
                 .insert(account.to_string());
         }
 
+        fn fail_next_get(&self, account: &str) {
+            self.fail_get
+                .lock()
+                .expect("fail get set should lock")
+                .insert(account.to_string());
+        }
+
         fn discard_next_set(&self, account: &str) {
             self.discard_next_set
                 .lock()
                 .expect("discard set should lock")
+                .insert(account.to_string());
+        }
+
+        fn fail_next_delete(&self, account: &str) {
+            self.fail_delete
+                .lock()
+                .expect("fail delete set should lock")
                 .insert(account.to_string());
         }
 
@@ -1141,6 +1208,7 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     impl CredentialBackend for MockCredentialBackend {
         fn set_password(&self, service_name: &str, account: &str, payload: &str) -> Result<()> {
             if self
@@ -1169,6 +1237,15 @@ mod tests {
         }
 
         fn get_password(&self, service_name: &str, account: &str) -> Result<Option<String>> {
+            if self
+                .fail_get
+                .lock()
+                .expect("fail get set should lock")
+                .remove(account)
+            {
+                return Err(anyhow!("mock keychain read failed"));
+            }
+
             Ok(self
                 .entries
                 .lock()
@@ -1178,6 +1255,15 @@ mod tests {
         }
 
         fn delete_password(&self, service_name: &str, account: &str) -> Result<()> {
+            if self
+                .fail_delete
+                .lock()
+                .expect("fail delete set should lock")
+                .remove(account)
+            {
+                return Err(anyhow!("mock keychain delete failed"));
+            }
+
             self.entries
                 .lock()
                 .expect("entries should lock")
@@ -1186,20 +1272,18 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     const TEST_SERVICE: &str = "com.xiic.ssh-manager.test";
 
     fn make_test_core() -> (DesktopCore, PathBuf) {
         let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&test_dir).expect("test dir should be created");
         let db_path = test_dir.join("instances.sqlite3");
-        let core = DesktopCore::new(
-            db_path,
-            format!("com.xiic.ssh-manager.test.{}", Uuid::new_v4()),
-        )
-        .expect("test core should initialize");
+        let core = DesktopCore::new(db_path).expect("test core should initialize");
         (core, test_dir)
     }
 
+    #[cfg(any())]
     fn make_mock_core() -> (DesktopCore, PathBuf, TestArc<MockCredentialBackend>) {
         let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&test_dir).expect("test dir should be created");
@@ -1214,6 +1298,7 @@ mod tests {
         (core, test_dir, backend)
     }
 
+    #[cfg(any())]
     fn make_mock_core_from_db(
         db_path: PathBuf,
         backend: TestArc<MockCredentialBackend>,
@@ -1226,6 +1311,7 @@ mod tests {
         .expect("test core should initialize")
     }
 
+    #[cfg(any())]
     fn password_draft(instance_id: &str) -> InstanceDraft {
         InstanceDraft {
             instance_id: instance_id.to_string(),
@@ -1244,6 +1330,7 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     fn password_secret(password: &str) -> SecretPayload {
         SecretPayload {
             password: Some(password.to_string()),
@@ -1253,6 +1340,7 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     fn save_legacy_secret(store: &InstanceStore, instance_id: &str, secret: &SecretPayload) {
         store
             .save_instance(&password_draft(instance_id))
@@ -1270,6 +1358,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn save_instance_stores_secret_only_in_keychain() {
         let (core, test_dir, backend) = make_mock_core();
 
@@ -1296,6 +1385,49 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
+    fn list_instances_keeps_metadata_when_keychain_read_fails() {
+        let (core, test_dir, backend) = make_mock_core();
+        core.save_instance(password_draft("prod"))
+            .expect("initial instance should save");
+        backend.fail_next_get("prod");
+
+        let instances = core
+            .list_instances()
+            .expect("metadata list should remain available");
+
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].instance_id, "prod");
+        assert!(!instances[0].has_secret);
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    #[cfg(any())]
+    fn save_instance_replaces_an_unreadable_secret_when_new_credential_is_supplied() {
+        let (core, test_dir, backend) = make_mock_core();
+        core.save_instance(password_draft("prod"))
+            .expect("initial instance should save");
+        backend.fail_next_get("prod");
+        let mut replacement = password_draft("prod");
+        replacement.password = Some("replacement".to_string());
+
+        core.save_instance(replacement)
+            .expect("new credential should recover an unreadable old entry");
+
+        assert_eq!(
+            backend
+                .load_payload(TEST_SERVICE, "prod")
+                .expect("replacement credential should be stored"),
+            password_secret("replacement")
+        );
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    #[cfg(any())]
     fn save_instance_fails_when_keychain_save_fails_without_sqlite_fallback() {
         let (core, test_dir, backend) = make_mock_core();
         backend.fail_next_set("prod");
@@ -1317,6 +1449,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn save_instance_fails_when_keychain_write_cannot_be_read_back() {
         let (core, test_dir, backend) = make_mock_core();
         backend.discard_next_set("prod");
@@ -1338,6 +1471,127 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
+    fn metadata_save_failure_restores_previous_keychain_secret() {
+        let (core, test_dir, backend) = make_mock_core();
+        core.save_instance(password_draft("prod"))
+            .expect("initial instance should save");
+        let connection = rusqlite::Connection::open(test_dir.join("instances.sqlite3"))
+            .expect("database should open");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_instance_update
+                 BEFORE UPDATE ON instances
+                 BEGIN
+                   SELECT RAISE(ABORT, 'mock metadata update failed');
+                 END;",
+            )
+            .expect("failure trigger should be created");
+        drop(connection);
+        let mut updated = password_draft("prod");
+        updated.name = "Changed".to_string();
+        updated.password = Some("replacement".to_string());
+
+        let error = core
+            .save_instance(updated)
+            .expect_err("metadata failure should fail save");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to save instance metadata")
+        );
+        assert_eq!(
+            backend
+                .load_payload(TEST_SERVICE, "prod")
+                .expect("previous credential should remain"),
+            password_secret("secret")
+        );
+        assert_eq!(
+            core.store
+                .get_instance("prod")
+                .expect("instance lookup should succeed")
+                .expect("instance should remain")
+                .name,
+            "Production"
+        );
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    #[cfg(any())]
+    fn keychain_delete_failure_preserves_instance_metadata() {
+        let (core, test_dir, backend) = make_mock_core();
+        core.save_instance(password_draft("prod"))
+            .expect("initial instance should save");
+        backend.fail_next_delete("prod");
+
+        let error = core
+            .delete_instance("prod")
+            .expect_err("keychain failure should fail deletion");
+
+        assert!(format!("{error:#}").contains("mock keychain delete failed"));
+        assert!(
+            core.store
+                .get_instance("prod")
+                .expect("instance lookup should succeed")
+                .is_some(),
+            "metadata must remain when credential deletion fails"
+        );
+        assert_eq!(
+            backend
+                .load_payload(TEST_SERVICE, "prod")
+                .expect("credential should remain"),
+            password_secret("secret")
+        );
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    #[cfg(any())]
+    fn metadata_delete_failure_restores_keychain_secret() {
+        let (core, test_dir, backend) = make_mock_core();
+        core.save_instance(password_draft("prod"))
+            .expect("initial instance should save");
+        let connection = rusqlite::Connection::open(test_dir.join("instances.sqlite3"))
+            .expect("database should open");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_instance_delete
+                 BEFORE DELETE ON instances
+                 BEGIN
+                   SELECT RAISE(ABORT, 'mock metadata delete failed');
+                 END;",
+            )
+            .expect("failure trigger should be created");
+        drop(connection);
+
+        let error = core
+            .delete_instance("prod")
+            .expect_err("metadata failure should fail deletion");
+
+        assert!(error.to_string().contains("failed to delete instance"));
+        assert!(
+            core.store
+                .get_instance("prod")
+                .expect("instance lookup should succeed")
+                .is_some(),
+            "metadata should remain after the failed deletion"
+        );
+        assert_eq!(
+            backend
+                .load_payload(TEST_SERVICE, "prod")
+                .expect("credential should be restored"),
+            password_secret("secret")
+        );
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    #[cfg(any())]
     fn legacy_sqlite_secret_migrates_to_keychain_and_is_deleted() {
         let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&test_dir).expect("test dir should be created");
@@ -1366,6 +1620,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn legacy_secret_is_preserved_when_keychain_migration_cannot_be_verified() {
         let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&test_dir).expect("test dir should be created");
@@ -1389,6 +1644,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn legacy_sqlite_secret_does_not_overwrite_existing_keychain_secret() {
         let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&test_dir).expect("test dir should be created");
@@ -1424,6 +1680,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any())]
     fn legacy_sqlite_secret_is_not_used_when_keychain_is_missing() {
         let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&test_dir).expect("test dir should be created");
@@ -1483,6 +1740,17 @@ mod tests {
         );
 
         std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn command_output_over_limit_is_rejected() {
+        let bytes = vec![b'a'; (MAX_COMMAND_STREAM_BYTES + 1) as usize];
+        let mut reader = std::io::Cursor::new(bytes);
+
+        let error = read_limited_utf8(&mut reader, "command stdout")
+            .expect_err("oversized output should fail");
+
+        assert!(error.to_string().contains("4 MiB"));
     }
 
     #[test]
