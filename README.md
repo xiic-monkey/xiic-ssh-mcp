@@ -67,17 +67,13 @@ Xiic SSH MCP 是一个本地 MCP 服务器，为 Cursor、Claude Desktop 等 AI 
 
 ### 审批
 
-当操作未被白名单放行时，进入审批流程。支持两种审批方式：
+当操作未被白名单放行时，按安全设置中的「审核等级」处理：
 
-- **Elicitation 模式**：通过 MCP 协议让 AI 客户端自身弹出审批（客户端需支持 elicitation 能力）
-- **Local 模式**：弹出独立的审批窗口（Tauri 应用），或使用系统原生弹窗
+- **系统弹窗审核**：使用系统原生对话框确认操作
+- **App 弹窗审核**：使用 Xiic 独立审批窗口确认操作
+- **完全允许访问**：跳过审核，未被 Deny 规则拦截的操作会直接执行
 
-审批模式由 `--approval-mode` 参数控制：
-- `auto`（默认）：始终使用 local，不信任客户端自报身份或能力来切换审批方式
-- `elicitation`：强制 elicitation；如果客户端未声明支持 elicitation 能力，会直接拒绝该操作
-- `local`：强制本地审批
-
-设置中的「使用系统弹窗进行审核」开启时，local 审批会直接调用系统原生对话框（macOS AppleScript / Windows PowerShell / Linux zenity），跳过审批 App；关闭时则使用独立审批窗口。
+审核等级在桌面应用的「设置 → 安全」中调整。旧版 `use_system_approval` 配置会自动迁移：开启对应「系统弹窗审核」，关闭对应「App 弹窗审核」。
 
 ### 凭据存储
 
@@ -131,7 +127,6 @@ curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh | ba
       "args": [
         "--db-path", "~/Library/Application Support/com.xiic.sshmanager/instances.sqlite3",
         "--notify-socket", "~/Library/Application Support/com.xiic.sshmanager/notify.sock",
-        "--approval-mode", "auto",
         "--approval-endpoint", "~/Library/Application Support/com.xiic.sshmanager/approval.sock"
       ],
       "env": {
@@ -150,7 +145,6 @@ curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh | ba
 | `--keyring-service <name>` | 已废弃；为兼容旧配置保留且会被忽略 | 无 |
 | `--notify-socket <path>` | 日志通知 IPC 端点 | 无 |
 | `--whitelist <strict\|off>` | 白名单模式 | `strict` |
-| `--approval-mode <auto\|elicitation\|local>` | 审批模式 | `auto` |
 | `--approval-endpoint <path>` | 审批 IPC 端点 | 无 |
 
 ## 开发

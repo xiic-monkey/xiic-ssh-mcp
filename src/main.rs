@@ -11,7 +11,7 @@ use xiic_ssh_mcp::broker::{run_broker, run_stdio_bridge};
 use xiic_ssh_mcp::local_ipc::{
     broker_server_healthy, default_broker_endpoint, remove_stale_endpoint,
 };
-use xiic_ssh_mcp::models::{ApprovalMode, WhitelistMode};
+use xiic_ssh_mcp::models::WhitelistMode;
 use xiic_ssh_mcp::paths::shared_app_data_dir;
 use xiic_ssh_mcp::single_instance::SingleInstanceGuard;
 
@@ -57,7 +57,6 @@ fn main() -> Result<()> {
         &broker_endpoint,
         core,
         options.whitelist_mode,
-        options.approval_mode,
         approval_endpoint,
     )
 }
@@ -73,8 +72,6 @@ fn ensure_daemon(options: &CliOptions, broker_endpoint: &str) -> Result<()> {
         .arg("--daemon")
         .arg("--db-path")
         .arg(&options.db_path)
-        .arg("--approval-mode")
-        .arg(approval_mode_as_str(options.approval_mode))
         .arg("--whitelist")
         .arg(whitelist_mode_as_str(options.whitelist_mode))
         .arg("--broker-endpoint")
@@ -107,7 +104,6 @@ struct CliOptions {
     db_path: PathBuf,
     notify_socket: Option<String>,
     whitelist_mode: WhitelistMode,
-    approval_mode: ApprovalMode,
     approval_endpoint: Option<String>,
     broker_endpoint: Option<String>,
     client_id: String,
@@ -122,7 +118,6 @@ impl CliOptions {
         let mut db_path = None;
         let mut notify_socket = None;
         let mut whitelist_mode = WhitelistMode::Strict;
-        let mut approval_mode = ApprovalMode::Auto;
         let mut approval_endpoint = None;
         let mut broker_endpoint = None;
         let mut client_id = DEFAULT_CLIENT_ID.to_string();
@@ -166,24 +161,6 @@ impl CliOptions {
                         }
                     };
                 }
-                "--approval-mode" => {
-                    let value = iter.next().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "--approval-mode requires 'auto', 'elicitation', or 'local'"
-                        )
-                    })?;
-                    approval_mode = match value.as_str() {
-                        "auto" => ApprovalMode::Auto,
-                        "elicitation" => ApprovalMode::Elicitation,
-                        "local" => ApprovalMode::Local,
-                        _ => {
-                            return Err(anyhow::anyhow!(
-                                "--approval-mode must be 'auto', 'elicitation', or 'local', got '{}'",
-                                value
-                            ));
-                        }
-                    };
-                }
                 "--approval-endpoint" => {
                     approval_endpoint =
                         Some(iter.next().ok_or_else(|| {
@@ -219,7 +196,6 @@ impl CliOptions {
             db_path,
             notify_socket,
             whitelist_mode,
-            approval_mode,
             approval_endpoint,
             broker_endpoint,
             client_id,
@@ -235,19 +211,11 @@ fn whitelist_mode_as_str(mode: WhitelistMode) -> &'static str {
     }
 }
 
-fn approval_mode_as_str(mode: ApprovalMode) -> &'static str {
-    match mode {
-        ApprovalMode::Auto => "auto",
-        ApprovalMode::Elicitation => "elicitation",
-        ApprovalMode::Local => "local",
-    }
-}
-
 fn print_help() {
     println!(
         "xiic-ssh-mcp\n\n\
          Usage:\n  \
-         xiic-ssh-mcp --db-path <path> [--client-id <id>] [--broker-endpoint <path-or-pipe>] [--daemon] [--notify-socket <path>] [--approval-endpoint <path-or-pipe>] [--whitelist strict|off] [--approval-mode auto|elicitation|local]\n\n\
+         xiic-ssh-mcp --db-path <path> [--client-id <id>] [--broker-endpoint <path-or-pipe>] [--daemon] [--notify-socket <path>] [--approval-endpoint <path-or-pipe>] [--whitelist strict|off]\n\n\
          Options:\n  \
          --daemon                  Run the long-lived local MCP daemon\n  \
          --db-path <path>          Path to SQLite database\n  \
@@ -256,7 +224,6 @@ fn print_help() {
          --keyring-service <srv>   Deprecated legacy option; accepted but ignored\n  \
          --notify-socket <path>    Local IPC endpoint for UI log notifications\n  \
          --approval-endpoint <x>   Local IPC endpoint for approval request/response\n  \
-         --whitelist <mode>        Whitelist mode: 'strict' (default) or 'off'\n  \
-         --approval-mode <mode>    Approval mode: 'auto' (default), 'elicitation', or 'local'\n",
+         --whitelist <mode>        Whitelist mode: 'strict' (default) or 'off'\n",
     );
 }

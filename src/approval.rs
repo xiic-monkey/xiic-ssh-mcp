@@ -15,6 +15,7 @@ use crate::models::{
     ApprovalOperationMetadata, ApprovalRequest, ApprovalRequestedEvent, ApprovalResolvedEvent,
     ApprovalResponse,
 };
+use crate::settings::{ApprovalLevel, load_settings};
 
 const APP_LAUNCH_COOLDOWN: Duration = Duration::from_secs(3);
 
@@ -50,10 +51,8 @@ impl LocalApprovalClient {
             metadata: metadata.clone(),
         };
 
-        // 优先使用系统弹窗。只有弹窗本身无法启动时，才回退到独立审批 App，
-        // 避免把“系统 UI 不可用”误报成“用户拒绝”。
-        if uses_system_approval() {
-            eprintln!("[xiic-ssh-mcp] 使用系统弹窗进行审批（settings.use_system_approval）");
+        if approval_level() == ApprovalLevel::SystemDialog {
+            eprintln!("[xiic-ssh-mcp] 使用系统弹窗进行审批（settings.approval_level）");
             match request_via_native_dialog(&request) {
                 Ok(accepted) => return Ok(accepted),
                 Err(err) => eprintln!("[xiic-ssh-mcp] 系统审批弹窗失败，尝试独立审批 App: {err:#}"),
@@ -95,7 +94,7 @@ impl LocalApprovalClient {
             None => return,
         };
 
-        if uses_system_approval() {
+        if approval_level() != ApprovalLevel::AppDialog {
             return;
         }
 
@@ -127,8 +126,8 @@ impl LocalApprovalClient {
     }
 }
 
-fn uses_system_approval() -> bool {
-    crate::settings::load_settings().use_system_approval
+fn approval_level() -> ApprovalLevel {
+    load_settings().approval_level
 }
 
 fn launch_desktop_app_once(endpoint: &str) -> Result<()> {

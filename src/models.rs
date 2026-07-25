@@ -391,13 +391,6 @@ pub enum WhitelistMode {
     Off,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalMode {
-    Auto,
-    Elicitation,
-    Local,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalOperationMetadata {
     pub tool_name: String,

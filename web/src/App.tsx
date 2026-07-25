@@ -91,8 +91,10 @@ type OperationLogEntry = {
 };
 
 type AppSettings = {
-  use_system_approval: boolean;
+  approval_level: ApprovalLevel;
 };
+
+type ApprovalLevel = "system_dialog" | "app_dialog" | "allow_all";
 
 type ParsedTarget = {
   host: string;
@@ -453,19 +455,19 @@ export default function App() {
     }
   }
 
-  async function handleToggleSystemApproval(useSystem: boolean) {
+  async function handleChangeApprovalLevel(approvalLevel: ApprovalLevel) {
     if (!appSettings) {
       return;
     }
     setSavingSettings(true);
     const newSettings: AppSettings = {
       ...appSettings,
-      use_system_approval: useSystem,
+      approval_level: approvalLevel,
     };
     try {
       await invoke("save_settings", { settings: newSettings });
       setAppSettings(newSettings);
-      setStatus(useSystem ? "已启用系统弹窗审批。" : "已禁用系统弹窗审批。");
+      setStatus("审核等级已更新。");
       setStatusTone("success");
     } catch (error) {
       setStatus(asMessage(error));
@@ -707,7 +709,7 @@ export default function App() {
             saving={savingSettings}
             restartingMcp={restartingMcp}
             restartResult={restartResult}
-            onToggleSystemApproval={handleToggleSystemApproval}
+            onChangeApprovalLevel={handleChangeApprovalLevel}
             onRestartMcp={handleRestartMcp}
             onClose={closeSettings}
             onDragMouseDown={(event) => void handleDragMouseDown(event)}
@@ -1225,7 +1227,7 @@ function SettingsPanel({
   saving,
   restartingMcp,
   restartResult,
-  onToggleSystemApproval,
+  onChangeApprovalLevel,
   onRestartMcp,
   onClose,
   onDragMouseDown,
@@ -1234,12 +1236,12 @@ function SettingsPanel({
   saving: boolean;
   restartingMcp: boolean;
   restartResult: { kind: "success" | "error"; message: string } | null;
-  onToggleSystemApproval: (useSystem: boolean) => void;
+  onChangeApprovalLevel: (approvalLevel: ApprovalLevel) => void;
   onRestartMcp: () => Promise<void>;
   onClose: () => void;
   onDragMouseDown: (event: React.MouseEvent<HTMLElement>) => void;
 }) {
-  const [activeSection, setActiveSection] = useState<"approval" | "mcp">("approval");
+  const [activeSection, setActiveSection] = useState<"security" | "mcp">("security");
 
   function restartButtonContent() {
     if (restartingMcp) {
@@ -1283,15 +1285,15 @@ function SettingsPanel({
       <div className="settings-layout">
         <nav className="settings-nav" aria-label="设置分类">
           <button
-            aria-current={activeSection === "approval" ? "page" : undefined}
-            className={activeSection === "approval" ? "active" : ""}
-            onClick={() => setActiveSection("approval")}
+            aria-current={activeSection === "security" ? "page" : undefined}
+            className={activeSection === "security" ? "active" : ""}
+            onClick={() => setActiveSection("security")}
             type="button"
           >
             <ShieldCheck size={16} />
             <span>
-              <strong>审批与安全</strong>
-              <small>操作确认方式</small>
+              <strong>安全</strong>
+              <small>审核等级</small>
             </span>
           </button>
           <button
@@ -1309,33 +1311,47 @@ function SettingsPanel({
         </nav>
 
         <div className="settings-content">
-          {activeSection === "approval" ? (
+          {activeSection === "security" ? (
             <section className="settings-section">
               <div className="settings-section-heading">
                 <span className="section-icon"><ShieldCheck size={17} /></span>
                 <div>
-                  <h3>审批与安全</h3>
-                  <p>决定敏感 SSH 操作由哪个本地界面确认。</p>
+                  <h3>安全</h3>
+                  <p>决定未被白名单放行的 SSH 操作如何审核。</p>
                 </div>
               </div>
               <div className="settings-row">
                 <div className="settings-item-info">
-                  <strong>使用系统弹窗审批</strong>
-                  <p>开启后使用操作系统原生对话框；关闭后使用独立审批窗口。</p>
+                  <strong>审核等级</strong>
+                  <p>选择系统弹窗、独立 App 弹窗，或跳过审核直接允许访问。</p>
                   <span className="settings-current-value">
-                    当前：{appSettings?.use_system_approval ? "系统原生对话框" : "Xiic 独立审批窗口"}
+                    当前：{approvalLevelLabel(appSettings?.approval_level)}
                   </span>
                 </div>
-                <label className="toggle-switch settings-toggle">
-                  <input
-                    type="checkbox"
-                    checked={appSettings?.use_system_approval ?? false}
-                    disabled={saving || !appSettings}
-                    onChange={(event) => onToggleSystemApproval(event.target.checked)}
-                  />
-                  <span className="toggle-slider" />
-                  <span className="toggle-label">{appSettings?.use_system_approval ? "开启" : "关闭"}</span>
-                </label>
+                <div className="settings-choice-list" role="radiogroup" aria-label="审核等级">
+                  {approvalLevelOptions.map((option) => (
+                    <label
+                      className={
+                        "settings-choice"
+                        + (appSettings?.approval_level === option.value ? " active" : "")
+                      }
+                      key={option.value}
+                    >
+                      <input
+                        type="radio"
+                        name="approval-level"
+                        value={option.value}
+                        checked={appSettings?.approval_level === option.value}
+                        disabled={saving || !appSettings}
+                        onChange={() => onChangeApprovalLevel(option.value)}
+                      />
+                      <span>
+                        <strong>{option.label}</strong>
+                        <small>{option.description}</small>
+                      </span>
+                    </label>
+                  ))}
+                </div>
               </div>
             </section>
           ) : (
@@ -1374,6 +1390,32 @@ function SettingsPanel({
       </div>
     </section>
   );
+}
+
+const approvalLevelOptions: Array<{
+  value: ApprovalLevel;
+  label: string;
+  description: string;
+}> = [
+  {
+    value: "system_dialog",
+    label: "系统弹窗审核",
+    description: "使用操作系统原生对话框确认操作。",
+  },
+  {
+    value: "app_dialog",
+    label: "App 弹窗审核",
+    description: "使用 Xiic 独立审批窗口确认操作。",
+  },
+  {
+    value: "allow_all",
+    label: "完全允许访问",
+    description: "未被拒绝规则拦截的操作会直接执行。",
+  },
+];
+
+function approvalLevelLabel(level: ApprovalLevel | undefined): string {
+  return approvalLevelOptions.find((option) => option.value === level)?.label ?? "加载中";
 }
 
 function formatLogTime(iso: string): string {

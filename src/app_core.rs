@@ -260,8 +260,6 @@ impl DesktopCore {
             args.push("--notify-socket".to_string());
             args.push(endpoint.to_string());
         }
-        args.push("--approval-mode".to_string());
-        args.push("auto".to_string());
         if let Some(endpoint) = request.approval_endpoint {
             args.push("--approval-endpoint".to_string());
             args.push(endpoint.to_string());

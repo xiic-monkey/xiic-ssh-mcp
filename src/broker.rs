@@ -17,7 +17,7 @@ use crate::local_ipc::remove_stale_endpoint;
 use crate::local_ipc::{BROKER_HEALTH_CHECK_KIND, BROKER_HEALTH_OK_KIND, broker_server_healthy};
 use crate::mcp::McpServer;
 use crate::mcp_protocol::{IncomingMessage, MessageFraming, read_message, write_message};
-use crate::models::{ApprovalMode, BrokerHello, BrokerWelcome, RequestContext, WhitelistMode};
+use crate::models::{BrokerHello, BrokerWelcome, RequestContext, WhitelistMode};
 #[cfg(unix)]
 use crate::paths::ensure_private_file;
 
@@ -121,7 +121,6 @@ pub fn run_broker(
     endpoint: &str,
     core: Arc<DesktopCore>,
     whitelist_mode: WhitelistMode,
-    approval_mode: ApprovalMode,
     approval_endpoint: Option<String>,
 ) -> Result<()> {
     #[cfg(unix)]
@@ -141,13 +140,9 @@ pub fn run_broker(
             let core = core.clone();
             let approval_endpoint = approval_endpoint.clone();
             std::thread::spawn(move || {
-                if let Err(err) = handle_broker_connection(
-                    stream,
-                    core,
-                    whitelist_mode,
-                    approval_mode,
-                    approval_endpoint,
-                ) {
+                if let Err(err) =
+                    handle_broker_connection(stream, core, whitelist_mode, approval_endpoint)
+                {
                     eprintln!("[xiic-ssh-mcp] broker connection failed: {err:#}");
                 }
             });
@@ -169,13 +164,9 @@ pub fn run_broker(
             let core = core.clone();
             let approval_endpoint = approval_endpoint.clone();
             std::thread::spawn(move || {
-                if let Err(err) = handle_broker_connection(
-                    stream,
-                    core,
-                    whitelist_mode,
-                    approval_mode,
-                    approval_endpoint,
-                ) {
+                if let Err(err) =
+                    handle_broker_connection(stream, core, whitelist_mode, approval_endpoint)
+                {
                     eprintln!("[xiic-ssh-mcp] broker connection failed: {err:#}");
                 }
             });
@@ -184,13 +175,7 @@ pub fn run_broker(
 
     #[cfg(not(any(unix, target_os = "windows")))]
     {
-        let _ = (
-            endpoint,
-            core,
-            whitelist_mode,
-            approval_mode,
-            approval_endpoint,
-        );
+        let _ = (endpoint, core, whitelist_mode, approval_endpoint);
         anyhow::bail!("MCP broker daemon is not supported on this platform yet");
     }
 }
@@ -199,7 +184,6 @@ fn handle_broker_connection<S>(
     stream: S,
     core: Arc<DesktopCore>,
     whitelist_mode: WhitelistMode,
-    approval_mode: ApprovalMode,
     approval_endpoint: Option<String>,
 ) -> Result<()>
 where
@@ -244,12 +228,7 @@ where
 
     core.log_client_connection(&ctx, "client_connected")?;
 
-    let mut server = McpServer::new(
-        core.clone(),
-        whitelist_mode,
-        approval_mode,
-        approval_endpoint,
-    );
+    let mut server = McpServer::new(core.clone(), whitelist_mode, approval_endpoint);
     server.pre_launch();
 
     loop {
