@@ -140,13 +140,6 @@ impl CliOptions {
                         .next()
                         .ok_or_else(|| anyhow::anyhow!("--keyring-service requires a value"))?;
                 }
-                "--approval-mode" => {
-                    // Cached MCP configurations may still contain this removed option.
-                    // Approval behavior now comes only from the desktop approval level.
-                    let _legacy_approval_mode = iter
-                        .next()
-                        .ok_or_else(|| anyhow::anyhow!("--approval-mode requires a value"))?;
-                }
                 "--notify-socket" => {
                     let value = iter
                         .next()
@@ -233,42 +226,4 @@ fn print_help() {
          --approval-endpoint <x>   Local IPC endpoint for approval request/response\n  \
          --whitelist <mode>        Whitelist mode: 'strict' (default) or 'off'\n",
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use super::CliOptions;
-
-    #[test]
-    fn legacy_approval_mode_does_not_break_cached_mcp_configurations() {
-        let options = CliOptions::parse([
-            "--db-path".to_string(),
-            "/tmp/xiic-ssh.sqlite3".to_string(),
-            "--approval-mode".to_string(),
-            "auto".to_string(),
-            "--client-id".to_string(),
-            "codex".to_string(),
-        ])
-        .expect("legacy approval mode should be ignored");
-
-        assert_eq!(options.db_path, PathBuf::from("/tmp/xiic-ssh.sqlite3"));
-        assert_eq!(options.client_id, "codex");
-    }
-
-    #[test]
-    fn legacy_approval_mode_still_requires_its_value() {
-        let result = CliOptions::parse([
-            "--db-path".to_string(),
-            "/tmp/xiic-ssh.sqlite3".to_string(),
-            "--approval-mode".to_string(),
-        ]);
-        let err = match result {
-            Ok(_) => panic!("missing legacy approval mode value should be rejected"),
-            Err(err) => err,
-        };
-
-        assert!(err.to_string().contains("--approval-mode requires a value"));
-    }
 }
