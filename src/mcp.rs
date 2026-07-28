@@ -7,12 +7,13 @@ use serde_json::{Value, json};
 
 use crate::app_core::DesktopCore;
 use crate::approval::LocalApprovalClient;
+use crate::auto_review::{AutoReviewDecision, AutoReviewer};
 use crate::mcp_protocol::{MessageFraming, read_message, write_message};
 use crate::models::{
-    ApprovalOperationMetadata, CloseSessionArgs, CreateSessionResult, DownloadFileArgs,
-    DownloadFileResult, DownloadToLocalArgs, DownloadToLocalResult, ExecuteCommandArgs,
-    ExecuteCommandResult, OperationContext, PendingToolCall, RequestContext, RuleDecision,
-    SudoCommandArgs, ToolCall, UploadFileArgs, UploadFileResult, UploadLocalFileArgs,
+    ApprovalKind, ApprovalOperationMetadata, CloseSessionArgs, CreateSessionResult,
+    DownloadFileArgs, DownloadFileResult, DownloadToLocalArgs, DownloadToLocalResult,
+    ExecuteCommandArgs, ExecuteCommandResult, OperationContext, PendingToolCall, RequestContext,
+    RuleDecision, SudoCommandArgs, ToolCall, UploadFileArgs, UploadFileResult, UploadLocalFileArgs,
     UploadLocalFileResult, WhitelistMode,
 };
 use crate::settings::ApprovalLevel;
@@ -33,6 +34,7 @@ pub struct McpServer {
     client_id: Option<String>,
     checker: WhitelistChecker,
     local_approval: LocalApprovalClient,
+    auto_reviewer: AutoReviewer,
 }
 
 impl McpServer {
@@ -48,6 +50,7 @@ impl McpServer {
             client_id: None,
             checker,
             local_approval: LocalApprovalClient::new(approval_endpoint),
+            auto_reviewer: AutoReviewer::default(),
         }
     }
 
@@ -170,7 +173,103 @@ impl McpServer {
                 write_message(writer, &response, framing)?;
             }
             DispatchResult::NeedsApproval { pending } => {
-                let accepted = self.local_approval.request(&pending.approval)?;
+                let approval_kind = pending.approval_kind;
+
+                if crate::settings::load_settings().approval_level == ApprovalLevel::AutoAgent {
+                    let review_result = (|| -> Result<AutoReviewDecision> {
+                        let api_key = self
+                            .core
+                            .load_auto_review_api_key()?
+                            .context("自动审核 API key 未配置")?;
+                        let review_context = AutoReviewer::context_for(
+                            &self.core,
+                            &pending.tool_call,
+                            &pending.operation,
+                            approval_kind,
+                        )?;
+                        self.auto_reviewer.review(
+                            &crate::settings::load_settings().auto_review,
+                            &api_key,
+                            &review_context,
+                        )
+                    })();
+
+                    match review_result {
+                        Ok(decision) => {
+                            let allowed = decision.is_allowed();
+                            let reason = decision.reason().to_string();
+                            let event = if allowed {
+                                "approval_auto_allowed"
+                            } else {
+                                "approval_auto_denied"
+                            };
+                            if let Err(err) = self.core.log_approval_event(
+                                &pending.context,
+                                &pending.tool_call,
+                                &pending.operation,
+                                approval_kind,
+                                event,
+                                Some(&reason),
+                            ) {
+                                eprintln!("[xiic-ssh-mcp] failed to log automatic review: {err:#}");
+                            }
+
+                            if allowed {
+                                let exec_result =
+                                    self.execute_tool(&pending.context, &pending.tool_call)?;
+                                let response = success_response(pending.id, exec_result);
+                                write_message(writer, &response, framing)?;
+                            } else {
+                                let response = error_response_with_data(
+                                    pending.id,
+                                    -32000,
+                                    format!(
+                                        "operation rejected by automatic security review: {reason}"
+                                    ),
+                                    json!({
+                                        "approval_source": "auto_agent",
+                                        "decision": "deny",
+                                        "reason": reason,
+                                        "approval_kind": approval_kind,
+                                    }),
+                                );
+                                write_message(writer, &response, framing)?;
+                            }
+                        }
+                        Err(err) => {
+                            let message = format!("automatic security review unavailable: {err:#}");
+                            if let Err(log_err) = self.core.log_approval_event(
+                                &pending.context,
+                                &pending.tool_call,
+                                &pending.operation,
+                                approval_kind,
+                                "approval_auto_failed",
+                                Some(&message),
+                            ) {
+                                eprintln!(
+                                    "[xiic-ssh-mcp] failed to log automatic review failure: {log_err:#}"
+                                );
+                            }
+                            let response = error_response_with_data(
+                                pending.id,
+                                -32002,
+                                message.clone(),
+                                json!({
+                                    "approval_source": "auto_agent",
+                                    "decision": "unavailable",
+                                    "reason": message,
+                                    "approval_kind": approval_kind,
+                                }),
+                            );
+                            write_message(writer, &response, framing)?;
+                        }
+                    }
+                    return Ok(());
+                }
+
+                let accepted = self
+                    .local_approval
+                    .request(&pending.approval, approval_kind)?;
 
                 if accepted {
                     self.checker.cache_approval(&pending.operation);
@@ -408,8 +507,11 @@ impl McpServer {
                 );
                 Ok(DispatchResult::Respond(error_response(id, -32001, reason)))
             }
-            RuleDecision::NeedsApproval => {
-                if crate::settings::load_settings().approval_level == ApprovalLevel::AllowAll {
+            RuleDecision::NeedsApproval(approval_kind) => {
+                if should_skip_approval(
+                    approval_kind,
+                    crate::settings::load_settings().approval_level,
+                ) {
                     eprintln!(
                         "[xiic-ssh-mcp] Approval skipped by settings for tool='{}' cmd='{}'",
                         ctx.tool_name,
@@ -425,6 +527,7 @@ impl McpServer {
                     tool_call,
                     operation: ctx,
                     approval,
+                    approval_kind,
                     context: request_context,
                 });
 
@@ -644,6 +747,22 @@ fn error_response(id: Value, code: i64, message: String) -> Value {
     })
 }
 
+fn should_skip_approval(_approval_kind: ApprovalKind, approval_level: ApprovalLevel) -> bool {
+    approval_level == ApprovalLevel::AllowAll
+}
+
+fn error_response_with_data(id: Value, code: i64, message: String, data: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message,
+            "data": data,
+        }
+    })
+}
+
 fn tool_success<T>(payload: T) -> Result<Value>
 where
     T: serde::Serialize,
@@ -705,9 +824,13 @@ mod tests {
     use serde_json::json;
 
     use crate::app_core::DesktopCore;
-    use crate::models::{RequestContext, WhitelistMode};
+    use crate::models::{ApprovalKind, RequestContext, WhitelistMode};
+    use crate::settings::ApprovalLevel;
 
-    use super::{McpServer, MessageFraming, deserialize_args, read_message, write_message};
+    use super::{
+        McpServer, MessageFraming, deserialize_args, read_message, should_skip_approval,
+        write_message,
+    };
 
     fn initialize_payload() -> serde_json::Value {
         json!({
@@ -845,6 +968,22 @@ mod tests {
 
         assert_eq!(args.session_id, "session-1");
         assert_eq!(args.command, "uname -a");
+    }
+
+    #[test]
+    fn allow_all_skips_all_approval_kinds() {
+        assert!(should_skip_approval(
+            ApprovalKind::Normal,
+            ApprovalLevel::AllowAll
+        ));
+        assert!(should_skip_approval(
+            ApprovalKind::HighRisk,
+            ApprovalLevel::AllowAll
+        ));
+        assert!(!should_skip_approval(
+            ApprovalKind::Normal,
+            ApprovalLevel::SystemDialog
+        ));
     }
 
     fn test_server() -> McpServer {

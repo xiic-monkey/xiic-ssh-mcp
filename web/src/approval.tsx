@@ -1,7 +1,18 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Check, Clock3, ShieldAlert, X } from "lucide-react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import {
+  Check,
+  CheckCheck,
+  Clock3,
+  Copy,
+  FileText,
+  Server,
+  ShieldAlert,
+  Terminal,
+  X,
+} from "lucide-react";
 
 type ApprovalOperationMetadata = {
   tool_name: string;
@@ -16,6 +27,7 @@ type ApprovalRequest = {
   kind: string;
   request_id: string;
   message: string;
+  approval_kind?: "normal" | "high_risk";
   metadata: ApprovalOperationMetadata;
 };
 
@@ -30,11 +42,23 @@ type ApprovalResolvedEvent = {
   pending_count: number;
 };
 
+const approvalWindow = isTauri() ? getCurrentWindow() : null;
+
 export default function ApprovalApp() {
   const [activeApproval, setActiveApproval] = useState<ApprovalRequest | null>(null);
   const [pendingApprovalCount, setPendingApprovalCount] = useState(0);
   const [resolvingApproval, setResolvingApproval] = useState(false);
+  const [copiedCommand, setCopiedCommand] = useState(false);
   const [status, setStatus] = useState("等待审批请求…");
+
+  useEffect(() => {
+    if (!approvalWindow) {
+      return;
+    }
+    void approvalWindow.setTitle(
+      activeApproval ? approvalTitle(activeApproval.approval_kind) : "Xiic SSH 审批",
+    );
+  }, [activeApproval?.approval_kind]);
 
   useEffect(() => {
     if (!isTauri()) {
@@ -46,6 +70,7 @@ export default function ApprovalApp() {
         if (current) {
           setActiveApproval(current.request);
           setPendingApprovalCount(current.pending_count);
+          setCopiedCommand(false);
           setStatus("有高危 SSH 操作等待审批。");
         }
       } catch {
@@ -63,6 +88,7 @@ export default function ApprovalApp() {
       const unlistenRequested = await listen<ApprovalRequestedEvent>("approval-requested", (event) => {
         setActiveApproval(event.payload.request);
         setPendingApprovalCount(event.payload.pending_count);
+        setCopiedCommand(false);
         setStatus("有高危 SSH 操作等待审批。");
       });
 
@@ -104,6 +130,16 @@ export default function ApprovalApp() {
     }
   }
 
+  async function copyCommand(command: string) {
+    try {
+      await navigator.clipboard.writeText(command);
+      setCopiedCommand(true);
+      window.setTimeout(() => setCopiedCommand(false), 1600);
+    } catch {
+      setStatus("命令复制失败，请手动选择复制。");
+    }
+  }
+
   return (
     <div className="approval-standalone-shell">
       {activeApproval ? (
@@ -112,23 +148,52 @@ export default function ApprovalApp() {
             <span className="approval-header-icon" aria-hidden="true">
               <ShieldAlert size={18} />
             </span>
-            <div>
-              <h1>操作审批</h1>
-              <p>{pendingApprovalCount > 0 ? `后面还有 ${pendingApprovalCount} 个待审批请求` : "请确认是否执行此操作"}</p>
+            <div className="approval-header-copy">
+              <div className="approval-title-row">
+                <h1>{approvalTitle(activeApproval.approval_kind)}</h1>
+                <span className="approval-risk-badge">
+                  {activeApproval.approval_kind === "high_risk" ? "高危规则" : "需要确认"}
+                </span>
+              </div>
+              <p>{approvalSubtitle(activeApproval.approval_kind, pendingApprovalCount)}</p>
             </div>
           </div>
 
           <div className="approval-panel-summary">
-            <ApprovalField label="工具" value={approvalToolName(activeApproval.metadata.tool_name)} />
-            <ApprovalField label="连接" value={activeApproval.metadata.instance_id ?? "-"} />
+            <div className="approval-context-grid">
+              <ApprovalContextField
+                icon={<Server size={14} />}
+                label="连接"
+                value={activeApproval.metadata.instance_id ?? "-"}
+              />
+              <ApprovalContextField
+                icon={<Terminal size={14} />}
+                label="操作"
+                value={approvalToolName(activeApproval.metadata.tool_name)}
+              />
+            </div>
             {activeApproval.metadata.command ? (
-              <ApprovalCommandField value={activeApproval.metadata.command} />
+              <ApprovalCommandField
+                copied={copiedCommand}
+                onCopy={() => void copyCommand(activeApproval.metadata.command ?? "")}
+                value={activeApproval.metadata.command}
+              />
             ) : null}
             {activeApproval.metadata.local_path ? (
-              <ApprovalField label="本地路径" value={activeApproval.metadata.local_path} mono />
+              <ApprovalField
+                icon={<FileText size={14} />}
+                label="本地路径"
+                mono
+                value={activeApproval.metadata.local_path}
+              />
             ) : null}
             {activeApproval.metadata.remote_path ? (
-              <ApprovalField label="远端路径" value={activeApproval.metadata.remote_path} mono />
+              <ApprovalField
+                icon={<FileText size={14} />}
+                label="远端路径"
+                mono
+                value={activeApproval.metadata.remote_path}
+              />
             ) : null}
             {activeApproval.metadata.overwrite !== null ? (
               <ApprovalField label="覆盖文件" value={activeApproval.metadata.overwrite ? "是" : "否"} />
@@ -137,7 +202,7 @@ export default function ApprovalApp() {
 
           <div className="approval-panel-actions">
             <button
-              className="secondary-button"
+              className="secondary-button approval-deny-button"
               disabled={resolvingApproval}
               onClick={() => void resolveApproval(false)}
               type="button"
@@ -146,7 +211,7 @@ export default function ApprovalApp() {
               拒绝
             </button>
             <button
-              className="primary-button"
+              className="primary-button approval-allow-button"
               disabled={resolvingApproval}
               onClick={() => void resolveApproval(true)}
               type="button"
@@ -173,26 +238,64 @@ function ApprovalField({
   label,
   value,
   mono = false,
+  icon,
 }: {
   label: string;
   value: string;
   mono?: boolean;
+  icon?: ReactNode;
 }) {
   return (
     <div className="approval-field">
-      <span>{label}</span>
+      <span className="approval-field-label">{icon}{label}</span>
       <strong className={mono ? "mono-value" : ""}>{value}</strong>
     </div>
   );
 }
 
-function ApprovalCommandField({ value }: { value: string }) {
+function ApprovalContextField({
+  icon,
+  label,
+  value,
+}: {
+  icon: ReactNode;
+  label: string;
+  value: string;
+}) {
+  return (
+    <div className="approval-context-field">
+      <span>{icon}{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function ApprovalCommandField({
+  copied,
+  onCopy,
+  value,
+}: {
+  copied: boolean;
+  onCopy: () => void;
+  value: string;
+}) {
   const lineCount = Math.max(1, value.split("\n").length);
   const rows = Math.min(lineCount, 6);
 
   return (
     <div className="approval-command-field">
-      <span>命令</span>
+      <div className="approval-command-label">
+        <span>将执行的命令</span>
+        <button
+          aria-label={copied ? "已复制命令" : "复制命令"}
+          className="approval-copy-button"
+          onClick={onCopy}
+          title={copied ? "已复制" : "复制命令"}
+          type="button"
+        >
+          {copied ? <CheckCheck size={14} /> : <Copy size={14} />}
+        </button>
+      </div>
       <div className="approval-command-shell">
         <textarea
           className="approval-command-code"
@@ -228,6 +331,24 @@ function approvalToolName(toolName: string): string {
     default:
       return toolName;
   }
+}
+
+function approvalTitle(kind: ApprovalRequest["approval_kind"]): string {
+  return kind === "high_risk" ? "高危操作" : "操作审批";
+}
+
+function approvalSubtitle(
+  kind: ApprovalRequest["approval_kind"],
+  pendingCount: number,
+): string {
+  if (kind === "high_risk") {
+    return pendingCount > 0
+      ? `当前请求处理后还有 ${pendingCount} 个待审批`
+      : "请核对目标和操作内容";
+  }
+  return pendingCount > 0
+    ? `后面还有 ${pendingCount} 个待审批请求`
+    : "请确认是否执行此操作";
 }
 
 function asMessage(error: unknown): string {

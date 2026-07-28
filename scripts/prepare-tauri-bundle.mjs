@@ -103,6 +103,8 @@ run(cargoCmd, [
   "--manifest-path",
   "approval-tauri/Cargo.toml",
   "--release",
+  "--features",
+  "tauri/custom-protocol",
   ...(targetTriple ? ["--target", targetTriple] : []),
 ]);
 

@@ -55,15 +55,21 @@ Xiic SSH MCP 是一个本地 MCP 服务器，为 Cursor、Claude Desktop 等 AI 
 
 ## 安全机制
 
-### 白名单
+### 全局访问规则
 
-白名单按四个维度匹配操作：**工具名**、**命令**、**路径**、**实例**。支持 glob 模式。
+规则在桌面应用的「设置 → 全局规则」中管理，对所有 SSH 连接生效。按实例限制时，使用「实例」维度匹配 `instance_id`。
 
-- 所有维度都被 Allow 规则覆盖 → 直接放行
-- 命中 Deny 规则 → 直接拒绝
-- 部分维度未覆盖 → 进入审批流程
+规则按四个维度匹配操作：**工具名**、**命令**、**路径**、**实例**。匹配语法是完整字符串 glob：`*` 匹配任意长度，`?` 匹配一个字符，区分大小写，不使用正则。例如：`ls *`、`/srv/reports/*`、`prod-*`。
 
-`execute_command` 的命令白名单会先按未引用、未转义的 shell 连接符（`;`、`&`、`&&`、`||`、`|`、换行）分段，再匹配 command 规则。每一段都命中 Allow 时才会自动放行；任一段命中 Deny 则直接拒绝；任一段未命中 Allow 则进入审批。引号和反斜杠转义内的连接符不会触发分段。命令替换、反引号、子 shell/group、重定向、here-doc 等复杂 shell 语法默认进入审批。
+每条规则有三种处理方式：
+
+- **允许访问**：白名单。严格模式下，操作中出现的每个维度都被 Allow 规则覆盖后才会自动放行。
+- **要求审核**：命中后必须经过审核；`sudo` 操作为高风险，其他工具为普通风险。
+- **禁止访问**：黑名单。命中后直接拒绝，不弹窗。
+
+优先级为：禁止访问 > 要求审核 > 允许访问 > 普通审批。规则支持新增、编辑、启停和删除，修改后无需重启 MCP 即时生效。
+
+`execute_command` 的命令规则会先按未引用、未转义的 shell 连接符（`;`、`&`、`&&`、`||`、`|`、换行）分段，再匹配 command 规则。每一段都命中 Allow 时才会自动放行；任一段命中 Deny 则直接拒绝；任一段命中要求审核规则则进入审核；任一段未命中 Allow 则进入普通审批。引号和反斜杠转义内的连接符不会触发分段。命令替换、反引号、子 shell/group、重定向、here-doc 等复杂 shell 语法默认进入审批。
 
 ### 审批
 
@@ -71,9 +77,12 @@ Xiic SSH MCP 是一个本地 MCP 服务器，为 Cursor、Claude Desktop 等 AI 
 
 - **系统弹窗审核**：使用系统原生对话框确认操作
 - **App 弹窗审核**：使用 Xiic 独立审批窗口确认操作
-- **完全允许访问**：跳过审核，未被 Deny 规则拦截的操作会直接执行
+- **完全允许访问**：跳过所有 NeedsApproval；禁止规则仍然有效
+- **大模型自动审核**：将 Normal 和 HighRisk 两类待审核操作交给配置的 OpenAI 兼容接口，模型拒绝或服务异常都会失败关闭。
 
 审核等级在桌面应用的「设置 → 安全」中调整。旧版 `use_system_approval` 配置会自动迁移：开启对应「系统弹窗审核」，关闭对应「App 弹窗审核」。
+
+大模型审核配置包括 Base URL、模型名称和 API key。API key 只写入加密的 `app_secrets` 表；模型会收到工具参数（本地会话 ID 等凭据会脱敏）、解析后的命令/路径、风险等级和目标连接的实例 ID、名称、主机、端口、用户名，不会收到 SSH 凭据、命令输出、连接备注或其他客户端信息。
 
 ### 凭据存储
 
@@ -124,11 +133,7 @@ curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh | ba
   "mcpServers": {
     "xiic-ssh": {
       "command": "/path/to/xiic-ssh-mcp",
-      "args": [
-        "--db-path", "~/Library/Application Support/com.xiic.sshmanager/instances.sqlite3",
-        "--notify-socket", "~/Library/Application Support/com.xiic.sshmanager/notify.sock",
-        "--approval-endpoint", "~/Library/Application Support/com.xiic.sshmanager/approval.sock"
-      ],
+      "args": [],
       "env": {
         "SSH_ASKPASS_REQUIRE": "never"
       }
@@ -141,11 +146,11 @@ curl -fsSL https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh | ba
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `--db-path <path>` | SQLite 数据库路径 | 必选 |
+| `--db-path <path>` | SQLite 数据库路径 | 可选，默认使用共享应用数据目录 |
 | `--keyring-service <name>` | 已废弃；为兼容旧配置保留且会被忽略 | 无 |
-| `--notify-socket <path>` | 日志通知 IPC 端点 | 无 |
+| `--notify-socket <path>` | 日志通知 IPC 端点 | 无，一般无需手填 |
 | `--whitelist <strict\|off>` | 白名单模式 | `strict` |
-| `--approval-endpoint <path>` | 审批 IPC 端点 | 无 |
+| `--approval-endpoint <path>` | 审批 IPC 端点 | 无，一般无需手填 |
 
 ## 开发
 

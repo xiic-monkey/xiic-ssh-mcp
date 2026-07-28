@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use crate::local_ipc::{approval_server_healthy, send_request};
 use crate::models::{
-    ApprovalOperationMetadata, ApprovalRequest, ApprovalRequestedEvent, ApprovalResolvedEvent,
-    ApprovalResponse,
+    ApprovalKind, ApprovalOperationMetadata, ApprovalRequest, ApprovalRequestedEvent,
+    ApprovalResolvedEvent, ApprovalResponse,
 };
 use crate::settings::{ApprovalLevel, load_settings};
 
@@ -43,11 +43,16 @@ impl LocalApprovalClient {
         Self { approval_endpoint }
     }
 
-    pub fn request(&self, metadata: &ApprovalOperationMetadata) -> Result<bool> {
+    pub fn request(
+        &self,
+        metadata: &ApprovalOperationMetadata,
+        approval_kind: ApprovalKind,
+    ) -> Result<bool> {
         let request = ApprovalRequest {
             kind: "approval_request".to_string(),
             request_id: Uuid::new_v4().to_string(),
             message: approval_message(metadata),
+            approval_kind,
             metadata: metadata.clone(),
         };
 
@@ -199,6 +204,13 @@ pub fn approval_message(metadata: &ApprovalOperationMetadata) -> String {
             metadata.command.as_deref().unwrap_or("-"),
         ),
         _ => format!("是否允许执行 SSH 操作 '{}'？", metadata.tool_name),
+    }
+}
+
+pub fn approval_title(approval_kind: ApprovalKind) -> &'static str {
+    match approval_kind {
+        ApprovalKind::Normal => "Xiic SSH 审批",
+        ApprovalKind::HighRisk => "高危操作",
     }
 }
 
@@ -541,9 +553,10 @@ fn launch_desktop_app() -> Result<()> {
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
     let approval_app = resolve_approval_binary(&current_exe)
         .ok_or_else(|| anyhow!("xiic-ssh-approval binary was not found"))?;
+    let requires_dev_server = binary_requires_dev_server(&approval_app);
 
     // 如果是 debug 构建且 Vite 开发服务器未运行，自动启动它
-    if binary_requires_dev_server(&approval_app) && !approval_dev_server_is_ready() {
+    if requires_dev_server && !approval_dev_server_is_ready() {
         eprintln!("[xiic-ssh-mcp] 正在启动 Vite 开发服务器 (port 1430)...");
         let repo_root = current_exe
             .ancestors()
@@ -576,8 +589,11 @@ fn launch_desktop_app() -> Result<()> {
         }
     }
 
-    Command::new(approval_app)
-        .env("TAURI_DEV", "1")
+    let mut command = Command::new(approval_app);
+    if requires_dev_server {
+        command.env("TAURI_DEV", "1");
+    }
+    command
         .spawn()
         .context("failed to launch xiic-ssh-approval")?;
     Ok(())
@@ -638,8 +654,9 @@ fn approval_dev_server_is_ready() -> bool {
 #[cfg(target_os = "macos")]
 fn request_via_native_dialog(request: &ApprovalRequest) -> Result<bool> {
     let script = format!(
-        "display dialog {} buttons {{\"拒绝\", \"允许执行\"}} default button \"允许执行\" cancel button \"拒绝\" with title \"Xiic SSH 审批\" with icon caution",
-        osascript_string(&request.message)
+        "display dialog {} buttons {{\"拒绝\", \"允许执行\"}} default button \"允许执行\" cancel button \"拒绝\" with title {} with icon caution",
+        osascript_string(&request.message),
+        osascript_string(approval_title(request.approval_kind))
     );
     let output = Command::new("osascript")
         .args(["-e", &script])
@@ -667,8 +684,9 @@ fn request_via_native_dialog(request: &ApprovalRequest) -> Result<bool> {
 #[cfg(target_os = "windows")]
 fn request_via_native_dialog(request: &ApprovalRequest) -> Result<bool> {
     let script = format!(
-        "Add-Type -AssemblyName PresentationFramework; $r=[System.Windows.MessageBox]::Show({}, 'Xiic SSH 审批', 'YesNo', 'Warning', 'Yes', 'ServiceNotification'); if ($r -eq 'Yes') {{ exit 0 }} else {{ exit 1 }}",
-        powershell_string(&request.message)
+        "Add-Type -AssemblyName PresentationFramework; $r=[System.Windows.MessageBox]::Show({}, {}, 'YesNo', 'Warning', 'Yes', 'ServiceNotification'); if ($r -eq 'Yes') {{ exit 0 }} else {{ exit 1 }}",
+        powershell_string(&request.message),
+        powershell_string(approval_title(request.approval_kind))
     );
     let status = Command::new("powershell")
         .args(["-NoProfile", "-Command", &script])
@@ -687,7 +705,7 @@ fn request_via_native_dialog(request: &ApprovalRequest) -> Result<bool> {
             .args([
                 "--question",
                 "--title",
-                "Xiic SSH 审批",
+                approval_title(request.approval_kind),
                 "--text",
                 &request.message,
             ])
@@ -701,7 +719,12 @@ fn request_via_native_dialog(request: &ApprovalRequest) -> Result<bool> {
 
     if command_exists("kdialog") {
         let status = Command::new("kdialog")
-            .args(["--title", "Xiic SSH 审批", "--yesno", &request.message])
+            .args([
+                "--title",
+                approval_title(request.approval_kind),
+                "--yesno",
+                &request.message,
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -742,9 +765,57 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::mpsc;
 
+    use serde_json::json;
+
     use crate::models::{ApprovalOperationMetadata, ApprovalRequest};
 
-    use super::{ApprovalQueue, approval_message, resolve_approval_binary};
+    use super::{
+        ApprovalQueue, approval_message, approval_title, binary_requires_dev_server,
+        resolve_approval_binary,
+    };
+
+    #[test]
+    fn only_debug_approval_helpers_use_the_vite_dev_server() {
+        assert!(binary_requires_dev_server(&PathBuf::from(
+            "/tmp/approval-tauri/target/debug/xiic-ssh-approval"
+        )));
+        assert!(!binary_requires_dev_server(&PathBuf::from(
+            "/Applications/Xiic SSH Manager.app/Contents/Resources/binaries/xiic-ssh-approval"
+        )));
+    }
+
+    #[test]
+    fn high_risk_approval_uses_dedicated_title() {
+        assert_eq!(
+            approval_title(crate::models::ApprovalKind::HighRisk),
+            "高危操作"
+        );
+        assert_eq!(
+            approval_title(crate::models::ApprovalKind::Normal),
+            "Xiic SSH 审批"
+        );
+    }
+
+    #[test]
+    fn approval_kind_serializes_and_legacy_requests_default_to_normal() {
+        let normal = request("normal");
+        let encoded = serde_json::to_value(&normal).expect("approval request should serialize");
+        assert_eq!(encoded["approval_kind"], "normal");
+
+        let legacy: ApprovalRequest = serde_json::from_value(json!({
+            "kind": "approval_request",
+            "request_id": "legacy",
+            "message": "demo",
+            "metadata": encoded["metadata"].clone(),
+        }))
+        .expect("legacy approval request should deserialize");
+        assert_eq!(legacy.approval_kind, crate::models::ApprovalKind::Normal);
+
+        let mut high_risk = normal;
+        high_risk.approval_kind = crate::models::ApprovalKind::HighRisk;
+        let encoded = serde_json::to_value(high_risk).expect("high-risk request should serialize");
+        assert_eq!(encoded["approval_kind"], "high_risk");
+    }
 
     #[test]
     fn formats_command_approval_message() {
@@ -878,6 +949,7 @@ mod tests {
             kind: "approval_request".into(),
             request_id: id.into(),
             message: "demo".into(),
+            approval_kind: crate::models::ApprovalKind::Normal,
             metadata: ApprovalOperationMetadata {
                 tool_name: "execute_command".into(),
                 command: Some("echo hello".into()),

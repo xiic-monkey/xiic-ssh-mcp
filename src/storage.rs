@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::models::{
     AuthKind, InstanceDraft, OperationLogEntry, RuleAction, RuleType, SecretPayload,
@@ -126,7 +126,8 @@ impl InstanceStore {
     }
 
     fn init_schema(&self) -> Result<()> {
-        let connection = self.open()?;
+        let mut connection = self.open()?;
+        let whitelist_rules_existed = table_exists(&connection, "whitelist_rules")?;
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS instances (
                 instance_id TEXT PRIMARY KEY,
@@ -166,14 +167,26 @@ impl InstanceStore {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 rule_type TEXT NOT NULL CHECK(rule_type IN ('tool','command','path','instance')),
                 pattern TEXT NOT NULL,
-                action TEXT NOT NULL CHECK(action IN ('allow','deny')),
+                action TEXT NOT NULL CHECK(action IN ('allow','deny','require_approval')),
                 enabled INTEGER NOT NULL DEFAULT 1,
+                is_builtin INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
-            );
-
-            INSERT OR IGNORE INTO whitelist_rules (rule_type, pattern, action, created_at)
-            VALUES ('tool', 'list_servers', 'allow', datetime('now'));",
+            );",
         )?;
+
+        if whitelist_rules_existed && !whitelist_rules_supports_approval(&connection)? {
+            migrate_whitelist_rules_table(&mut connection)?;
+        }
+        ensure_whitelist_rules_column(&connection, "is_builtin")?;
+        normalize_builtin_whitelist_rules(&connection)?;
+        if !whitelist_rules_existed {
+            connection.execute(
+                "INSERT INTO whitelist_rules (rule_type, pattern, action, enabled, is_builtin, created_at)
+                 VALUES ('tool', 'list_servers', 'allow', 1, 1, datetime('now'))",
+                [],
+            )?;
+        }
+
         ensure_operation_logs_column(&connection, "client_id")?;
         ensure_operation_logs_column(&connection, "client_session_id")?;
         connection.execute(
@@ -342,7 +355,7 @@ impl InstanceStore {
     pub fn list_whitelist_rules(&self) -> Result<Vec<WhitelistRule>> {
         let connection = self.open()?;
         let mut statement = connection.prepare(
-            "SELECT id, rule_type, pattern, action, enabled, created_at
+            "SELECT id, rule_type, pattern, action, enabled, is_builtin, created_at
              FROM whitelist_rules
              ORDER BY id ASC",
         )?;
@@ -356,7 +369,8 @@ impl InstanceStore {
                 action: RuleAction::from_db_value(row.get::<_, String>(3)?.as_str())
                     .unwrap_or(RuleAction::Deny),
                 enabled: row.get::<_, i64>(4)? != 0,
-                created_at: row.get(5)?,
+                is_builtin: row.get::<_, i64>(5)? != 0,
+                created_at: row.get(6)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -367,7 +381,7 @@ impl InstanceStore {
         let connection = self.open()?;
         let type_str = rule_type.as_str();
         let mut statement = connection.prepare(
-            "SELECT id, rule_type, pattern, action, enabled, created_at
+            "SELECT id, rule_type, pattern, action, enabled, is_builtin, created_at
              FROM whitelist_rules
              WHERE rule_type = ?1 AND enabled = 1
              ORDER BY id ASC",
@@ -382,7 +396,8 @@ impl InstanceStore {
                 action: RuleAction::from_db_value(row.get::<_, String>(3)?.as_str())
                     .unwrap_or(RuleAction::Deny),
                 enabled: true,
-                created_at: row.get(5)?,
+                is_builtin: row.get::<_, i64>(5)? != 0,
+                created_at: row.get(6)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -396,14 +411,48 @@ impl InstanceStore {
         action: &RuleAction,
     ) -> Result<i64> {
         let connection = self.open()?;
+        let pattern = normalize_rule_pattern(pattern)?;
         let now = Utc::now().to_rfc3339();
         connection.execute(
-            "INSERT INTO whitelist_rules (rule_type, pattern, action, enabled, created_at)
-             VALUES (?1, ?2, ?3, 1, ?4)",
+            "INSERT INTO whitelist_rules (rule_type, pattern, action, enabled, is_builtin, created_at)
+             VALUES (?1, ?2, ?3, 1, 0, ?4)",
             params![rule_type.as_str(), pattern, action.as_str(), now],
         )?;
 
         Ok(connection.last_insert_rowid())
+    }
+
+    pub fn update_whitelist_rule(
+        &self,
+        id: i64,
+        rule_type: &RuleType,
+        pattern: &str,
+        action: &RuleAction,
+    ) -> Result<()> {
+        let connection = self.open()?;
+        let pattern = normalize_rule_pattern(pattern)?;
+        let affected = connection.execute(
+            "UPDATE whitelist_rules
+             SET rule_type = ?1, pattern = ?2, action = ?3, is_builtin = 0
+             WHERE id = ?4",
+            params![rule_type.as_str(), pattern, action.as_str(), id],
+        )?;
+        if affected == 0 {
+            bail!("whitelist rule with id {} not found", id);
+        }
+        Ok(())
+    }
+
+    pub fn set_whitelist_rule_enabled(&self, id: i64, enabled: bool) -> Result<()> {
+        let connection = self.open()?;
+        let affected = connection.execute(
+            "UPDATE whitelist_rules SET enabled = ?1 WHERE id = ?2",
+            params![if enabled { 1 } else { 0 }, id],
+        )?;
+        if affected == 0 {
+            bail!("whitelist rule with id {} not found", id);
+        }
+        Ok(())
     }
 
     pub fn remove_whitelist_rule(&self, id: i64) -> Result<()> {
@@ -487,6 +536,112 @@ fn ensure_operation_logs_column(connection: &Connection, column_name: &str) -> R
     Ok(())
 }
 
+fn table_exists(connection: &Connection, table_name: &str) -> Result<bool> {
+    let exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table_name],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(exists)
+}
+
+fn whitelist_rules_supports_approval(connection: &Connection) -> Result<bool> {
+    let sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'whitelist_rules'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(sql
+        .map(|value| value.contains("require_approval"))
+        .unwrap_or(false))
+}
+
+fn migrate_whitelist_rules_table(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "ALTER TABLE whitelist_rules RENAME TO whitelist_rules_legacy;
+         CREATE TABLE whitelist_rules (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             rule_type TEXT NOT NULL CHECK(rule_type IN ('tool','command','path','instance')),
+             pattern TEXT NOT NULL,
+             action TEXT NOT NULL CHECK(action IN ('allow','deny','require_approval')),
+             enabled INTEGER NOT NULL DEFAULT 1,
+             is_builtin INTEGER NOT NULL DEFAULT 0,
+             created_at TEXT NOT NULL
+         );
+         INSERT INTO whitelist_rules (id, rule_type, pattern, action, enabled, is_builtin, created_at)
+         SELECT id, rule_type, pattern, action, enabled,
+                CASE WHEN rule_type = 'tool' AND pattern = 'list_servers' AND action = 'allow' THEN 1 ELSE 0 END,
+                created_at
+         FROM whitelist_rules_legacy;
+         DROP TABLE whitelist_rules_legacy;",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn ensure_whitelist_rules_column(connection: &Connection, column_name: &str) -> Result<()> {
+    if whitelist_rules_column_exists(connection, column_name)? {
+        return Ok(());
+    }
+
+    let sql =
+        format!("ALTER TABLE whitelist_rules ADD COLUMN {column_name} INTEGER NOT NULL DEFAULT 0");
+    connection
+        .execute(&sql, [])
+        .with_context(|| format!("failed to add '{column_name}' column to whitelist_rules"))?;
+    Ok(())
+}
+
+fn whitelist_rules_column_exists(connection: &Connection, column_name: &str) -> Result<bool> {
+    let mut statement = connection.prepare("PRAGMA table_info(whitelist_rules)")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for column in rows {
+        if column? == column_name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn normalize_builtin_whitelist_rules(connection: &Connection) -> Result<()> {
+    connection.execute(
+        "DELETE FROM whitelist_rules
+         WHERE rule_type = 'tool'
+           AND pattern = 'list_servers'
+           AND action = 'allow'
+           AND id NOT IN (
+               SELECT MIN(id)
+               FROM whitelist_rules
+               WHERE rule_type = 'tool' AND pattern = 'list_servers' AND action = 'allow'
+           )",
+        [],
+    )?;
+    connection.execute(
+        "UPDATE whitelist_rules
+         SET is_builtin = 1
+         WHERE rule_type = 'tool' AND pattern = 'list_servers' AND action = 'allow'",
+        [],
+    )?;
+    Ok(())
+}
+
+fn normalize_rule_pattern(pattern: &str) -> Result<String> {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        bail!("whitelist rule pattern cannot be empty");
+    }
+    if pattern.contains('\0') {
+        bail!("whitelist rule pattern cannot contain NUL characters");
+    }
+    Ok(pattern.to_string())
+}
+
 fn operation_logs_column_exists(connection: &Connection, column_name: &str) -> Result<bool> {
     let mut statement = connection.prepare("PRAGMA table_info(operation_logs)")?;
     let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
@@ -511,8 +666,8 @@ mod tests {
 
     use rusqlite::Connection;
 
-    use super::InstanceStore;
-    use crate::models::{AuthKind, InstanceDraft, SecretPayload};
+    use super::{InstanceStore, normalize_rule_pattern};
+    use crate::models::{AuthKind, InstanceDraft, RuleAction, RuleType, SecretPayload};
     use uuid::Uuid;
 
     #[cfg(unix)]
@@ -630,5 +785,98 @@ mod tests {
         assert!(columns.contains(&"client_session_id".to_string()));
 
         std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn whitelist_rules_support_crud_and_deleted_default_is_not_reseeded() {
+        let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-storage-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).expect("test dir should be created");
+        let db_path = test_dir.join("instances.sqlite3");
+
+        let store = InstanceStore::new(db_path.clone()).expect("store should initialize");
+        let defaults = store
+            .list_whitelist_rules()
+            .expect("rules should list after initialization");
+        assert_eq!(defaults.len(), 1);
+        assert!(defaults[0].is_builtin);
+        store
+            .remove_whitelist_rule(defaults[0].id)
+            .expect("default rule should be removable");
+        drop(store);
+
+        let store = InstanceStore::new(db_path.clone()).expect("store should reopen");
+        assert!(
+            store
+                .list_whitelist_rules()
+                .expect("rules should list after reopen")
+                .is_empty()
+        );
+
+        let rule_id = store
+            .add_whitelist_rule(&RuleType::Command, "rm *", &RuleAction::RequireApproval)
+            .expect("rule should be added");
+        let rules = store
+            .list_whitelist_rules()
+            .expect("added rule should list");
+        assert_eq!(rules[0].action, RuleAction::RequireApproval);
+        assert!(!rules[0].is_builtin);
+
+        store
+            .update_whitelist_rule(rule_id, &RuleType::Command, "sudo *", &RuleAction::Deny)
+            .expect("rule should update");
+        store
+            .set_whitelist_rule_enabled(rule_id, false)
+            .expect("rule should toggle");
+        let updated = store
+            .list_whitelist_rules()
+            .expect("updated rule should list");
+        assert_eq!(updated[0].pattern, "sudo *");
+        assert_eq!(updated[0].action, RuleAction::Deny);
+        assert!(!updated[0].enabled);
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn whitelist_rules_migrate_old_action_constraint() {
+        let test_dir = env::temp_dir().join(format!("xiic-ssh-mcp-storage-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).expect("test dir should be created");
+        let db_path = test_dir.join("instances.sqlite3");
+
+        let connection = Connection::open(&db_path).expect("legacy db should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE whitelist_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    rule_type TEXT NOT NULL CHECK(rule_type IN ('tool','command','path','instance')),
+                    pattern TEXT NOT NULL,
+                    action TEXT NOT NULL CHECK(action IN ('allow','deny')),
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO whitelist_rules (rule_type, pattern, action, created_at)
+                VALUES ('tool', 'list_servers', 'allow', datetime('now'));",
+            )
+            .expect("legacy whitelist table should be created");
+        drop(connection);
+
+        let store = InstanceStore::new(db_path.clone()).expect("legacy rules should migrate");
+        let rules = store
+            .list_whitelist_rules()
+            .expect("migrated rules should list");
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].is_builtin);
+        store
+            .add_whitelist_rule(&RuleType::Tool, "sudo", &RuleAction::RequireApproval)
+            .expect("migrated table should accept high-risk rules");
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn whitelist_rule_pattern_rejects_empty_values() {
+        assert!(normalize_rule_pattern(" ").is_err());
+        assert!(normalize_rule_pattern("\0").is_err());
+        assert_eq!(normalize_rule_pattern(" rm * ").unwrap(), "rm *");
     }
 }

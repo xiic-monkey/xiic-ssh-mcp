@@ -14,7 +14,11 @@ use xiic_ssh_mcp::local_ipc::{
 };
 use xiic_ssh_mcp::models::{
     InstanceDraft, InstanceSummary, McpConfigBundle, McpConfigRequest, OperationLogEntry,
-    TestConnectionResult,
+    RuleAction, RuleType, TestConnectionResult, WhitelistRule,
+};
+use xiic_ssh_mcp::settings::{
+    AppSettingsView, SaveSettingsRequest, ApprovalLevel, load_settings,
+    save_settings as persist_settings, validate_auto_review_settings,
 };
 use xiic_ssh_mcp::paths::{ensure_private_dir, ensure_private_file, shared_app_data_dir};
 use xiic_ssh_mcp::single_instance::SingleInstanceGuard;
@@ -108,13 +112,145 @@ fn get_mcp_configs(state: State<'_, DesktopState>) -> Result<McpConfigBundle, St
 }
 
 #[tauri::command]
-fn get_settings() -> Result<xiic_ssh_mcp::settings::AppSettings, String> {
-    Ok(xiic_ssh_mcp::settings::load_settings())
+fn get_settings(state: State<'_, DesktopState>) -> Result<AppSettingsView, String> {
+    let settings = load_settings();
+    let api_key_configured = state
+        .core
+        .has_auto_review_api_key()
+        .map_err(|err| err.to_string())?;
+    Ok(AppSettingsView::from_settings(settings, api_key_configured))
 }
 
 #[tauri::command]
-fn save_settings(settings: xiic_ssh_mcp::settings::AppSettings) -> Result<(), String> {
-    xiic_ssh_mcp::settings::save_settings(&settings).map_err(|err| err.to_string())
+fn save_settings(
+    state: State<'_, DesktopState>,
+    request: SaveSettingsRequest,
+) -> Result<AppSettingsView, String> {
+    let previous_key = state
+        .core
+        .load_auto_review_api_key()
+        .map_err(|err| err.to_string())?;
+    let effective_key = if request.clear_api_key {
+        None
+    } else {
+        request
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or(previous_key.clone())
+    };
+
+    let mut settings = request.settings;
+    if settings.approval_level == ApprovalLevel::AutoAgent {
+        settings.auto_review = validate_auto_review_settings(&settings.auto_review)
+            .map_err(|err| err.to_string())?;
+        if effective_key.is_none() {
+            return Err("启用大模型自动审核前必须配置 API key".to_string());
+        }
+    } else if !settings.auto_review.base_url.trim().is_empty()
+        || !settings.auto_review.model.trim().is_empty()
+    {
+        settings.auto_review = validate_auto_review_settings(&settings.auto_review)
+            .map_err(|err| err.to_string())?;
+    }
+
+    let secret_changed = request.clear_api_key
+        || request
+            .api_key
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+    if request.clear_api_key {
+        state
+            .core
+            .delete_auto_review_api_key()
+            .map_err(|err| err.to_string())?;
+    } else if let Some(api_key) = request
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        state
+            .core
+            .save_auto_review_api_key(api_key)
+            .map_err(|err| err.to_string())?;
+    }
+
+    if let Err(err) = persist_settings(&settings) {
+        if secret_changed {
+            match previous_key {
+                Some(key) => {
+                    let _ = state.core.save_auto_review_api_key(&key);
+                }
+                None => {
+                    let _ = state.core.delete_auto_review_api_key();
+                }
+            }
+        }
+        return Err(err.to_string());
+    }
+
+    Ok(AppSettingsView::from_settings(
+        settings,
+        effective_key.is_some(),
+    ))
+}
+
+#[tauri::command]
+fn list_whitelist_rules(state: State<'_, DesktopState>) -> Result<Vec<WhitelistRule>, String> {
+    state
+        .core
+        .list_whitelist_rules()
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn add_whitelist_rule(
+    state: State<'_, DesktopState>,
+    rule_type: RuleType,
+    pattern: String,
+    action: RuleAction,
+) -> Result<i64, String> {
+    state
+        .core
+        .add_whitelist_rule(&rule_type, &pattern, &action)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn update_whitelist_rule(
+    state: State<'_, DesktopState>,
+    id: i64,
+    rule_type: RuleType,
+    pattern: String,
+    action: RuleAction,
+) -> Result<(), String> {
+    state
+        .core
+        .update_whitelist_rule(id, &rule_type, &pattern, &action)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn set_whitelist_rule_enabled(
+    state: State<'_, DesktopState>,
+    id: i64,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .core
+        .set_whitelist_rule_enabled(id, enabled)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn remove_whitelist_rule(state: State<'_, DesktopState>, id: i64) -> Result<(), String> {
+    state
+        .core
+        .remove_whitelist_rule(id)
+        .map_err(|err| err.to_string())
 }
 
 /// 重启 MCP 服务器：杀死残留进程 + 清理 stale socket 文件。
@@ -237,6 +373,11 @@ fn main() {
             get_mcp_configs,
             get_settings,
             save_settings,
+            list_whitelist_rules,
+            add_whitelist_rule,
+            update_whitelist_rule,
+            set_whitelist_rule_enabled,
+            remove_whitelist_rule,
             restart_mcp
         ])
         .build(tauri::generate_context!())

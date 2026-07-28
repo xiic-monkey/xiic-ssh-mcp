@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
@@ -17,12 +17,14 @@ import {
   LoaderCircle,
   LockKeyhole,
   Plus,
+  Pencil,
   RefreshCw,
   RotateCcw,
   Save,
   Search,
   Server,
   Settings,
+  ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
   SquareTerminal,
@@ -92,9 +94,34 @@ type OperationLogEntry = {
 
 type AppSettings = {
   approval_level: ApprovalLevel;
+  auto_review: {
+    base_url: string;
+    model: string;
+  };
+  api_key_configured: boolean;
 };
 
-type ApprovalLevel = "system_dialog" | "app_dialog" | "allow_all";
+type ApprovalLevel = "system_dialog" | "app_dialog" | "allow_all" | "auto_agent";
+
+type RuleType = "tool" | "command" | "path" | "instance";
+
+type RuleAction = "allow" | "deny" | "require_approval";
+
+type WhitelistRule = {
+  id: number;
+  rule_type: RuleType;
+  pattern: string;
+  action: RuleAction;
+  enabled: boolean;
+  is_builtin: boolean;
+  created_at: string;
+};
+
+type WhitelistRuleInput = {
+  rule_type: RuleType;
+  pattern: string;
+  action: RuleAction;
+};
 
 type ParsedTarget = {
   host: string;
@@ -174,6 +201,8 @@ export default function App() {
   const [lastLogId, setLastLogId] = useState(0);
   const [showSettings, setShowSettings] = useState(false);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
+  const [whitelistRules, setWhitelistRules] = useState<WhitelistRule[]>([]);
+  const [loadingWhitelistRules, setLoadingWhitelistRules] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
   const [restartingMcp, setRestartingMcp] = useState(false);
   const [restartResult, setRestartResult] = useState<{ kind: "success" | "error"; message: string } | null>(null);
@@ -447,11 +476,18 @@ export default function App() {
   }
 
   async function loadSettings() {
+    setLoadingWhitelistRules(true);
     try {
-      const settings = await invoke<AppSettings>("get_settings");
+      const [settings, rules] = await Promise.all([
+        invoke<AppSettings>("get_settings"),
+        invoke<WhitelistRule[]>("list_whitelist_rules"),
+      ]);
       setAppSettings(settings);
+      setWhitelistRules(rules);
     } catch {
       // ignore loading failure
+    } finally {
+      setLoadingWhitelistRules(false);
     }
   }
 
@@ -465,9 +501,109 @@ export default function App() {
       approval_level: approvalLevel,
     };
     try {
-      await invoke("save_settings", { settings: newSettings });
-      setAppSettings(newSettings);
+      const saved = await invoke<AppSettings>("save_settings", {
+        request: {
+          settings: newSettings,
+          api_key: null,
+          clear_api_key: false,
+        },
+      });
+      setAppSettings(saved);
       setStatus("审核等级已更新。");
+      setStatusTone("success");
+    } catch (error) {
+      setStatus(asMessage(error));
+      setStatusTone("danger");
+    } finally {
+      setSavingSettings(false);
+    }
+  }
+
+  async function handleSaveAutoReviewSettings(
+    autoReview: { base_url: string; model: string },
+    apiKey: string,
+    clearApiKey: boolean,
+  ) {
+    if (!appSettings) {
+      return;
+    }
+    setSavingSettings(true);
+    try {
+      const saved = await invoke<AppSettings>("save_settings", {
+        request: {
+          settings: {
+            ...appSettings,
+            auto_review: autoReview,
+          },
+          api_key: apiKey.trim() || null,
+          clear_api_key: clearApiKey,
+        },
+      });
+      setAppSettings(saved);
+      setStatus("大模型审核配置已保存。");
+      setStatusTone("success");
+    } catch (error) {
+      setStatus(asMessage(error));
+      setStatusTone("danger");
+      throw error;
+    } finally {
+      setSavingSettings(false);
+    }
+  }
+
+  async function handleSaveWhitelistRule(
+    id: number | null,
+    input: WhitelistRuleInput,
+  ) {
+    setSavingSettings(true);
+    try {
+      if (id === null) {
+        await invoke("add_whitelist_rule", {
+          ruleType: input.rule_type,
+          pattern: input.pattern,
+          action: input.action,
+        });
+      } else {
+        await invoke("update_whitelist_rule", {
+          id,
+          ruleType: input.rule_type,
+          pattern: input.pattern,
+          action: input.action,
+        });
+      }
+      await loadSettings();
+      setStatus(id === null ? "规则已添加。" : "规则已更新。重新匹配时立即生效。");
+      setStatusTone("success");
+    } catch (error) {
+      setStatus(asMessage(error));
+      setStatusTone("danger");
+      throw error;
+    } finally {
+      setSavingSettings(false);
+    }
+  }
+
+  async function handleToggleWhitelistRule(id: number, enabled: boolean) {
+    setSavingSettings(true);
+    try {
+      await invoke("set_whitelist_rule_enabled", { id, enabled });
+      await loadSettings();
+      setStatus(enabled ? "规则已启用。" : "规则已停用。重新匹配时立即生效。");
+      setStatusTone("success");
+    } catch (error) {
+      setStatus(asMessage(error));
+      setStatusTone("danger");
+    } finally {
+      setSavingSettings(false);
+    }
+  }
+
+  async function handleRemoveWhitelistRule(id: number) {
+    setSavingSettings(true);
+    try {
+      await invoke("remove_whitelist_rule", { id });
+      await loadSettings();
+      setStatus("规则已删除。重新匹配时立即生效。");
       setStatusTone("success");
     } catch (error) {
       setStatus(asMessage(error));
@@ -706,11 +842,17 @@ export default function App() {
         {showSettings ? (
           <SettingsPanel
             appSettings={appSettings}
+            loadingWhitelistRules={loadingWhitelistRules}
+            whitelistRules={whitelistRules}
             saving={savingSettings}
             restartingMcp={restartingMcp}
             restartResult={restartResult}
             onChangeApprovalLevel={handleChangeApprovalLevel}
+            onSaveAutoReviewSettings={handleSaveAutoReviewSettings}
+            onRemoveWhitelistRule={handleRemoveWhitelistRule}
             onRestartMcp={handleRestartMcp}
+            onSaveWhitelistRule={handleSaveWhitelistRule}
+            onToggleWhitelistRule={handleToggleWhitelistRule}
             onClose={closeSettings}
             onDragMouseDown={(event) => void handleDragMouseDown(event)}
           />
@@ -1224,24 +1366,71 @@ export default function App() {
 
 function SettingsPanel({
   appSettings,
+  loadingWhitelistRules,
+  whitelistRules,
   saving,
   restartingMcp,
   restartResult,
   onChangeApprovalLevel,
+  onSaveAutoReviewSettings,
+  onRemoveWhitelistRule,
   onRestartMcp,
+  onSaveWhitelistRule,
+  onToggleWhitelistRule,
   onClose,
   onDragMouseDown,
 }: {
   appSettings: AppSettings | null;
+  loadingWhitelistRules: boolean;
+  whitelistRules: WhitelistRule[];
   saving: boolean;
   restartingMcp: boolean;
   restartResult: { kind: "success" | "error"; message: string } | null;
   onChangeApprovalLevel: (approvalLevel: ApprovalLevel) => void;
+  onSaveAutoReviewSettings: (
+    autoReview: { base_url: string; model: string },
+    apiKey: string,
+    clearApiKey: boolean,
+  ) => Promise<void>;
+  onRemoveWhitelistRule: (id: number) => Promise<void>;
   onRestartMcp: () => Promise<void>;
+  onSaveWhitelistRule: (id: number | null, input: WhitelistRuleInput) => Promise<void>;
+  onToggleWhitelistRule: (id: number, enabled: boolean) => Promise<void>;
   onClose: () => void;
   onDragMouseDown: (event: React.MouseEvent<HTMLElement>) => void;
 }) {
-  const [activeSection, setActiveSection] = useState<"security" | "mcp">("security");
+  const [activeSection, setActiveSection] = useState<"security" | "rules" | "mcp">("security");
+  const [autoReviewBaseUrl, setAutoReviewBaseUrl] = useState("");
+  const [autoReviewModel, setAutoReviewModel] = useState("");
+  const [autoReviewApiKey, setAutoReviewApiKey] = useState("");
+  const [clearAutoReviewApiKey, setClearAutoReviewApiKey] = useState(false);
+
+  useEffect(() => {
+    if (!appSettings) {
+      return;
+    }
+    setAutoReviewBaseUrl(appSettings.auto_review.base_url);
+    setAutoReviewModel(appSettings.auto_review.model);
+    setAutoReviewApiKey("");
+    setClearAutoReviewApiKey(false);
+  }, [appSettings]);
+
+  async function saveAutoReviewSettings() {
+    try {
+      await onSaveAutoReviewSettings(
+        {
+          base_url: autoReviewBaseUrl,
+          model: autoReviewModel,
+        },
+        autoReviewApiKey,
+        clearAutoReviewApiKey,
+      );
+      setAutoReviewApiKey("");
+      setClearAutoReviewApiKey(false);
+    } catch {
+      // The parent already reports the backend error in the global status bar.
+    }
+  }
 
   function restartButtonContent() {
     if (restartingMcp) {
@@ -1297,6 +1486,18 @@ function SettingsPanel({
             </span>
           </button>
           <button
+            aria-current={activeSection === "rules" ? "page" : undefined}
+            className={activeSection === "rules" ? "active" : ""}
+            onClick={() => setActiveSection("rules")}
+            type="button"
+          >
+            <ShieldAlert size={16} />
+            <span>
+              <strong>全局规则</strong>
+              <small>黑白名单</small>
+            </span>
+          </button>
+          <button
             aria-current={activeSection === "mcp" ? "page" : undefined}
             className={activeSection === "mcp" ? "active" : ""}
             onClick={() => setActiveSection("mcp")}
@@ -1320,7 +1521,7 @@ function SettingsPanel({
                   <p>决定未被白名单放行的 SSH 操作如何审核。</p>
                 </div>
               </div>
-              <div className="settings-row">
+                  <div className="settings-row">
                 <div className="settings-item-info">
                   <strong>审核等级</strong>
                   <p>选择系统弹窗、独立 App 弹窗，或跳过审核直接允许访问。</p>
@@ -1329,31 +1530,110 @@ function SettingsPanel({
                   </span>
                 </div>
                 <div className="settings-choice-list" role="radiogroup" aria-label="审核等级">
-                  {approvalLevelOptions.map((option) => (
-                    <label
-                      className={
-                        "settings-choice"
-                        + (appSettings?.approval_level === option.value ? " active" : "")
-                      }
-                      key={option.value}
-                    >
-                      <input
-                        type="radio"
-                        name="approval-level"
-                        value={option.value}
-                        checked={appSettings?.approval_level === option.value}
-                        disabled={saving || !appSettings}
-                        onChange={() => onChangeApprovalLevel(option.value)}
-                      />
-                      <span>
-                        <strong>{option.label}</strong>
-                        <small>{option.description}</small>
+                  {approvalLevelOptions.map((option) => {
+                    const unavailable =
+                      option.value === "auto_agent" && !isAutoReviewConfigured(appSettings);
+                    return (
+                      <label
+                        className={
+                          "settings-choice"
+                          + (appSettings?.approval_level === option.value ? " active" : "")
+                          + (unavailable ? " disabled" : "")
+                        }
+                        key={option.value}
+                        title={unavailable ? "请先配置 Base URL、模型和 API key" : undefined}
+                      >
+                        <input
+                          type="radio"
+                          name="approval-level"
+                          value={option.value}
+                          checked={appSettings?.approval_level === option.value}
+                          disabled={saving || !appSettings || unavailable}
+                          onChange={() => onChangeApprovalLevel(option.value)}
+                        />
+                        <span>
+                          <strong>{option.label}</strong>
+                          <small>{option.description}</small>
+                        </span>
+                      </label>
+                    );
+                  })}
+                    </div>
+                  </div>
+                  <div className="settings-row auto-review-settings-row">
+                    <div className="settings-item-info">
+                      <strong>大模型审核配置</strong>
+                      <p>模型会看到 SSH 工具参数、命令、路径和目标主机信息，不会收到 SSH 凭据或命令输出。</p>
+                      <span className="settings-current-value">
+                        API key：{appSettings?.api_key_configured ? "已配置" : "未配置"}
                       </span>
-                    </label>
-                  ))}
-                </div>
-              </div>
-            </section>
+                    </div>
+                    <div className="auto-review-form">
+                      <label>
+                        <span>Base URL</span>
+                        <input
+                          autoComplete="url"
+                          onChange={(event) => setAutoReviewBaseUrl(event.target.value)}
+                          placeholder="https://api.example.com/v1"
+                          value={autoReviewBaseUrl}
+                        />
+                      </label>
+                      <label>
+                        <span>模型名称</span>
+                        <input
+                          autoComplete="off"
+                          onChange={(event) => setAutoReviewModel(event.target.value)}
+                          placeholder="安全审核模型"
+                          value={autoReviewModel}
+                        />
+                      </label>
+                      <label>
+                        <span>API key</span>
+                        <input
+                          autoComplete="new-password"
+                          onChange={(event) => {
+                            setAutoReviewApiKey(event.target.value);
+                            setClearAutoReviewApiKey(false);
+                          }}
+                          placeholder={appSettings?.api_key_configured ? "已保存，留空表示不修改" : "输入 API key"}
+                          type="password"
+                          value={autoReviewApiKey}
+                        />
+                      </label>
+                      <div className="auto-review-actions">
+                        <button
+                          className="primary-button"
+                          disabled={saving || !appSettings}
+                          onClick={() => void saveAutoReviewSettings()}
+                          type="button"
+                        >
+                          <Save size={14} />
+                          保存模型配置
+                        </button>
+                        {appSettings?.api_key_configured ? (
+                          <button
+                            className={clearAutoReviewApiKey ? "danger-button solid" : "secondary-button"}
+                            disabled={saving}
+                            onClick={() => setClearAutoReviewApiKey((value) => !value)}
+                            type="button"
+                          >
+                            <Trash2 size={14} />
+                            {clearAutoReviewApiKey ? "将清除 API key" : "清除 API key"}
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+                  </div>
+                </section>
+          ) : activeSection === "rules" ? (
+            <WhitelistRulesSection
+              loading={loadingWhitelistRules}
+              rules={whitelistRules}
+              saving={saving}
+              onRemove={onRemoveWhitelistRule}
+              onSave={onSaveWhitelistRule}
+              onToggle={onToggleWhitelistRule}
+            />
           ) : (
             <section className="settings-section">
               <div className="settings-section-heading">
@@ -1392,6 +1672,288 @@ function SettingsPanel({
   );
 }
 
+function WhitelistRulesSection({
+  loading,
+  rules,
+  saving,
+  onRemove,
+  onSave,
+  onToggle,
+}: {
+  loading: boolean;
+  rules: WhitelistRule[];
+  saving: boolean;
+  onRemove: (id: number) => Promise<void>;
+  onSave: (id: number | null, input: WhitelistRuleInput) => Promise<void>;
+  onToggle: (id: number, enabled: boolean) => Promise<void>;
+}) {
+  const [actionFilter, setActionFilter] = useState<"all" | RuleAction>("all");
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [editorError, setEditorError] = useState<string | null>(null);
+  const [draft, setDraft] = useState<WhitelistRuleInput>(emptyWhitelistRuleInput());
+
+  const filteredRules = actionFilter === "all"
+    ? rules
+    : rules.filter((rule) => rule.action === actionFilter);
+
+  function openNewRule() {
+    setEditingId(null);
+    setDraft(emptyWhitelistRuleInput());
+    setEditorError(null);
+    setEditorOpen(true);
+  }
+
+  function openEditRule(rule: WhitelistRule) {
+    setEditingId(rule.id);
+    setDraft({
+      rule_type: rule.rule_type,
+      pattern: rule.pattern,
+      action: rule.action,
+    });
+    setEditorError(null);
+    setEditorOpen(true);
+  }
+
+  function closeEditor() {
+    setEditorOpen(false);
+    setEditorError(null);
+  }
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const pattern = draft.pattern.trim();
+    if (!pattern) {
+      setEditorError("请输入匹配规则。");
+      return;
+    }
+
+    try {
+      await onSave(editingId, { ...draft, pattern });
+      closeEditor();
+    } catch {
+      // The parent already reports the backend error in the global status bar.
+    }
+  }
+
+  async function handleRemove(rule: WhitelistRule) {
+    if (!window.confirm(`确定删除规则“${rule.pattern}”吗？`)) {
+      return;
+    }
+    await onRemove(rule.id);
+    if (editingId === rule.id) {
+      closeEditor();
+    }
+  }
+
+  return (
+    <section className="settings-section rules-section">
+      <div className="settings-section-heading">
+        <span className="section-icon"><ShieldAlert size={17} /></span>
+        <div>
+          <h3>全局访问规则</h3>
+          <p>对所有 SSH 连接生效，规则修改后立即应用。</p>
+        </div>
+      </div>
+
+      <div className="rules-toolbar">
+        <label className="rule-filter-label">
+          <span>显示</span>
+          <select
+            aria-label="筛选规则动作"
+            className="rule-filter"
+            value={actionFilter}
+            onChange={(event) => setActionFilter(event.target.value as "all" | RuleAction)}
+          >
+            <option value="all">全部规则</option>
+            <option value="allow">允许访问</option>
+            <option value="require_approval">要求审核</option>
+            <option value="deny">禁止访问</option>
+          </select>
+        </label>
+        <button className="primary-button" onClick={openNewRule} type="button">
+          <Plus size={14} />
+          添加规则
+        </button>
+      </div>
+
+      {editorOpen ? (
+        <form className="rule-editor" onSubmit={(event) => void handleSubmit(event)}>
+          <div className="rule-editor-heading">
+            <div>
+              <strong>{editingId === null ? "添加全局规则" : "编辑全局规则"}</strong>
+              <span>规则按完整字符串匹配；命令支持 `*` 和 `?` 通配符。</span>
+            </div>
+            <button
+              aria-label="关闭规则编辑器"
+              className="secondary-button icon-button"
+              onClick={closeEditor}
+              title="关闭"
+              type="button"
+            >
+              <X size={14} />
+            </button>
+          </div>
+          <div className="rule-form-grid">
+            <label>
+              <span>处理方式</span>
+              <select
+                value={draft.action}
+                onChange={(event) => setDraft({ ...draft, action: event.target.value as RuleAction })}
+              >
+                <option value="allow">允许访问（白名单）</option>
+                <option value="require_approval">要求审核</option>
+                <option value="deny">禁止访问（黑名单）</option>
+              </select>
+            </label>
+            <label>
+              <span>匹配维度</span>
+              <select
+                value={draft.rule_type}
+                onChange={(event) => setDraft({ ...draft, rule_type: event.target.value as RuleType })}
+              >
+                <option value="tool">工具名</option>
+                <option value="command">命令</option>
+                <option value="path">路径</option>
+                <option value="instance">实例 ID</option>
+              </select>
+            </label>
+            <label className="rule-pattern-field">
+              <span>匹配规则</span>
+              <input
+                autoComplete="off"
+                autoFocus
+                className="mono-input"
+                placeholder={rulePatternPlaceholder(draft.rule_type)}
+                spellCheck={false}
+                value={draft.pattern}
+                onChange={(event) => setDraft({ ...draft, pattern: event.target.value })}
+              />
+            </label>
+          </div>
+          {editorError ? <p className="rule-editor-error" role="alert">{editorError}</p> : null}
+          <div className="rule-editor-actions">
+            <button className="secondary-button" onClick={closeEditor} type="button">
+              取消
+            </button>
+            <button className="primary-button" disabled={saving} type="submit">
+              <Save size={14} />
+              {editingId === null ? "添加规则" : "保存修改"}
+            </button>
+          </div>
+        </form>
+      ) : null}
+
+      <div className="rules-summary" aria-live="polite">
+        <span>共 {rules.length} 条规则</span>
+        <span>启用 {rules.filter((rule) => rule.enabled).length} 条</span>
+      </div>
+
+      {loading ? (
+        <div className="rules-empty-state">正在加载规则...</div>
+      ) : filteredRules.length === 0 ? (
+        <div className="rules-empty-state">
+          <ShieldAlert size={18} />
+          <span>{rules.length === 0 ? "暂无全局规则" : "没有符合筛选条件的规则"}</span>
+        </div>
+      ) : (
+        <div className="rules-list" role="list">
+          {filteredRules.map((rule) => (
+            <article className={"rule-row" + (rule.enabled ? "" : " disabled")} key={rule.id}>
+              <label className="rule-enabled-control">
+                <input
+                  aria-label={`${rule.pattern}规则`}
+                  checked={rule.enabled}
+                  disabled={saving}
+                  type="checkbox"
+                  onChange={(event) => void onToggle(rule.id, event.target.checked)}
+                />
+              </label>
+              <div className="rule-row-main">
+                <div className="rule-row-heading">
+                  <span className={`rule-action-badge ${rule.action}`}>
+                    {ruleActionLabel(rule.action)}
+                  </span>
+                  <span className="rule-type-label">{ruleTypeLabel(rule.rule_type)}</span>
+                  {rule.is_builtin ? <span className="rule-builtin-label">默认</span> : null}
+                </div>
+                <code className="rule-pattern">{rule.pattern}</code>
+              </div>
+              <div className="rule-row-actions">
+                <button
+                  aria-label={`编辑规则 ${rule.pattern}`}
+                  className="secondary-button icon-button"
+                  disabled={saving}
+                  onClick={() => openEditRule(rule)}
+                  title="编辑规则"
+                  type="button"
+                >
+                  <Pencil size={14} />
+                </button>
+                <button
+                  aria-label={`删除规则 ${rule.pattern}`}
+                  className="danger-button icon-button"
+                  disabled={saving}
+                  onClick={() => void handleRemove(rule)}
+                  title="删除规则"
+                  type="button"
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function emptyWhitelistRuleInput(): WhitelistRuleInput {
+  return {
+    rule_type: "tool",
+    pattern: "",
+    action: "allow",
+  };
+}
+
+function ruleActionLabel(action: RuleAction): string {
+  switch (action) {
+    case "allow":
+      return "允许访问";
+    case "require_approval":
+      return "要求审核";
+    case "deny":
+      return "禁止访问";
+  }
+}
+
+function ruleTypeLabel(ruleType: RuleType): string {
+  switch (ruleType) {
+    case "tool":
+      return "工具";
+    case "command":
+      return "命令";
+    case "path":
+      return "路径";
+    case "instance":
+      return "实例";
+  }
+}
+
+function rulePatternPlaceholder(ruleType: RuleType): string {
+  switch (ruleType) {
+    case "tool":
+      return "execute_command 或 *";
+    case "command":
+      return "ls * 或 rm -rf *";
+    case "path":
+      return "/srv/reports/*";
+    case "instance":
+      return "production 或 prod-*";
+  }
+}
+
 const approvalLevelOptions: Array<{
   value: ApprovalLevel;
   label: string;
@@ -1412,10 +1974,24 @@ const approvalLevelOptions: Array<{
     label: "完全允许访问",
     description: "未被拒绝规则拦截的操作会直接执行。",
   },
+  {
+    value: "auto_agent",
+    label: "大模型自动审核",
+    description: "将未被白名单放行的操作交给配置的模型判断。",
+  },
 ];
 
 function approvalLevelLabel(level: ApprovalLevel | undefined): string {
   return approvalLevelOptions.find((option) => option.value === level)?.label ?? "加载中";
+}
+
+function isAutoReviewConfigured(settings: AppSettings | null): boolean {
+  return Boolean(
+    settings
+      && settings.api_key_configured
+      && settings.auto_review.base_url.trim()
+      && settings.auto_review.model.trim(),
+  );
 }
 
 function formatLogTime(iso: string): string {

@@ -3,7 +3,9 @@ use std::time::Instant;
 
 use anyhow::Result;
 
-use crate::models::{OperationContext, RuleAction, RuleDecision, RuleType, WhitelistRule};
+use crate::models::{
+    ApprovalKind, OperationContext, RuleAction, RuleDecision, RuleType, WhitelistRule,
+};
 use crate::storage::InstanceStore;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +62,16 @@ impl WhitelistChecker {
             ));
         }
 
+        if rules
+            .iter()
+            .filter(|r| r.enabled && r.action == RuleAction::RequireApproval)
+            .any(|rule| {
+                matching_rule_value_for_command(ctx, command_analysis.as_ref(), rule).is_some()
+            })
+        {
+            return RuleDecision::NeedsApproval(approval_kind(ctx));
+        }
+
         // Collect which dimensions have allow rules
         let mut covered_dims: HashMap<&str, i64> = HashMap::new();
         for rule in rules
@@ -103,7 +115,7 @@ impl WhitelistChecker {
             return RuleDecision::Allow;
         }
 
-        RuleDecision::NeedsApproval
+        RuleDecision::NeedsApproval(approval_kind(ctx))
     }
 
     fn present_dimensions(ctx: &OperationContext) -> Vec<&str> {
@@ -123,6 +135,14 @@ impl WhitelistChecker {
     pub fn cache_approval(&mut self, ctx: &OperationContext) {
         let key = approval_key(ctx);
         self.session_approvals.insert(key, Instant::now());
+    }
+}
+
+fn approval_kind(ctx: &OperationContext) -> ApprovalKind {
+    if ctx.tool_name == "sudo" {
+        ApprovalKind::HighRisk
+    } else {
+        ApprovalKind::Normal
     }
 }
 
@@ -157,13 +177,21 @@ fn matching_deny_value<'a>(
     command_analysis: Option<&'a CommandAnalysis>,
     rule: &'a WhitelistRule,
 ) -> Option<(&'a str, &'a WhitelistRule)> {
+    matching_rule_value_for_command(ctx, command_analysis, rule).map(|value| (value, rule))
+}
+
+fn matching_rule_value_for_command<'a>(
+    ctx: &'a OperationContext,
+    command_analysis: Option<&'a CommandAnalysis>,
+    rule: &'a WhitelistRule,
+) -> Option<&'a str> {
     if rule.rule_type != RuleType::Command {
-        return matching_rule_value(ctx, rule).map(|value| (value, rule));
+        return matching_rule_value(ctx, rule);
     }
 
     let command = ctx.command.as_deref()?;
     if glob_match(&rule.pattern, command) {
-        return Some((command, rule));
+        return Some(command);
     }
 
     let Some(CommandAnalysis::Segments(segments)) = command_analysis else {
@@ -173,7 +201,7 @@ fn matching_deny_value<'a>(
     segments
         .iter()
         .find(|segment| glob_match(&rule.pattern, segment))
-        .map(|segment| (segment.as_str(), rule))
+        .map(String::as_str)
 }
 
 fn command_allow_covered(analysis: Option<&CommandAnalysis>, rules: &[WhitelistRule]) -> bool {
@@ -372,6 +400,8 @@ fn match_impl(pat: &[u8], val: &[u8], pi: usize, vi: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::models::RuleAction;
 
@@ -382,6 +412,7 @@ mod tests {
             pattern: pattern.into(),
             action,
             enabled: true,
+            is_builtin: false,
             created_at: String::new(),
         }
     }
@@ -493,6 +524,117 @@ mod tests {
     }
 
     #[test]
+    fn require_approval_overrides_allow_and_cached_approval() {
+        let rules = vec![
+            rule(1, RuleType::Tool, "execute_command", RuleAction::Allow),
+            rule(2, RuleType::Instance, "*", RuleAction::Allow),
+            rule(3, RuleType::Command, "rm *", RuleAction::Allow),
+            rule(4, RuleType::Command, "rm *", RuleAction::RequireApproval),
+        ];
+        let ctx = execute_ctx("rm -rf /tmp/demo");
+        let mut approvals = HashMap::new();
+        approvals.insert(approval_key(&ctx), Instant::now());
+
+        let result = WhitelistChecker::evaluate(&rules, &ctx, &approvals);
+
+        assert!(matches!(
+            result,
+            RuleDecision::NeedsApproval(ApprovalKind::Normal)
+        ));
+    }
+
+    #[test]
+    fn require_approval_command_rule_matches_a_command_segment() {
+        let rules = vec![rule(
+            1,
+            RuleType::Command,
+            "rm *",
+            RuleAction::RequireApproval,
+        )];
+        let ctx = execute_ctx("echo before && rm -rf /tmp/demo");
+
+        let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
+
+        assert!(matches!(
+            result,
+            RuleDecision::NeedsApproval(ApprovalKind::Normal)
+        ));
+    }
+
+    #[test]
+    fn require_approval_path_rule_matches_the_complete_path() {
+        let rules = vec![rule(
+            1,
+            RuleType::Path,
+            "/etc/*",
+            RuleAction::RequireApproval,
+        )];
+        let ctx = transfer_ctx("upload_file", "/etc/shadow", "/tmp/upload");
+
+        let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
+
+        assert!(matches!(
+            result,
+            RuleDecision::NeedsApproval(ApprovalKind::Normal)
+        ));
+    }
+
+    #[test]
+    fn disabled_require_approval_rule_does_not_change_normal_approval() {
+        let mut high_risk = rule(1, RuleType::Command, "rm *", RuleAction::RequireApproval);
+        high_risk.enabled = false;
+        let ctx = execute_ctx("rm -rf /tmp/demo");
+
+        let result = WhitelistChecker::evaluate(&[high_risk], &ctx, &HashMap::new());
+
+        assert!(matches!(
+            result,
+            RuleDecision::NeedsApproval(ApprovalKind::Normal)
+        ));
+    }
+
+    #[test]
+    fn sudo_is_high_risk_for_default_and_required_approval() {
+        let ctx = OperationContext {
+            tool_name: "sudo".into(),
+            command: Some("sudo systemctl restart ssh".into()),
+            remote_path: None,
+            local_path: None,
+            instance_id: Some("prod".into()),
+            overwrite: None,
+        };
+
+        let default_result = WhitelistChecker::evaluate(&[], &ctx, &HashMap::new());
+        assert!(matches!(
+            default_result,
+            RuleDecision::NeedsApproval(ApprovalKind::HighRisk)
+        ));
+
+        let required_result = WhitelistChecker::evaluate(
+            &[rule(1, RuleType::Tool, "sudo", RuleAction::RequireApproval)],
+            &ctx,
+            &HashMap::new(),
+        );
+        assert!(matches!(
+            required_result,
+            RuleDecision::NeedsApproval(ApprovalKind::HighRisk)
+        ));
+    }
+
+    #[test]
+    fn deny_rule_overrides_high_risk_rule() {
+        let rules = vec![
+            rule(1, RuleType::Command, "rm *", RuleAction::RequireApproval),
+            rule(2, RuleType::Command, "rm -rf *", RuleAction::Deny),
+        ];
+        let ctx = execute_ctx("rm -rf /tmp/demo");
+
+        let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
+
+        assert!(matches!(result, RuleDecision::Deny(_)));
+    }
+
+    #[test]
     fn evaluate_needs_approval() {
         let rules = vec![rule(1, RuleType::Tool, "list_servers", RuleAction::Allow)];
 
@@ -507,7 +649,7 @@ mod tests {
 
         let approvals = HashMap::new();
         let result = WhitelistChecker::evaluate(&rules, &ctx, &approvals);
-        assert!(matches!(result, RuleDecision::NeedsApproval));
+        assert!(matches!(result, RuleDecision::NeedsApproval(_)));
     }
 
     #[test]
@@ -520,7 +662,7 @@ mod tests {
 
         let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
 
-        assert!(matches!(result, RuleDecision::NeedsApproval));
+        assert!(matches!(result, RuleDecision::NeedsApproval(_)));
     }
 
     #[test]
@@ -542,7 +684,7 @@ mod tests {
 
         let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
 
-        assert!(matches!(result, RuleDecision::NeedsApproval));
+        assert!(matches!(result, RuleDecision::NeedsApproval(_)));
     }
 
     #[test]
@@ -641,7 +783,7 @@ mod tests {
 
         let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
 
-        assert!(matches!(result, RuleDecision::NeedsApproval));
+        assert!(matches!(result, RuleDecision::NeedsApproval(_)));
     }
 
     #[test]
@@ -710,7 +852,7 @@ mod tests {
 
         let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
 
-        assert!(matches!(result, RuleDecision::NeedsApproval));
+        assert!(matches!(result, RuleDecision::NeedsApproval(_)));
     }
 
     #[test]
@@ -725,7 +867,7 @@ mod tests {
 
         let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
 
-        assert!(matches!(result, RuleDecision::NeedsApproval));
+        assert!(matches!(result, RuleDecision::NeedsApproval(_)));
     }
 
     #[test]
@@ -740,7 +882,7 @@ mod tests {
 
         let result = WhitelistChecker::evaluate(&rules, &ctx, &HashMap::new());
 
-        assert!(matches!(result, RuleDecision::NeedsApproval));
+        assert!(matches!(result, RuleDecision::NeedsApproval(_)));
     }
 
     #[test]
@@ -752,7 +894,7 @@ mod tests {
         let empty_segment =
             WhitelistChecker::evaluate(&rules, &execute_ctx("ls &&"), &HashMap::new());
 
-        assert!(matches!(unclosed_quote, RuleDecision::NeedsApproval));
-        assert!(matches!(empty_segment, RuleDecision::NeedsApproval));
+        assert!(matches!(unclosed_quote, RuleDecision::NeedsApproval(_)));
+        assert!(matches!(empty_segment, RuleDecision::NeedsApproval(_)));
     }
 }

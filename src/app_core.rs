@@ -16,12 +16,12 @@ use crate::approval::prompt_sudo_password;
 use crate::credentials::SecretStore;
 use crate::local_ipc::send_notification;
 use crate::models::{
-    AuthKind, CloseSessionResult, CreateSessionResult, DownloadFileArgs, DownloadFileResult,
-    DownloadToLocalArgs, DownloadToLocalResult, ExecuteCommandArgs, ExecuteCommandResult,
-    InstanceDraft, InstanceSummary, ListServersResult, McpConfigBundle, McpConfigRequest,
-    OperationLogEntry, RequestContext, RuleAction, RuleType, SecretPayload, StoredInstance,
-    SudoCommandArgs, TestConnectionResult, UploadFileArgs, UploadFileResult, UploadLocalFileArgs,
-    UploadLocalFileResult, WhitelistRule,
+    ApprovalKind, AuthKind, CloseSessionResult, CreateSessionResult, DownloadFileArgs,
+    DownloadFileResult, DownloadToLocalArgs, DownloadToLocalResult, ExecuteCommandArgs,
+    ExecuteCommandResult, InstanceDraft, InstanceSummary, ListServersResult, McpConfigBundle,
+    McpConfigRequest, OperationContext, OperationLogEntry, RequestContext, RuleAction, RuleType,
+    SecretPayload, StoredInstance, SudoCommandArgs, TestConnectionResult, ToolCall, UploadFileArgs,
+    UploadFileResult, UploadLocalFileArgs, UploadLocalFileResult, WhitelistRule,
 };
 use crate::storage::InstanceStore;
 use crate::whitelist::WhitelistChecker;
@@ -102,6 +102,65 @@ impl DesktopCore {
         limit: u64,
     ) -> Result<Vec<OperationLogEntry>> {
         self.store.get_operation_logs_since(since_id, limit)
+    }
+
+    pub fn get_instance_metadata(&self, instance_id: &str) -> Result<Option<StoredInstance>> {
+        self.store.get_instance(instance_id)
+    }
+
+    pub fn has_auto_review_api_key(&self) -> Result<bool> {
+        self.secrets
+            .has_app_secret(crate::settings::AUTO_REVIEW_API_KEY)
+    }
+
+    pub fn load_auto_review_api_key(&self) -> Result<Option<String>> {
+        self.secrets
+            .load_app_secret(crate::settings::AUTO_REVIEW_API_KEY)
+    }
+
+    pub fn save_auto_review_api_key(&self, api_key: &str) -> Result<()> {
+        self.secrets
+            .save_app_secret(crate::settings::AUTO_REVIEW_API_KEY, api_key)
+    }
+
+    pub fn delete_auto_review_api_key(&self) -> Result<()> {
+        self.secrets
+            .delete_app_secret(crate::settings::AUTO_REVIEW_API_KEY)
+    }
+
+    pub fn log_approval_event(
+        &self,
+        ctx: &RequestContext,
+        tool_call: &ToolCall,
+        operation: &OperationContext,
+        approval_kind: ApprovalKind,
+        event: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let session_id = tool_call
+            .arguments
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let instance_id = operation.instance_id.as_deref().unwrap_or_default();
+        let details = serde_json::json!({
+            "client_id": ctx.client_id,
+            "client_session_id": ctx.client_session_id,
+            "tool_name": tool_call.name,
+            "arguments": tool_call.arguments,
+            "approval_kind": approval_kind,
+            "reason": reason,
+        });
+        self.store.insert_log(
+            &ctx.client_id,
+            &ctx.client_session_id,
+            session_id,
+            instance_id,
+            event,
+            &serde_json::to_string(&details).unwrap_or_default(),
+        )?;
+        self.notify_ui();
+        Ok(())
     }
 
     pub fn log_client_connection(&self, ctx: &RequestContext, operation: &str) -> Result<()> {
@@ -255,17 +314,7 @@ impl DesktopCore {
     }
 
     pub fn mcp_config_bundle(&self, request: McpConfigRequest<'_>) -> Result<McpConfigBundle> {
-        let mut args = vec!["--db-path".to_string(), request.db_path.to_string()];
-        if let Some(endpoint) = request.notify_endpoint {
-            args.push("--notify-socket".to_string());
-            args.push(endpoint.to_string());
-        }
-        if let Some(endpoint) = request.approval_endpoint {
-            args.push("--approval-endpoint".to_string());
-            args.push(endpoint.to_string());
-        }
-        args.push("--client-id".to_string());
-        args.push(request.client_id.to_string());
+        let args = Vec::new();
 
         let stdio_json = serde_json::to_string_pretty(&serde_json::json!({
             "mcpServers": {
@@ -800,6 +849,21 @@ impl DesktopCore {
         action: &RuleAction,
     ) -> Result<i64> {
         self.store.add_whitelist_rule(rule_type, pattern, action)
+    }
+
+    pub fn update_whitelist_rule(
+        &self,
+        id: i64,
+        rule_type: &RuleType,
+        pattern: &str,
+        action: &RuleAction,
+    ) -> Result<()> {
+        self.store
+            .update_whitelist_rule(id, rule_type, pattern, action)
+    }
+
+    pub fn set_whitelist_rule_enabled(&self, id: i64, enabled: bool) -> Result<()> {
+        self.store.set_whitelist_rule_enabled(id, enabled)
     }
 
     pub fn remove_whitelist_rule(&self, id: i64) -> Result<()> {
@@ -1353,6 +1417,35 @@ mod tests {
             client_id: "test-client".to_string(),
             client_session_id: Uuid::new_v4().to_string(),
         }
+    }
+
+    #[test]
+    fn mcp_config_bundle_uses_stable_helper_entrypoint() {
+        let (core, test_dir) = make_test_core();
+        let db_path = test_dir.join("instances.sqlite3");
+        let db_path = db_path.to_string_lossy().to_string();
+        let bundle = core
+            .mcp_config_bundle(McpConfigRequest {
+                command_path:
+                    "/Applications/Xiic SSH Manager.app/Contents/Resources/binaries/xiic-ssh-mcp",
+                db_path: &db_path,
+                notify_endpoint: Some("/tmp/notify.sock"),
+                approval_endpoint: Some("/tmp/approval.sock"),
+                client_id: "codex",
+                helper_found: true,
+                helper_warning: None,
+            })
+            .expect("config bundle should build");
+
+        assert!(bundle.args.is_empty());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&bundle.stdio_json).expect("stdio json should parse");
+        assert_eq!(
+            parsed["mcpServers"]["xiic-ssh"]["args"],
+            serde_json::json!([])
+        );
+
+        std::fs::remove_dir_all(test_dir).expect("test dir should be removed");
     }
 
     #[test]

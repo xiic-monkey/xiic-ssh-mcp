@@ -1,5 +1,6 @@
 pub mod app_core;
 pub mod approval;
+pub mod auto_review;
 pub mod broker;
 pub mod credentials;
 pub mod local_ipc;

@@ -8,7 +8,7 @@ use aes_gcm::{
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use chrono::Utc;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::models::SecretPayload;
 use crate::paths::{ensure_private_dir, ensure_private_file};
@@ -30,8 +30,52 @@ impl SecretStore {
         let key = load_or_create_master_key(&key_path)?;
         let cipher = Aes256Gcm::new_from_slice(&key).expect("AES-256 key has a fixed size");
         let store = Self { db_path, cipher };
+        store.ensure_app_secret_schema()?;
         store.migrate_plaintext_rows()?;
         Ok(store)
+    }
+
+    pub fn save_app_secret(&self, key: &str, secret: &str) -> Result<()> {
+        let payload = serde_json::to_vec(secret).context("failed to serialize app secret")?;
+        let encrypted = self.encrypt(&format!("app:{key}"), &payload)?;
+        self.open()?.execute(
+            "INSERT INTO app_secrets (secret_key, secret_value, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(secret_key) DO UPDATE SET
+                secret_value = excluded.secret_value,
+                updated_at = excluded.updated_at",
+            params![key, encrypted, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_app_secret(&self, key: &str) -> Result<Option<String>> {
+        let payload = self.open()?.query_row(
+            "SELECT secret_value FROM app_secrets WHERE secret_key = ?1",
+            [key],
+            |row| row.get::<_, String>(0),
+        );
+        let payload = match payload {
+            Ok(payload) => payload,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(err) => return Err(err).context("failed to load app secret"),
+        };
+        let decoded = self
+            .decrypt_bytes(&format!("app:{key}"), &payload)
+            .context("failed to decode app secret")?;
+        let secret: String =
+            serde_json::from_slice(&decoded).context("failed to parse app secret")?;
+        Ok(Some(secret))
+    }
+
+    pub fn delete_app_secret(&self, key: &str) -> Result<()> {
+        self.open()?
+            .execute("DELETE FROM app_secrets WHERE secret_key = ?1", [key])?;
+        Ok(())
+    }
+
+    pub fn has_app_secret(&self, key: &str) -> Result<bool> {
+        Ok(self.load_app_secret(key)?.is_some())
     }
 
     pub fn save_secret(&self, instance_id: &str, secret: &SecretPayload) -> Result<()> {
@@ -83,6 +127,18 @@ impl SecretStore {
 
     fn migrate_plaintext_rows(&self) -> Result<()> {
         let connection = self.open()?;
+        let instance_secrets_exists = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'instance_secrets'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !instance_secrets_exists {
+            return Ok(());
+        }
+
         let mut statement = connection.prepare(
             "SELECT instance_id, secret_json FROM instance_secrets
              WHERE secret_json NOT LIKE 'enc-v1:%'",
@@ -98,6 +154,17 @@ impl SecretStore {
             let secret = self.decode(&instance_id, &payload)?;
             self.save_secret(&instance_id, &secret)?;
         }
+        Ok(())
+    }
+
+    fn ensure_app_secret_schema(&self) -> Result<()> {
+        self.open()?.execute_batch(
+            "CREATE TABLE IF NOT EXISTS app_secrets (
+                secret_key TEXT PRIMARY KEY,
+                secret_value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );",
+        )?;
         Ok(())
     }
 
@@ -124,14 +191,21 @@ impl SecretStore {
     }
 
     fn decode(&self, instance_id: &str, payload: &str) -> Result<SecretPayload> {
-        let bytes = if let Some(encoded) = payload.strip_prefix(ENCRYPTED_SECRET_PREFIX) {
+        let bytes = self.decrypt_bytes(instance_id, payload)?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to decode secret for '{instance_id}'"))
+    }
+
+    fn decrypt_bytes(&self, instance_id: &str, payload: &str) -> Result<Vec<u8>> {
+        if let Some(encoded) = payload.strip_prefix(ENCRYPTED_SECRET_PREFIX) {
             let bytes = STANDARD_NO_PAD
                 .decode(encoded)
                 .context("credential ciphertext is not valid base64")?;
             if bytes.len() <= NONCE_SIZE {
                 bail!("credential ciphertext is truncated");
             }
-            self.cipher
+            Ok(self
+                .cipher
                 .decrypt(
                     Nonce::from_slice(&bytes[..NONCE_SIZE]),
                     Payload {
@@ -139,12 +213,10 @@ impl SecretStore {
                         aad: instance_id.as_bytes(),
                     },
                 )
-                .map_err(|_| anyhow::anyhow!("credential ciphertext failed authentication"))?
+                .map_err(|_| anyhow::anyhow!("credential ciphertext failed authentication"))?)
         } else {
-            payload.as_bytes().to_vec()
-        };
-        serde_json::from_slice(&bytes)
-            .with_context(|| format!("failed to decode secret for '{}'", instance_id))
+            Ok(payload.as_bytes().to_vec())
+        }
     }
 
     fn open(&self) -> Result<Connection> {
@@ -266,6 +338,45 @@ mod tests {
         assert_eq!(
             store.load_secret("prod").expect("secret should load"),
             Some(secret())
+        );
+
+        std::fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn app_secret_is_encrypted_and_round_trips() {
+        let (directory, db_path) = test_paths();
+        let store = SecretStore::new(db_path.clone()).expect("store should initialize");
+        let api_key = "sk-test-automatic-review-key";
+
+        store
+            .save_app_secret("auto_review_api_key", api_key)
+            .expect("app secret should save");
+
+        let stored = Connection::open(&db_path)
+            .expect("database should open")
+            .query_row(
+                "SELECT secret_value FROM app_secrets WHERE secret_key = 'auto_review_api_key'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("app secret ciphertext should load");
+        assert!(stored.starts_with("enc-v1:"));
+        assert!(!stored.contains(api_key));
+        assert_eq!(
+            store
+                .load_app_secret("auto_review_api_key")
+                .expect("app secret should load"),
+            Some(api_key.to_string())
+        );
+
+        store
+            .delete_app_secret("auto_review_api_key")
+            .expect("app secret should delete");
+        assert!(
+            !store
+                .has_app_secret("auto_review_api_key")
+                .expect("app secret should be checked")
         );
 
         std::fs::remove_dir_all(directory).expect("test directory should be removed");

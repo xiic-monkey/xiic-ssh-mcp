@@ -308,6 +308,7 @@ impl RuleType {
 pub enum RuleAction {
     Allow,
     Deny,
+    RequireApproval,
 }
 
 impl RuleAction {
@@ -315,6 +316,7 @@ impl RuleAction {
         match s {
             "allow" => Some(Self::Allow),
             "deny" => Some(Self::Deny),
+            "require_approval" => Some(Self::RequireApproval),
             _ => None,
         }
     }
@@ -323,6 +325,7 @@ impl RuleAction {
         match self {
             Self::Allow => "allow",
             Self::Deny => "deny",
+            Self::RequireApproval => "require_approval",
         }
     }
 }
@@ -334,6 +337,7 @@ pub struct WhitelistRule {
     pub pattern: String,
     pub action: RuleAction,
     pub enabled: bool,
+    pub is_builtin: bool,
     pub created_at: String,
 }
 
@@ -351,7 +355,20 @@ pub struct OperationContext {
 pub enum RuleDecision {
     Allow,
     Deny(String),
-    NeedsApproval,
+    NeedsApproval(ApprovalKind),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalKind {
+    Normal,
+    HighRisk,
+}
+
+impl Default for ApprovalKind {
+    fn default() -> Self {
+        Self::Normal
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -367,6 +384,7 @@ pub struct PendingToolCall {
     pub tool_call: ToolCall,
     pub operation: OperationContext,
     pub approval: ApprovalOperationMetadata,
+    pub approval_kind: ApprovalKind,
     pub context: RequestContext,
 }
 
@@ -420,6 +438,8 @@ pub struct ApprovalRequest {
     pub kind: String,
     pub request_id: String,
     pub message: String,
+    #[serde(default)]
+    pub approval_kind: ApprovalKind,
     pub metadata: ApprovalOperationMetadata,
 }
 
